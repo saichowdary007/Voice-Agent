@@ -20,10 +20,10 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Create models directory
-RUN mkdir -p /opt/render/project/src/models
+RUN mkdir -p /app/models
 
 # Set environment variables
-ENV MODEL_PATH=/opt/render/project/src/models
+ENV MODEL_PATH=/app/models
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
@@ -46,7 +46,7 @@ RUN python app/models/download_models.py
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app_user && \
     chown -R app_user:app_user /app && \
-    chown -R app_user:app_user /opt/render/project/src/models
+    chown -R app_user:app_user /app/models
 
 # Switch to non-root user
 USER app_user

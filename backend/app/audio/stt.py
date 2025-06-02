@@ -24,7 +24,7 @@ class STTEngine:
     
     def __init__(self):
         self.sample_rate = int(os.getenv('SAMPLE_RATE', '16000'))
-        self.model_path = os.getenv('MODEL_PATH', '/opt/render/project/src/models')
+        self.model_path = os.getenv('MODEL_PATH', '/app/models')
         
         # Model components
         self.recognizer: Optional[sherpa_ncnn.Recognizer] = None

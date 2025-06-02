@@ -138,8 +138,48 @@ class WebSocketHandler:
             # Try different FFmpeg approaches based on data characteristics
             pcm_data = None
             
-            # Method 1: Auto-detect format (works for complete containers)
-            if len(audio_data) > 1000 or is_webm:  # Only for larger chunks
+            # Method 1: Try as WebM container first (most common from browsers)
+            if is_webm or len(audio_data) > 500:
+                ffmpeg_cmd = [
+                    'ffmpeg',
+                    '-f', 'matroska',      # Force WebM/Matroska input format
+                    '-i', 'pipe:0',        
+                    '-f', 's16le',         
+                    '-ar', str(target_sample_rate), 
+                    '-ac', '1',            
+                    '-hide_banner',
+                    '-loglevel', 'error',
+                    'pipe:1'               
+                ]
+                
+                self.logger.debug(f"FFmpeg WebM command: {' '.join(ffmpeg_cmd)}")
+
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *ffmpeg_cmd,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    
+                    pcm_data, stderr_bytes = await proc.communicate(input=audio_data)
+                    
+                    if proc.returncode != 0:
+                        stderr_str = stderr_bytes.decode('utf-8', errors='ignore').strip()
+                        self.logger.warning(f"FFmpeg WebM format failed (return code {proc.returncode}): {stderr_str}")
+                        pcm_data = None
+                    elif not pcm_data:
+                        self.logger.warning("FFmpeg WebM format produced no PCM data")
+                        pcm_data = None
+                    else:
+                        self.logger.debug(f"Successfully converted audio to PCM via WebM format. PCM data length: {len(pcm_data)}")
+                        
+                except Exception as e:
+                    self.logger.warning(f"FFmpeg WebM format failed with exception: {e}")
+                    pcm_data = None
+            
+            # Method 2: Try auto-detect format if WebM failed
+            if pcm_data is None and len(audio_data) > 1000:
                 ffmpeg_cmd = [
                     'ffmpeg',
                     '-i', 'pipe:0',        # Input from stdin (auto-detect format)
@@ -151,7 +191,7 @@ class WebSocketHandler:
                     'pipe:1'               # Output to stdout
                 ]
                 
-                self.logger.debug(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
+                self.logger.debug(f"FFmpeg auto-detect command: {' '.join(ffmpeg_cmd)}")
 
                 try:
                     proc = await asyncio.create_subprocess_exec(
@@ -167,23 +207,23 @@ class WebSocketHandler:
 
                     if proc.returncode != 0:
                         stderr_str = stderr_bytes.decode('utf-8', errors='ignore').strip()
-                        self.logger.debug(f"FFmpeg auto-detect failed (return code {proc.returncode}): {stderr_str}")
+                        self.logger.warning(f"FFmpeg auto-detect failed (return code {proc.returncode}): {stderr_str}")
                         pcm_data = None
                     elif not pcm_data:
-                        self.logger.debug("FFmpeg auto-detect produced no PCM data")
+                        self.logger.warning("FFmpeg auto-detect produced no PCM data")
                         pcm_data = None
                     else:
                         self.logger.debug(f"Successfully converted audio to PCM via auto-detect. PCM data length: {len(pcm_data)}")
                         
                 except Exception as e:
-                    self.logger.debug(f"FFmpeg auto-detect failed with exception: {e}")
+                    self.logger.warning(f"FFmpeg auto-detect failed with exception: {e}")
                     pcm_data = None
             
-            # Method 2: Try as WebM container if auto-detect failed
-            if pcm_data is None and (is_webm or len(audio_data) > 500):
+            # Method 3: Try as Ogg/Opus if still no success
+            if pcm_data is None and len(audio_data) > 500:
                 ffmpeg_cmd = [
                     'ffmpeg',
-                    '-f', 'matroska',      # Force WebM/Matroska input format
+                    '-f', 'ogg',           # Force Ogg input format
                     '-i', 'pipe:0',        
                     '-f', 's16le',         
                     '-ar', str(target_sample_rate), 
@@ -205,65 +245,43 @@ class WebSocketHandler:
                     
                     if proc.returncode != 0:
                         stderr_str = stderr_bytes.decode('utf-8', errors='ignore').strip()
-                        self.logger.debug(f"FFmpeg WebM format failed (return code {proc.returncode}): {stderr_str}")
+                        self.logger.warning(f"FFmpeg Ogg format failed (return code {proc.returncode}): {stderr_str}")
                         pcm_data = None
                     elif not pcm_data:
-                        self.logger.debug("FFmpeg WebM format produced no PCM data")
+                        self.logger.warning("FFmpeg Ogg format produced no PCM data")
                         pcm_data = None
                     else:
-                        self.logger.debug(f"Successfully converted audio to PCM via WebM format. PCM data length: {len(pcm_data)}")
-                        
-                except Exception as e:
-                    self.logger.debug(f"FFmpeg WebM format failed with exception: {e}")
-                    pcm_data = None
-            
-            # Method 3: Try as raw Opus data for smaller chunks
-            if pcm_data is None:
-                ffmpeg_cmd = [
-                    'ffmpeg',
-                    '-f', 'ogg',           # Try as Ogg/Opus
-                    '-i', 'pipe:0',        
-                    '-f', 's16le',         
-                    '-ar', str(target_sample_rate), 
-                    '-ac', '1',            
-                    '-hide_banner',
-                    '-loglevel', 'error',
-                    'pipe:1'               
-                ]
-                
-                try:
-                    proc = await asyncio.create_subprocess_exec(
-                        *ffmpeg_cmd,
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    
-                    pcm_data, stderr_bytes = await proc.communicate(input=audio_data)
-                    
-                    if proc.returncode == 0 and pcm_data:
                         self.logger.debug(f"Successfully converted audio to PCM via Ogg format. PCM data length: {len(pcm_data)}")
-                    else:
-                        self.logger.debug("FFmpeg Ogg format also failed")
-                        pcm_data = None
                         
                 except Exception as e:
-                    self.logger.debug(f"FFmpeg Ogg format failed with exception: {e}")
+                    self.logger.warning(f"FFmpeg Ogg format failed with exception: {e}")
                     pcm_data = None
             
-            # If all methods failed, buffer the chunk for later processing
+            # If all methods failed, buffer the chunk for later processing with improved logic
             if pcm_data is None:
-                self.logger.debug("All FFmpeg methods failed, buffering chunk for accumulation")
+                self.logger.warning("All FFmpeg methods failed, buffering chunk for accumulation")
                 if not hasattr(self, 'failed_chunk_buffer'):
                     self.failed_chunk_buffer = bytearray()
+                
+                # Prevent unbounded growth by limiting buffer size
+                max_buffer_size = 50000  # 50KB maximum
+                if len(self.failed_chunk_buffer) + len(audio_data) > max_buffer_size:
+                    # Keep only the most recent data
+                    excess = len(self.failed_chunk_buffer) + len(audio_data) - max_buffer_size
+                    self.failed_chunk_buffer = self.failed_chunk_buffer[excess:]
+                    self.logger.warning(f"Failed chunk buffer trimmed to prevent excessive memory usage")
+                
                 self.failed_chunk_buffer.extend(audio_data)
                 
                 # Try processing accumulated buffer if it's large enough
-                if len(self.failed_chunk_buffer) > 5000:  # 5KB threshold
-                    self.logger.debug(f"Trying to process accumulated buffer: {len(self.failed_chunk_buffer)} bytes")
+                buffer_threshold = 8000  # 8KB threshold (increased from 5KB)
+                if len(self.failed_chunk_buffer) > buffer_threshold:
+                    self.logger.info(f"Trying to process accumulated buffer: {len(self.failed_chunk_buffer)} bytes")
                     
+                    # Try WebM first on accumulated buffer
                     ffmpeg_cmd = [
                         'ffmpeg',
+                        '-f', 'matroska',
                         '-i', 'pipe:0',        
                         '-f', 's16le',         
                         '-ar', str(target_sample_rate), 
@@ -281,27 +299,54 @@ class WebSocketHandler:
                             stderr=asyncio.subprocess.PIPE
                         )
                         
-                        pcm_data, _ = await proc.communicate(input=bytes(self.failed_chunk_buffer))
+                        pcm_data, stderr_bytes = await proc.communicate(input=bytes(self.failed_chunk_buffer))
                         
                         if proc.returncode == 0 and pcm_data:
-                            self.logger.debug(f"Successfully processed accumulated buffer. PCM data length: {len(pcm_data)}")
+                            self.logger.info(f"Successfully processed accumulated buffer. PCM data length: {len(pcm_data)}")
                             self.failed_chunk_buffer.clear()
                         else:
-                            # Keep only recent data in buffer to prevent infinite growth
-                            if len(self.failed_chunk_buffer) > 10000:
-                                self.failed_chunk_buffer = self.failed_chunk_buffer[-5000:]
-                                self.logger.debug("Trimmed failed chunk buffer to prevent memory growth")
-                            pcm_data = None
-                            
+                            stderr_str = stderr_bytes.decode('utf-8', errors='ignore').strip()
+                            self.logger.error(f"Accumulated buffer processing failed: {stderr_str}")
+                            # Try fallback auto-detect on buffer
+                            try:
+                                fallback_cmd = [
+                                    'ffmpeg', '-i', 'pipe:0', '-f', 's16le', 
+                                    '-ar', str(target_sample_rate), '-ac', '1', 
+                                    '-hide_banner', '-loglevel', 'error', 'pipe:1'
+                                ]
+                                
+                                fallback_proc = await asyncio.create_subprocess_exec(
+                                    *fallback_cmd,
+                                    stdin=asyncio.subprocess.PIPE,
+                                    stdout=asyncio.subprocess.PIPE,
+                                    stderr=asyncio.subprocess.PIPE
+                                )
+                                
+                                pcm_data, _ = await fallback_proc.communicate(input=bytes(self.failed_chunk_buffer))
+                                if fallback_proc.returncode == 0 and pcm_data:
+                                    self.logger.info("Accumulated buffer processed with fallback auto-detect")
+                                    self.failed_chunk_buffer.clear()
+                                else:
+                                    self.logger.error("All buffer processing methods failed, clearing buffer")
+                                    self.failed_chunk_buffer.clear()
+                            except Exception as fallback_e:
+                                self.logger.error(f"Fallback processing failed: {fallback_e}")
+                                self.failed_chunk_buffer.clear()
+                                
                     except Exception as e:
-                        self.logger.debug(f"Accumulated buffer processing failed: {e}")
-                        pcm_data = None
+                        self.logger.error(f"Accumulated buffer processing failed with exception: {e}")
+                        self.failed_chunk_buffer.clear()
                 
                 # If still no PCM data, just return without processing
                 if pcm_data is None:
                     return
 
-            # Add decoded PCM data to buffer
+            # Send error to frontend if all processing failed
+            if not pcm_data:
+                await self._send_error("Audio processing failed - invalid format or corrupted data")
+                return
+
+            # Add PCM data to buffer for frame processing
             self.audio_buffer.extend(pcm_data)
             self.logger.debug(f"Audio buffer now has {len(self.audio_buffer)} bytes")
             
@@ -459,7 +504,7 @@ class WebSocketHandler:
                 
         except Exception as e:
             self.logger.error(f"AI processing error: {e}")
-            await self._send_error("AI processing failed")
+            await self._send_error(f"AI conversation failed: {str(e)}")
         finally: # Watchdog
             # self.pipeline_running will be set to False after TTS is done or if no TTS
             if not self.tts_playing:
@@ -490,6 +535,7 @@ class WebSocketHandler:
             
         except Exception as e:
             self.logger.error(f"TTS streaming error: {e}")
+            await self._send_error(f"Text-to-speech failed: {str(e)}")
             self.tts_playing = False
             self.pipeline_running = False # Watchdog - Pipeline ends on TTS error
             
@@ -530,86 +576,56 @@ class WebSocketHandler:
 
                 self.pipeline_running = True # Watchdog - Start of pipeline after EOS
                 try:
+                    # Simplified EOS handling: always finalize STT and process any remaining audio
+                    final_stt_result = None
+                    
+                    # Process any remaining audio buffer first
                     if self.audio_buffer:
                         self.logger.info(f"Processing remaining audio buffer of {len(self.audio_buffer)} bytes after EOS")
-                        # Process any remaining audio data in the buffer through VAD and STT
-                        # This assumes VAD can process a chunk and STT can finalize based on that.
-                        # We need to ensure VAD signals end of speech if applicable.
                         
-                        # Create a task to process the remaining buffer.
-                        # This is a simplified approach. Real implementation might need to feed this
-                        # through the same path as live audio chunks for VAD to work correctly.
-                        # Forcing VAD end of speech if there's a buffer and then finalizing STT
-                        # might be more robust.
-
-                        # Let's process the remaining audio through the VAD and STT pipeline parts
-                        # VAD process_frame might need to be called iteratively if buffer is large
-                        # For simplicity, assuming VAD can take the whole buffer or a signal.
-                        # This part is crucial and might need adjustment based on VAD/STT capabilities.
-                        
-                        # Attempt to process remaining buffer as a single frame for VAD/STT
-                        # This might not be ideal if the buffer is very large or contains pauses
-                        vad_result = await self.engines['vad'].process_frame(bytes(self.audio_buffer))
-                        self.audio_buffer.clear()
-
-                        if vad_result.is_speech or vad_result.is_end_of_speech : # if there was speech in remaining buffer
-                             stt_finalize_task = asyncio.create_task(self.engines['stt'].finalize())
-                             final_stt_result = await stt_finalize_task
-                             if final_stt_result and final_stt_result.final_text:
-                                 self.logger.info(f"Final text from STT after EOS: {final_stt_result.final_text}")
-                                 await self._send_message({"type": "transcript", "final": final_stt_result.final_text})
-                                 # Trigger AI processing
-                                 asyncio.create_task(self._process_with_ai(final_stt_result.final_text))
-                             else:
-                                 self.logger.info("No final STT result after EOS buffer processing.")
-                                 self.pipeline_running = False # Watchdog - No AI task, so pipeline ends
-                        else: # No speech in remaining buffer
-                             self.logger.info("No speech detected in remaining buffer after EOS.")
-                             self.pipeline_running = False # Watchdog - No AI task, so pipeline ends
+                        # Process remaining buffer through VAD to signal end of speech
+                        try:
+                            vad_result = await self.engines['vad'].process_frame(bytes(self.audio_buffer))
+                            self.audio_buffer.clear()
+                            self.logger.debug(f"VAD processed remaining buffer: speech={vad_result.is_speech}")
+                        except Exception as vad_error:
+                            self.logger.warning(f"VAD processing failed on remaining buffer: {vad_error}")
                     
-                    elif not self.is_speaking: # EOS received, but no audio in buffer and not currently speaking (VAD already triggered EOS)
-                        # This implies VAD already detected end of speech and STT should have been finalized.
-                        # We might need to check if there's a pending AI task from a previous VAD-triggered finalization.
-                        # Or, if STT needs an explicit finalize call even if VAD EOS occurred.
-                        self.logger.info("EOS received, VAD likely already processed end of speech. Checking for final STT.")
-                        final_stt_result = await self.engines['stt'].finalize() # Ensure STT is finalized
-                        if final_stt_result and final_stt_result.final_text:
-                            self.logger.info(f"Final text from STT (VAD EOS): {final_stt_result.final_text}")
-                            # Check if this text was already sent by _process_audio_frame's VAD EOS logic
-                            # This part needs careful handling to avoid duplicate AI processing if VAD EOS + client EOS occur close together
-                            # For now, assume _process_with_ai is idempotent or context manager handles duplicates.
-                            # To prevent reprocessing, we could check if an AI task for this text is already running/completed.
-                            # This check is complex, so we'll rely on downstream idempotency for now.
-                            if not self.context_manager.is_duplicate_user_message(final_stt_result.final_text):
-                                asyncio.create_task(self._process_with_ai(final_stt_result.final_text))
-                            else:
-                                self.logger.info("Duplicate text detected, not reprocessing with AI.")
-                                self.pipeline_running = False # Watchdog
+                    # Always finalize STT to get any pending transcription
+                    try:
+                        final_stt_result = await self.engines['stt'].finalize()
+                        self.logger.debug(f"STT finalization result: {final_stt_result}")
+                    except Exception as stt_error:
+                        self.logger.error(f"STT finalization failed: {stt_error}")
+                    
+                    # Process the final result if we got text
+                    if final_stt_result and final_stt_result.final_text and final_stt_result.final_text.strip():
+                        final_text = final_stt_result.final_text.strip()
+                        self.logger.info(f"Final text from STT after EOS: {final_text}")
+                        
+                        # Check for duplicate to prevent reprocessing
+                        if not self.context_manager.is_duplicate_user_message(final_text):
+                            await self._send_message({"type": "transcript", "final": final_text})
+                            # Start AI processing (will set pipeline_running to False when complete)
+                            asyncio.create_task(self._process_with_ai(final_text))
                         else:
-                            self.logger.info("No final STT result on explicit EOS (VAD already handled).")
+                            self.logger.info("Duplicate text detected, not reprocessing with AI.")
                             self.pipeline_running = False # Watchdog
                     else:
-                        # EOS received while is_speaking is true, but buffer is empty.
-                        # This case might indicate VAD hasn't triggered EOS yet.
-                        # We should finalize STT.
-                        self.logger.info("EOS received while speaking, buffer empty. Finalizing STT.")
-                        final_stt_result = await self.engines['stt'].finalize()
-                        if final_stt_result and final_stt_result.final_text:
-                             self.logger.info(f"Final text from STT after EOS (is_speaking): {final_stt_result.final_text}")
-                             await self._send_message({"type": "transcript", "final": final_stt_result.final_text})
-                             asyncio.create_task(self._process_with_ai(final_stt_result.final_text))
-                        else:
-                            self.logger.info("No final STT result after EOS (is_speaking).")
-                            self.pipeline_running = False # Watchdog
+                        self.logger.info("No final STT result after EOS processing.")
+                        self.pipeline_running = False # Watchdog
+                        
                 except Exception as e:
                     self.logger.error(f"Error during EOS processing: {e}")
                     self.pipeline_running = False # Watchdog - Ensure pipeline_running is reset on error
+                    await self._send_error(f"Processing failed: {str(e)}")
 
             else:
                 self.logger.warning(f"Unknown message type: {message_type}")
                 
         except Exception as e:
             self.logger.error(f"Control message error: {e}")
+            await self._send_error(f"Message processing failed: {str(e)}")
             
     async def _send_message(self, data: Dict[str, Any]):
         """Send JSON message to frontend"""

@@ -166,7 +166,7 @@ def verify_models(model_dir: Path):
 def main():
     """Main download function"""
     # Get model directory from environment or use default
-    model_dir = Path(os.getenv("MODEL_PATH", "/opt/render/project/src/models"))
+    model_dir = Path(os.getenv("MODEL_PATH", "/app/models"))
     
     # Create model directory
     model_dir.mkdir(parents=True, exist_ok=True)

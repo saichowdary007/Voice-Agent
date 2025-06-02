@@ -251,7 +251,7 @@ async def websocket_endpoint(websocket: WebSocket):
     
     logger.info(f"WebSocket connected: {session_id}")
     
-    session["keep_alive_task"] = asyncio.create_task(send_keep_alive_pings(websocket))
+    session["keep_alive_task"] = None
 
     try:
         await send_message(websocket, {
@@ -281,24 +281,6 @@ async def websocket_endpoint(websocket: WebSocket):
         if session and session.get("keep_alive_task"):
             session["keep_alive_task"].cancel()
         session_manager.remove_session(websocket)
-
-async def send_keep_alive_pings(websocket: WebSocket):
-    """Send ping messages to keep the WebSocket connection alive."""
-    try:
-        while True:
-            await asyncio.sleep(10) # Send ping every 10 seconds
-            try:
-                await websocket.send_json({"type": "ping", "timestamp": time.time()})
-            except WebSocketDisconnect:
-                logger.info(f"Client disconnected, stopping ping for {websocket.scope.get('client')}")
-                break
-            except Exception as e:
-                logger.warning(f"Could not send ping, connection might be closed: {e}")
-                break # Assume connection is problematic
-    except asyncio.CancelledError:
-        logger.info("Keep-alive ping task cancelled.")
-    except Exception as e:
-        logger.error(f"Error in keep-alive ping task: {e}")
 
 async def handle_websocket_message(websocket: WebSocket, data: Dict[str, Any]):
     session = session_manager.get_session(websocket)

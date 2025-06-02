@@ -3,6 +3,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Mic, MicOff, Square, AlertTriangle } from 'lucide-react';
 import { MicVAD, utils as vadUtils } from '@ricky0123/vad-web';
+import { AudioPlayer } from '../lib/audio';
 
 interface VoiceAgentProps {
   onError?: (error: string) => void;
@@ -38,9 +39,9 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
   const keepAliveIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const keepAliveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Add refs to track cleanup state and TTS audio contexts
+  // Add refs for persistent TTS audio player (replacing ttsAudioContextsRef)
   const isCleaningUpRef = useRef<boolean>(false);
-  const ttsAudioContextsRef = useRef<Set<AudioContext>>(new Set());
+  const ttsAudioPlayerRef = useRef<AudioPlayer | null>(null);
   const lastServerMessageTimeRef = useRef<number>(Date.now());
 
   // State
@@ -492,6 +493,11 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
     if (isCleaningUpRef.current || !session.isConnected || session.isMuted) return;
 
     try {
+      // Initialize persistent TTS audio player if not exists
+      if (!ttsAudioPlayerRef.current) {
+        ttsAudioPlayerRef.current = new AudioPlayer();
+      }
+
       // Decode base64 to binary data
       const binaryString = atob(base64Audio);
       const bytes = new Uint8Array(binaryString.length);
@@ -499,31 +505,11 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         bytes[i] = binaryString.charCodeAt(i);
       }
       
-      // Create audio context if needed
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-      // Track this audio context
-      ttsAudioContextsRef.current.add(audioContext);
-      
-      // Decode audio data
-      const audioBuffer = await audioContext.decodeAudioData(bytes.buffer);
-      
-      // Create and play audio source
-      const source = audioContext.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(audioContext.destination);
-      
-      // Play the audio
-      source.start(0);
-      
-      // Clean up when finished
-      source.onended = () => {
-        // Only close if not already closed
-        if (audioContext.state !== 'closed') {
-          audioContext.close().catch(console.error);
-        }
-        // Remove from tracking set
-        ttsAudioContextsRef.current.delete(audioContext);
-      };
+      // Play audio using the persistent audio player
+      await ttsAudioPlayerRef.current.playAudio(bytes.buffer, () => {
+        // Audio playback finished callback
+        console.log('TTS audio chunk finished playing');
+      });
       
     } catch (error) {
       console.error('Failed to play TTS audio:', error);
@@ -599,13 +585,11 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         audioContextRef.current = null;
       }
       
-      // Clean up any TTS audio contexts
-      ttsAudioContextsRef.current.forEach(audioContext => {
-        if (audioContext.state !== 'closed') {
-          audioContext.close().catch(console.error);
-        }
-      });
-      ttsAudioContextsRef.current.clear();
+      // Clean up any TTS audio player
+      if (ttsAudioPlayerRef.current) {
+        ttsAudioPlayerRef.current.cleanup();
+        ttsAudioPlayerRef.current = null;
+      }
 
       // Close WebSocket
       if (wsRef.current?.readyState === WebSocket.OPEN) {
