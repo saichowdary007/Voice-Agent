@@ -23,7 +23,7 @@ class TTSService:
         self.config_path = None
         
         # Model paths - will be downloaded at build time
-        self.model_dir = os.getenv("MODEL_PATH", "/opt/render/project/src/models")
+        self.model_dir = os.getenv("MODEL_PATH", "/app/models")
         self.voice_name = "en_US-libritts-high"
         
     async def initialize(self):

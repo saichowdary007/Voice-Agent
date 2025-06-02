@@ -18,7 +18,7 @@ class STTService:
         self.sample_rate = 16000
         
         # Model paths - will be downloaded at build time
-        self.model_dir = os.getenv("MODEL_PATH", "/opt/render/project/src/models")
+        self.model_dir = os.getenv("MODEL_PATH", "/app/models")
         
     async def initialize(self):
         """Initialize the sherpa-ncnn ASR model"""

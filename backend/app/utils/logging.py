@@ -16,7 +16,7 @@ def setup_logging(log_level: str = None) -> None:
     logging.basicConfig(
         format="%(message)s",
         stream=sys.stdout,
-        level=logging.DEBUG  # Changed from INFO to DEBUG for troubleshooting
+        level=log_level.upper() # Use the determined log_level
     )
     
     # Configure structlog

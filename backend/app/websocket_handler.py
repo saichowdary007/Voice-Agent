@@ -15,14 +15,14 @@ from .ai.context_manager import ContextManager
 class WebSocketHandler:
     """Handles WebSocket connections and message routing for voice agent"""
     
-    def __init__(self, websocket: WebSocket, engines: Dict, metrics: Any, logger: Any):
+    def __init__(self, websocket: WebSocket, services: Dict, metrics: Any, logger: Any):
         self.websocket = websocket
-        self.engines = engines
+        self.services = services
         self.metrics = metrics
         self.logger = logger
         
         # Session state - use a more reliable session ID
-        self.session_id = f"session_{int(time.time() * 1000)}"
+        self.session_id = f"session_{int(time.time() * 1000)}_{websocket.client.host}"
         self.logger.info(f"Created session {self.session_id}")
         self.is_muted = False
         self.is_speaking = False
@@ -37,9 +37,9 @@ class WebSocketHandler:
         self.speech_start_time = None
         self.processing_start_time = None
         
-        # Audio streaming state
-        self.tts_playing = False
-        self.should_interrupt = False
+        # Audio streaming state for TTS
+        self.tts_active = False
+        self.should_interrupt_tts = False
         
         # Tasks
         self.processing_tasks = set()
@@ -124,15 +124,15 @@ class WebSocketHandler:
             is_webm = audio_data.startswith(b'\x1a\x45\xdf\xa3')  # WebM magic bytes
             
             # Convert incoming audio (WebM/Opus or Ogg/Opus) to raw PCM s16le
-            # Get target sample rate from one of the engines
+            # Get target sample rate from one of the services
             target_sample_rate = 16000 # Default
-            self.logger.debug(f"Checking engines for sample rate: {list(self.engines.keys())}")
+            self.logger.debug(f"Checking services for sample rate: {list(self.services.keys())}")
             
-            if self.engines and 'stt' in self.engines and hasattr(self.engines['stt'], 'sample_rate'):
-                target_sample_rate = self.engines['stt'].sample_rate
+            if self.services and 'stt' in self.services and hasattr(self.services['stt'], 'sample_rate'):
+                target_sample_rate = self.services['stt'].sample_rate
                 self.logger.debug(f"Using STT sample rate: {target_sample_rate}")
-            elif self.engines and 'vad' in self.engines and hasattr(self.engines['vad'], 'sample_rate'):
-                target_sample_rate = self.engines['vad'].sample_rate
+            elif self.services and 'vad' in self.services and hasattr(self.services['vad'], 'sample_rate'):
+                target_sample_rate = self.services['vad'].sample_rate
                 self.logger.debug(f"Using VAD sample rate: {target_sample_rate}")
 
             # Try different FFmpeg approaches based on data characteristics
@@ -377,26 +377,24 @@ class WebSocketHandler:
             self.pipeline_running = True # Watchdog
             
             # VAD check
-            self.logger.debug("Calling VAD process_frame...")
-            vad_result = await self.engines['vad'].process_frame(frame)
+            self.logger.debug("Calling VAD service process_frame...")
+            vad_result = await self.services['vad'].process_frame(frame)
             self.logger.debug(f"VAD result: is_speech={vad_result.is_speech}, is_end_of_speech={vad_result.is_end_of_speech}")
             
             if vad_result.is_speech:
                 self.logger.debug("Speech detected by VAD")
-                # Speech detected
                 if not self.is_speaking:
                     self.is_speaking = True
                     self.speech_start_time = time.time()
                     self.logger.debug(f"Speech started at {self.speech_start_time}")
                     
-                    # Implement barge-in
-                    if self.tts_playing:
+                    if self.tts_active:
                         self.logger.debug("Barge-in detected during TTS")
                         await self._handle_barge_in()
                         
                 # STT processing
-                self.logger.debug("Calling STT process_frame...")
-                stt_result = await self.engines['stt'].process_frame(frame)
+                self.logger.debug("Calling STT service process_frame...")
+                stt_result = await self.services['stt'].process_frame(frame)
                 self.logger.debug(f"STT result: partial='{stt_result.partial_text}', final='{stt_result.final_text}', is_final={stt_result.is_final}")
                 
                 if stt_result.partial_text:
@@ -425,8 +423,8 @@ class WebSocketHandler:
                 self.is_speaking = False
                 
                 # Finalize STT
-                self.logger.debug("Finalizing STT...")
-                final_result = await self.engines['stt'].finalize()
+                self.logger.debug("Finalizing STT service...")
+                final_result = await self.services['stt'].finalize()
                 if final_result and final_result.final_text:
                     self.logger.debug(f"STT finalized with text: {final_result.final_text}")
                     await self._send_message({
@@ -448,10 +446,10 @@ class WebSocketHandler:
         self.logger.info("Barge-in detected, stopping TTS")
         
         # Stop TTS immediately
-        if self.tts_playing:
-            await self.engines['tts'].stop()
-            self.tts_playing = False
-            self.should_interrupt = True
+        if self.tts_active:
+            await self.services['tts'].stop()
+            self.tts_active = False
+            self.should_interrupt_tts = True
             
             # Notify frontend to stop audio
             await self._send_message({
@@ -473,7 +471,7 @@ class WebSocketHandler:
             
             # Generate AI response
             response_text = ""
-            async for token in self.engines['gemini'].generate_response(
+            async for token in self.services['gemini'].generate_response(
                 self.context_manager.get_messages()
             ):
                 response_text += token
@@ -485,7 +483,7 @@ class WebSocketHandler:
                 })
                 
                 # Start TTS early if we have enough tokens
-                if len(response_text) > 50 and not self.tts_playing:
+                if len(response_text) > 50 and not self.tts_active:
                     asyncio.create_task(self._start_tts_streaming(response_text))
                     
             # Mark response as complete
@@ -507,37 +505,40 @@ class WebSocketHandler:
             await self._send_error(f"AI conversation failed: {str(e)}")
         finally: # Watchdog
             # self.pipeline_running will be set to False after TTS is done or if no TTS
-            if not self.tts_playing:
+            if not self.tts_active:
                  self.pipeline_running = False
             
     async def _start_tts_streaming(self, text: str):
         """Start TTS streaming for AI response"""
         try:
-            # self.pipeline_running = True # Should be true already
-            if self.should_interrupt:
-                # Skip TTS if interrupted
-                self.should_interrupt = False
+            if self.should_interrupt_tts:
+                self.should_interrupt_tts = False
+                self.logger.info("TTS streaming skipped due to interruption.")
                 return
                 
-            self.tts_playing = True
+            self.tts_active = True
+            self.pipeline_running = True
             
             # Generate TTS audio chunks
-            async for audio_chunk in self.engines['tts'].generate_speech_stream(text):
-                if self.should_interrupt:
-                    # Stop if interrupted
+            async for audio_chunk in self.services['tts'].generate_speech_stream(text):
+                if self.should_interrupt_tts:
+                    self.logger.info("TTS streaming interrupted mid-stream.")
+                    if hasattr(self.services.get('tts'), 'stop'):
+                        await self.services['tts'].stop()
                     break
                     
-                # Send audio chunk to frontend
                 await self.websocket.send_bytes(audio_chunk)
                 
-            self.tts_playing = False
-            self.pipeline_running = False # Watchdog - Pipeline ends after TTS
+            self.tts_active = False
+            self.pipeline_running = False
             
         except Exception as e:
-            self.logger.error(f"TTS streaming error: {e}")
+            self.logger.error(f"TTS streaming error: {e}", exc_info=True)
             await self._send_error(f"Text-to-speech failed: {str(e)}")
-            self.tts_playing = False
-            self.pipeline_running = False # Watchdog - Pipeline ends on TTS error
+        finally:
+            self.tts_active = False
+            self.pipeline_running = False
+            self.logger.info("TTS streaming finished or errored. Pipeline running set to False.")
             
     async def handle_control_message(self, data: Dict[str, Any]):
         """Handle control messages from frontend"""
@@ -585,7 +586,7 @@ class WebSocketHandler:
                         
                         # Process remaining buffer through VAD to signal end of speech
                         try:
-                            vad_result = await self.engines['vad'].process_frame(bytes(self.audio_buffer))
+                            vad_result = await self.services['vad'].process_frame(bytes(self.audio_buffer))
                             self.audio_buffer.clear()
                             self.logger.debug(f"VAD processed remaining buffer: speech={vad_result.is_speech}")
                         except Exception as vad_error:
@@ -593,7 +594,7 @@ class WebSocketHandler:
                     
                     # Always finalize STT to get any pending transcription
                     try:
-                        final_stt_result = await self.engines['stt'].finalize()
+                        final_stt_result = await self.services['stt'].finalize()
                         self.logger.debug(f"STT finalization result: {final_stt_result}")
                     except Exception as stt_error:
                         self.logger.error(f"STT finalization failed: {stt_error}")
@@ -665,8 +666,8 @@ class WebSocketHandler:
                 await asyncio.gather(*self.processing_tasks, return_exceptions=True)
                 
             # Stop any ongoing TTS
-            if self.tts_playing:
-                await self.engines['tts'].stop()
+            if self.tts_active:
+                await self.services['tts'].stop()
                 
             self.logger.info(f"Session {self.session_id} cleaned up")
             

@@ -71,7 +71,9 @@ open http://localhost:3000
 cd backend
 pip install -r requirements.txt
 python -m app.models.download_models  # Download models
-uvicorn app.main:app --host 0.0.0.0 --port 8001
+# This runs the backend on http://localhost:8000 by default (see backend/app/config.py)
+# If using Docker, docker-compose.yml maps host port 8001 to container port 8000.
+uvicorn app.main:app --host 0.0.0.0 --port 8000 # Or use python -m app.main for defaults from config
 
 # Frontend  
 cd frontend
@@ -84,7 +86,7 @@ npm run dev
 ### Environment Variables
 ```env
 # Required
-GOOGLE_API_KEY=your_gemini_api_key
+GOOGLE_API_KEY=your_gemini_api_key_here
 
 # Optional - Audio Processing
 SAMPLE_RATE=16000
