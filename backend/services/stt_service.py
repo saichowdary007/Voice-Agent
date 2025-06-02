@@ -5,9 +5,19 @@ import numpy as np
 import soundfile as sf
 import tempfile
 from typing import Optional, Dict, Any, AsyncGenerator
+from dataclasses import dataclass
 import sherpa_ncnn
 
 logger = logging.getLogger(__name__)
+
+@dataclass
+class STTResult:
+    """STT processing result"""
+    partial_text: str
+    final_text: str
+    is_final: bool
+    confidence: float
+    timestamp: float = 0.0
 
 class STTService:
     """Speech-to-Text service using sherpa-ncnn 2.1.11 for ultra-fast streaming ASR"""
@@ -20,6 +30,10 @@ class STTService:
         # Model paths - will be downloaded at build time
         self.model_dir = os.getenv("MODEL_PATH", "/app/models")
         
+        # Audio buffer for streaming
+        self.audio_buffer = []
+        self.total_audio_duration = 0.0
+        
     async def initialize(self):
         """Initialize the sherpa-ncnn ASR model"""
         try:
@@ -27,16 +41,19 @@ class STTService:
             
             # Use the correct API for sherpa-ncnn 2.1.11
             # Based on documentation: direct Recognizer initialization
-            self.recognizer = sherpa_ncnn.Recognizer(
-                tokens=f"{self.model_dir}/tokens.txt",
-                encoder_param=f"{self.model_dir}/encoder_jit_trace-pnnx.ncnn.param",
-                encoder_bin=f"{self.model_dir}/encoder_jit_trace-pnnx.ncnn.bin",
-                decoder_param=f"{self.model_dir}/decoder_jit_trace-pnnx.ncnn.param",
-                decoder_bin=f"{self.model_dir}/decoder_jit_trace-pnnx.ncnn.bin",
-                joiner_param=f"{self.model_dir}/joiner_jit_trace-pnnx.ncnn.param",
-                joiner_bin=f"{self.model_dir}/joiner_jit_trace-pnnx.ncnn.bin",
-                num_threads=2,
-            )
+            def create_recognizer():
+                return sherpa_ncnn.Recognizer(
+                    tokens=f"{self.model_dir}/tokens.txt",
+                    encoder_param=f"{self.model_dir}/encoder_jit_trace-pnnx.ncnn.param",
+                    encoder_bin=f"{self.model_dir}/encoder_jit_trace-pnnx.ncnn.bin",
+                    decoder_param=f"{self.model_dir}/decoder_jit_trace-pnnx.ncnn.param",
+                    decoder_bin=f"{self.model_dir}/decoder_jit_trace-pnnx.ncnn.bin",
+                    joiner_param=f"{self.model_dir}/joiner_jit_trace-pnnx.ncnn.param",
+                    joiner_bin=f"{self.model_dir}/joiner_jit_trace-pnnx.ncnn.bin",
+                    num_threads=2,
+                )
+            
+            self.recognizer = await asyncio.to_thread(create_recognizer)
             
             if not self.recognizer:
                 raise Exception("Failed to create recognizer")
@@ -47,6 +64,123 @@ class STTService:
         except Exception as e:
             logger.error(f"Failed to initialize sherpa-ncnn: {e}")
             self.is_available = False
+
+    async def process_frame(self, audio_frame: bytes) -> STTResult:
+        """Process audio frame and return streaming STT result"""
+        try:
+            if not self.is_available:
+                return STTResult(
+                    partial_text="",
+                    final_text="",
+                    is_final=False,
+                    confidence=0.0,
+                    timestamp=self.total_audio_duration
+                )
+            
+            # Convert bytes to float32 audio
+            if isinstance(audio_frame, bytes):
+                audio_data = np.frombuffer(audio_frame, dtype=np.int16)
+            else:
+                audio_data = audio_frame
+                
+            # Normalize to float32 [-1, 1]
+            audio_float = audio_data.astype(np.float32) / 32768.0
+            
+            # Add to buffer
+            self.audio_buffer.extend(audio_float)
+            
+            # Process if we have enough samples (30ms minimum)
+            min_samples = self.sample_rate * 30 // 1000
+            if len(self.audio_buffer) >= min_samples:
+                # Extract audio chunk
+                audio_chunk = np.array(self.audio_buffer)
+                self.audio_buffer = []
+                    
+                # Feed audio to recognizer (sherpa-ncnn 2.1.11 API)
+                def process_audio():
+                    self.recognizer.accept_waveform(self.sample_rate, audio_chunk)
+                    return self.recognizer.text.strip()
+                
+                partial_text = await asyncio.to_thread(process_audio)
+                
+                # Update audio duration
+                audio_duration = len(audio_chunk) / self.sample_rate
+                self.total_audio_duration += audio_duration
+                
+                return STTResult(
+                    partial_text=partial_text,
+                    final_text="",
+                    is_final=False,
+                    confidence=0.95,
+                    timestamp=self.total_audio_duration
+                )
+            else:
+                # Not enough audio yet
+                return STTResult(
+                    partial_text="",
+                    final_text="",
+                    is_final=False,
+                    confidence=0.0,
+                    timestamp=self.total_audio_duration
+                )
+                
+        except Exception as e:
+            logger.error(f"STT processing error: {e}")
+            return STTResult(
+                partial_text="",
+                final_text="",
+                is_final=False,
+                confidence=0.0,
+                timestamp=self.total_audio_duration
+            )
+
+    async def finalize(self) -> Optional[STTResult]:
+        """Finalize current utterance and get final result"""
+        try:
+            if not self.is_available:
+                return None
+                
+            def finalize_recognition():
+                # Process any remaining audio
+                if self.audio_buffer:
+                    audio_chunk = np.array(self.audio_buffer)
+                    self.audio_buffer = []
+                    self.recognizer.accept_waveform(self.sample_rate, audio_chunk)
+                    
+                # Add tail padding for complete recognition
+                tail_paddings = np.zeros(int(self.sample_rate * 0.5), dtype=np.float32)
+                self.recognizer.accept_waveform(self.sample_rate, tail_paddings)
+                
+                # Signal input finished for final result
+                self.recognizer.input_finished()
+                
+                # Get final result
+                final_text = self.recognizer.text.strip()
+                
+                # Reset for next utterance
+                self.recognizer.reset()
+                
+                return final_text
+            
+            final_text = await asyncio.to_thread(finalize_recognition)
+            
+            if final_text:
+                logger.debug(f"STT finalized with text: {final_text}")
+                
+                return STTResult(
+                    partial_text="",
+                    final_text=final_text,
+                    is_final=True,
+                    confidence=0.95,
+                    timestamp=self.total_audio_duration
+                )
+            else:
+                logger.debug("STT finalization returned no text")
+                return None
+                
+        except Exception as e:
+            logger.error(f"STT finalization error: {e}")
+            return None
     
     async def transcribe_streaming(self, audio_data: bytes) -> Dict[str, Any]:
         """
@@ -72,8 +206,11 @@ class STTService:
             audio_samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
             
             # Use sherpa-ncnn 2.1.11 streaming API
-            self.recognizer.accept_waveform(self.sample_rate, audio_samples)
-            result_text = self.recognizer.text
+            def process_streaming():
+                self.recognizer.accept_waveform(self.sample_rate, audio_samples)
+                return self.recognizer.text
+            
+            result_text = await asyncio.to_thread(process_streaming)
             
             # For streaming, we return partial results
             return {
@@ -117,17 +254,20 @@ class STTService:
             # Convert bytes to numpy array
             audio_samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
             
-            # Use sherpa-ncnn 2.1.11 API for complete transcription
-            self.recognizer.accept_waveform(self.sample_rate, audio_samples)
+            def transcribe_complete():
+                # Use sherpa-ncnn 2.1.11 API for complete transcription
+                self.recognizer.accept_waveform(self.sample_rate, audio_samples)
+                
+                # Add tail padding for complete recognition
+                tail_paddings = np.zeros(int(self.sample_rate * 0.5), dtype=np.float32)
+                self.recognizer.accept_waveform(self.sample_rate, tail_paddings)
+                
+                # Signal input finished for final result
+                self.recognizer.input_finished()
+                
+                return self.recognizer.text.strip()
             
-            # Add tail padding for complete recognition
-            tail_paddings = np.zeros(int(self.sample_rate * 0.5), dtype=np.float32)
-            self.recognizer.accept_waveform(self.sample_rate, tail_paddings)
-            
-            # Signal input finished for final result
-            self.recognizer.input_finished()
-            
-            transcript = self.recognizer.text.strip()
+            transcript = await asyncio.to_thread(transcribe_complete)
                 
             logger.info(f"STT transcribed: '{transcript}'")
                 
@@ -154,6 +294,8 @@ class STTService:
             if self.recognizer:
                 # Reset recognizer state for new stream
                 self.recognizer.reset()
+                self.audio_buffer = []
+                self.total_audio_duration = 0.0
         except Exception as e:
             logger.warning(f"Failed to reset stream: {e}")
     
@@ -176,8 +318,21 @@ class STTService:
         """Get STT service status"""
         return {
             "available": self.is_available,
-            "service": "sherpa-ncnn 2.1.11" if self.is_available else "Not Available",
+            "service": "Sherpa-NCNN" if self.is_available else "Not Available",
             "sample_rate": self.sample_rate,
-            "streaming": True,
-            "model_dir": self.model_dir
-        } 
+            "model_path": self.model_dir,
+            "streaming": True
+        }
+    
+    async def cleanup(self):
+        """Clean up STT resources"""
+        try:
+            if self.recognizer:
+                del self.recognizer
+                self.recognizer = None
+                
+            self.is_available = False
+            logger.info("STT service cleaned up")
+            
+        except Exception as e:
+            logger.error(f"STT cleanup error: {e}") 

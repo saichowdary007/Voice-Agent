@@ -9,6 +9,7 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.websockets import WebSocketState
 import structlog
 
 from ..services.vad_service import VADService

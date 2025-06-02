@@ -14,8 +14,9 @@ class LLMService:
     def __init__(self):
         self.model = None
         self.is_available = False
-        self.api_key = os.getenv("GEMINI_API_KEY")
-        self.model_name = "gemini-2.0-flash"
+        # Use GOOGLE_API_KEY to match the config
+        self.api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        self.model_name = "gemini-2.0-flash-exp"
         
         # Conversation history
         self.conversation_history = []
@@ -32,7 +33,10 @@ class LLMService:
             logger.info("Initializing Gemini 2.0 Flash model...")
             
             # Configure Gemini
-            genai.configure(api_key=self.api_key)
+            def configure_genai():
+                genai.configure(api_key=self.api_key)
+            
+            await asyncio.to_thread(configure_genai)
             
             # Create model with optimized settings for speed
             generation_config = genai.types.GenerationConfig(
@@ -68,7 +72,11 @@ class LLMService:
                 )
             
             # Test the model
-            test_response = self.model.generate_content("Hello")
+            def test_model():
+                test_response = self.model.generate_content("Hello")
+                return test_response
+            
+            test_response = await asyncio.to_thread(test_model)
             if test_response and test_response.text:
                 self.is_available = True
                 logger.info("✅ Gemini 2.0 Flash initialized successfully")
@@ -101,7 +109,10 @@ class LLMService:
             prompt = self._build_prompt(user_input)
             
             # Generate response
-            response = self.model.generate_content(prompt)
+            def generate():
+                return self.model.generate_content(prompt)
+            
+            response = await asyncio.to_thread(generate)
             
             if response and response.text:
                 response_text = response.text.strip()
@@ -150,7 +161,11 @@ class LLMService:
             
             # Generate streaming response
             response_text = ""
-            response = self.model.generate_content(prompt, stream=True)
+            
+            def generate_stream():
+                return self.model.generate_content(prompt, stream=True)
+            
+            response = await asyncio.to_thread(generate_stream)
             
             for chunk in response:
                 if chunk.text:
@@ -249,4 +264,15 @@ class LLMService:
             "api_key_configured": bool(self.api_key and self.api_key != "test_key_for_demo"),
             "conversation_exchanges": len(self.conversation_history) // 2,
             "max_history_length": self.max_history_length
-        } 
+        }
+    
+    async def cleanup(self):
+        """Clean up LLM resources"""
+        try:
+            self.model = None
+            self.conversation_history = []
+            self.is_available = False
+            logger.info("LLM service cleaned up")
+            
+        except Exception as e:
+            logger.error(f"LLM cleanup error: {e}") 

@@ -458,7 +458,8 @@ class WebSocketHandler:
             })
             
         # Track barge-in metrics
-        self.metrics.increment_counter('barge_ins_total')
+        if self.metrics:
+            self.metrics.increment_counter('barge_ins_total')
         
     async def _process_with_ai(self, text: str):
         """Process user text with Gemini AI"""
@@ -471,8 +472,8 @@ class WebSocketHandler:
             
             # Generate AI response
             response_text = ""
-            async for token in self.services['gemini'].generate_response(
-                self.context_manager.get_messages()
+            async for token in self.services['llm'].generate_streaming(
+                self.context_manager.get_messages()[-1].content if self.context_manager.get_messages() else text
             ):
                 response_text += token
                 
@@ -496,7 +497,7 @@ class WebSocketHandler:
             self.context_manager.add_ai_message(response_text)
             
             # Track processing latency
-            if self.speech_start_time:
+            if self.speech_start_time and self.metrics:
                 latency = time.time() - self.speech_start_time
                 self.metrics.record_latency('end_to_end_latency', latency)
                 

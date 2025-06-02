@@ -443,4 +443,22 @@ class AudioService:
             return pcm_data
         
         logger.debug("All PCM extraction methods failed")
-        return None 
+        return None
+    
+    async def cleanup(self):
+        """Clean up audio service resources"""
+        try:
+            if self.opus_decoder:
+                del self.opus_decoder
+                self.opus_decoder = None
+                
+            if self.opus_encoder:
+                del self.opus_encoder
+                self.opus_encoder = None
+                
+            self.audio_buffer.clear()
+            self.is_available = False
+            logger.info("Audio service cleaned up")
+            
+        except Exception as e:
+            logger.error(f"Audio service cleanup error: {e}") 

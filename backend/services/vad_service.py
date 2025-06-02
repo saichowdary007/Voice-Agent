@@ -3,9 +3,18 @@ import numpy as np
 import torch
 import asyncio
 from typing import Optional, Tuple, Dict, Any
+from dataclasses import dataclass
 from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
 
 logger = logging.getLogger(__name__)
+
+@dataclass
+class VADResult:
+    """Voice activity detection result"""
+    is_speech: bool
+    is_end_of_speech: bool
+    confidence: float
+    timestamp: float
 
 class VADService:
     """Voice Activity Detection service using Silero VAD"""
@@ -22,17 +31,96 @@ class VADService:
         self.speech_start_time = None
         self.silence_duration = 0
         self.max_silence_ms = 1000  # 1 second of silence ends speech
+        self.frame_count = 0
         
     async def initialize(self):
         """Initialize the VAD model"""
         try:
             logger.info("Loading Silero VAD model...")
-            self.model = load_silero_vad()
+            self.model = await asyncio.to_thread(load_silero_vad)
             self.is_available = True
             logger.info("✅ Silero VAD model loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load Silero VAD model: {e}")
             self.is_available = False
+
+    async def process_frame(self, audio_frame: bytes) -> VADResult:
+        """Process audio frame and detect voice activity"""
+        try:
+            self.frame_count += 1
+            current_time = self.frame_count * len(audio_frame) / (self.sample_rate * 2)  # 2 bytes per sample
+            
+            if not self.is_available or self.model is None:
+                return VADResult(
+                    is_speech=False,
+                    is_end_of_speech=False,
+                    confidence=0.0,
+                    timestamp=current_time
+                )
+            
+            # Convert bytes to numpy array
+            if isinstance(audio_frame, bytes):
+                audio_data = np.frombuffer(audio_frame, dtype=np.int16).astype(np.float32) / 32768.0
+            else:
+                audio_data = audio_frame
+                
+            # Process audio frame
+            def process_vad():
+                # Ensure audio is the right format
+                if len(audio_data.shape) > 1:
+                    processed_audio = audio_data.mean(axis=1)  # Convert to mono
+                else:
+                    processed_audio = audio_data
+                    
+                # Normalize audio
+                if processed_audio.dtype != np.float32:
+                    processed_audio = processed_audio.astype(np.float32)
+                if np.max(np.abs(processed_audio)) > 1.0:
+                    processed_audio = processed_audio / np.max(np.abs(processed_audio))
+                    
+                # Convert to tensor
+                audio_tensor = torch.from_numpy(processed_audio)
+                
+                # Get VAD prediction
+                speech_prob = self.model(audio_tensor, self.sample_rate).item()
+                return speech_prob
+            
+            speech_prob = await asyncio.to_thread(process_vad)
+            is_speech = speech_prob > self.threshold
+            
+            # Track speech state
+            speech_ended = False
+            
+            if is_speech:
+                if not self.is_speech_active:
+                    self.is_speech_active = True
+                    self.speech_start_time = current_time
+                    logger.debug("Speech started")
+                self.silence_duration = 0
+            else:
+                if self.is_speech_active:
+                    self.silence_duration += len(audio_data) / self.sample_rate * 1000
+                    if self.silence_duration >= self.max_silence_ms:
+                        self.is_speech_active = False
+                        speech_ended = True
+                        logger.debug("Speech ended")
+                        
+            return VADResult(
+                is_speech=is_speech and self.is_speech_active,
+                is_end_of_speech=speech_ended,
+                confidence=speech_prob,
+                timestamp=current_time
+            )
+            
+        except Exception as e:
+            logger.error(f"VAD processing error: {e}")
+            current_time = self.frame_count * len(audio_frame) / (self.sample_rate * 2) if isinstance(audio_frame, bytes) else 0
+            return VADResult(
+                is_speech=False,
+                is_end_of_speech=False,
+                confidence=0.0,
+                timestamp=current_time
+            )
             
     def process_audio_frame(self, audio_data: np.ndarray) -> Tuple[bool, bool]:
         """
@@ -142,13 +230,31 @@ class VADService:
         self.is_speech_active = False
         self.speech_start_time = None
         self.silence_duration = 0
+        self.frame_count = 0
         
     def get_status(self) -> Dict[str, Any]:
         """Get VAD service status"""
         return {
             "available": self.is_available,
             "threshold": self.threshold,
-            "min_speech_duration_ms": self.min_speech_duration_ms,
+            "sample_rate": self.sample_rate,
             "is_speech_active": self.is_speech_active,
-            "sample_rate": self.sample_rate
-        } 
+            "frame_count": self.frame_count
+        }
+    
+    async def cleanup(self):
+        """Clean up VAD resources"""
+        try:
+            if self.model is not None:
+                del self.model
+                self.model = None
+                
+            # Clear CUDA cache if available
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            self.is_available = False
+            logger.info("VAD service cleaned up")
+            
+        except Exception as e:
+            logger.error(f"VAD cleanup error: {e}") 
