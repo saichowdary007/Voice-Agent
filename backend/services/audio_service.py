@@ -6,27 +6,35 @@ from typing import Optional, Tuple, Dict, Any, List
 import opuslib
 import soundfile as sf
 import subprocess
+import shutil
+
+from ..app.config import settings, get_sample_rate, get_channels
 
 logger = logging.getLogger(__name__)
 
 class AudioService:
     """Audio processing service for Opus decoding, PCM conversion, and format management"""
     
-    def __init__(self, sample_rate: int = 16000, channels: int = 1):
-        self.sample_rate = sample_rate
-        self.channels = channels
+    def __init__(self, sample_rate: Optional[int] = None, channels: Optional[int] = None):
+        # Use standardized configuration
+        self.sample_rate = sample_rate or get_sample_rate()
+        self.channels = channels or get_channels()
         self.opus_decoder = None
         self.opus_encoder = None
         self.is_available = False
+        self.ffmpeg_available = False
         
         # Audio buffers
         self.audio_buffer = bytearray()
-        self.frame_size = int(sample_rate * 0.12)  # 120ms frames as per spec
+        self.frame_size = int(self.sample_rate * settings.audio_frame_ms / 1000)  # Frame size based on config
         
     async def initialize(self):
         """Initialize audio processing components"""
         try:
             logger.info("Initializing audio processing service...")
+            
+            # Check FFmpeg availability first
+            await self._check_ffmpeg_availability()
             
             # Initialize Opus codec
             self.opus_decoder = opuslib.Decoder(fs=self.sample_rate, channels=self.channels)
@@ -38,11 +46,41 @@ class AudioService:
             self.opus_encoder.complexity = 5  # Balance between quality and CPU
             
             self.is_available = True
-            logger.info("✅ Audio service initialized successfully")
+            logger.info(f"✅ Audio service initialized successfully - Sample rate: {self.sample_rate}Hz, Channels: {self.channels}, FFmpeg: {self.ffmpeg_available}")
             
         except Exception as e:
             logger.error(f"Failed to initialize audio service: {e}")
             self.is_available = False
+    
+    async def _check_ffmpeg_availability(self):
+        """Check if FFmpeg is available and properly installed"""
+        try:
+            # Check if ffmpeg is in PATH
+            ffmpeg_path = shutil.which('ffmpeg')
+            if not ffmpeg_path:
+                logger.error("FFmpeg not found in PATH. Please ensure FFmpeg is installed.")
+                self.ffmpeg_available = False
+                return
+            
+            # Test FFmpeg execution
+            result = await asyncio.create_subprocess_exec(
+                'ffmpeg', '-version',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await result.communicate()
+            
+            if result.returncode == 0:
+                version_info = stdout.decode('utf-8').split('\n')[0]
+                logger.info(f"FFmpeg available: {version_info}")
+                self.ffmpeg_available = True
+            else:
+                logger.error(f"FFmpeg test failed: {stderr.decode('utf-8')}")
+                self.ffmpeg_available = False
+                
+        except Exception as e:
+            logger.error(f"FFmpeg availability check failed: {e}")
+            self.ffmpeg_available = False
     
     def decode_opus_frame(self, opus_frame: bytes) -> Optional[np.ndarray]:
         """
@@ -109,7 +147,7 @@ class AudioService:
         """
         audio_frames = []
         
-        if not self.is_available:
+        if not self.is_available or not self.ffmpeg_available:
             return audio_frames
             
         try:
@@ -149,6 +187,10 @@ class AudioService:
         Returns:
             Converted audio data or None if conversion fails
         """
+        if not self.ffmpeg_available:
+            logger.error("FFmpeg not available for audio conversion")
+            return None
+            
         try:
             # Build ffmpeg command
             cmd = [

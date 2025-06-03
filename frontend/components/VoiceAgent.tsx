@@ -252,103 +252,121 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
     }
   }, [onError]);
 
-  // Initialize audio recording
+  // Initialize audio
   const initializeAudio = useCallback(async () => {
+    if (isCleaningUpRef.current) {
+      console.log('Cleanup in progress, cannot initialize audio');
+      return;
+    }
+
     try {
       console.log('Requesting microphone access...');
-      const stream = await navigator.mediaDevices.getUserMedia({
+      
+      // Enhanced audio constraints for better quality and compatibility
+      const constraints: MediaStreamConstraints = {
         audio: {
-          sampleRate: 16000,
-          channelCount: 1,
+          sampleRate: 16000,      // Match backend sample rate
+          channelCount: 1,        // Mono audio for voice processing
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
-        }
-      });
+          // Additional constraints for better voice processing
+          latency: 0.01,         // Low latency requirement
+          volume: 1.0            // Full volume
+        },
+        video: false
+      };
 
-      console.log('Microphone access granted:', stream.getAudioTracks());
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
       streamRef.current = stream;
+      
+      console.log('Microphone access granted');
+      console.log('Audio track settings:', stream.getAudioTracks()[0]?.getSettings());
 
-      // Initialize MediaRecorder
-      const preferredMimeTypes = [
-        'audio/ogg;codecs=opus', // TASK 2.a: Ensure this is prioritized
-        'audio/webm;codecs=opus', 
-        'audio/webm',
-      ];
+      // Check if we need to clean up existing recorder
+      if (mediaRecorderRef.current) {
+        try {
+          if (mediaRecorderRef.current.state !== 'inactive') {
+            mediaRecorderRef.current.stop();
+          }
+        } catch (recorderCleanupError) {
+          console.warn('Error cleaning up existing MediaRecorder:', recorderCleanupError);
+        }
+        mediaRecorderRef.current = null;
+      }
 
-      let selectedMimeType = '';
-      for (const mimeType of preferredMimeTypes) {
-        if (MediaRecorder.isTypeSupported(mimeType)) {
-          selectedMimeType = mimeType;
-          break;
+      // Set up MediaRecorder with optimized settings
+      let mediaRecorder: MediaRecorder;
+      try {
+        // Try WebM/Opus first (best compression and quality for voice)
+        mediaRecorder = new MediaRecorder(stream, {
+          mimeType: 'audio/webm;codecs=opus',
+          audioBitsPerSecond: 32000 // 32 kbps for voice
+        });
+        console.log('MediaRecorder initialized with WebM/Opus');
+      } catch (webmError) {
+        console.warn('WebM/Opus not supported, trying alternatives:', webmError);
+        try {
+          // Fallback to WebM without codec specification
+          mediaRecorder = new MediaRecorder(stream, {
+            mimeType: 'audio/webm',
+            audioBitsPerSecond: 32000
+          });
+          console.log('MediaRecorder initialized with WebM (generic)');
+        } catch (webmGenericError) {
+          console.warn('WebM not supported, using default format:', webmGenericError);
+          // Final fallback to default
+          mediaRecorder = new MediaRecorder(stream);
+          console.log('MediaRecorder initialized with default format');
         }
       }
-
-      if (!selectedMimeType) {
-        console.error('No supported MIME type found for MediaRecorder. Supported types checked:', preferredMimeTypes);
-        onError?.('MediaRecorder: No supported audio format found. Please try a different browser or check microphone settings.');
-        // Optional: Clean up stream tracks if we can't proceed
-        stream.getTracks().forEach(track => track.stop());
-        streamRef.current = null; 
-        return; // Stop further initialization
-      }
       
-      console.log(`Using MediaRecorder MIME type: ${selectedMimeType}`);
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: selectedMimeType,
-        audioBitsPerSecond: 64000, // This might need adjustment based on codec
-      });
-      
-      console.log('MediaRecorder initialized with MIME type:', selectedMimeType);
       mediaRecorderRef.current = mediaRecorder;
 
-      // Audio chunk buffering to reduce FFmpeg overhead on small chunks
-      let audioChunkBuffer: Blob[] = [];
+      // Audio chunk buffering for improved streaming
+      let audioChunks: Blob[] = [];
       let bufferTimer: number | null = null;
-      const BUFFER_TIME_MS = 200; // Buffer chunks for 200ms
-      const MIN_CHUNK_SIZE = 1000; // Minimum chunk size before sending
+      const BUFFER_TIMEOUT = 120; // 120ms to match backend frame size
 
       const flushBuffer = () => {
-        if (audioChunkBuffer.length > 0) {
-          const combinedBlob = new Blob(audioChunkBuffer, { type: selectedMimeType });
-          if (wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(combinedBlob);
-          }
-          audioChunkBuffer = [];
-        }
-        bufferTimer = null;
-      };
-
-      mediaRecorderRef.current.ondataavailable = (event) => {
-        if (event.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
-          // Add chunk to buffer
-          audioChunkBuffer.push(event.data);
+        if (audioChunks.length > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
+          const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
           
-          // Calculate total buffered size
-          const totalSize = audioChunkBuffer.reduce((sum, blob) => sum + blob.size, 0);
+          audioBlob.arrayBuffer().then(buffer => {
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(buffer);
+              console.log(`Sent audio chunk: ${buffer.byteLength} bytes`);
+            }
+          }).catch(error => {
+            console.error('Error converting audio blob to buffer:', error);
+          });
           
-          // Send immediately if we have enough data or if this is the final chunk (when recording stops)
-          if (totalSize >= MIN_CHUNK_SIZE || mediaRecorderRef.current?.state === 'inactive') {
-            // Cancel pending timer
-            if (bufferTimer) {
-              window.clearTimeout(bufferTimer);
-              bufferTimer = null;
-            }
-            flushBuffer();
-          } else {
-            // Set timer to flush buffer after delay if not already set
-            if (!bufferTimer) {
-              bufferTimer = window.setTimeout(flushBuffer, BUFFER_TIME_MS);
-            }
-          }
+          audioChunks = [];
         }
       };
 
-      mediaRecorderRef.current.onstart = () => {
+      // Enhanced MediaRecorder event handlers
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          console.log(`Audio chunk received: ${event.data.size} bytes`);
+          audioChunks.push(event.data);
+          
+          // Clear existing timer
+          if (bufferTimer) {
+            window.clearTimeout(bufferTimer);
+          }
+          
+          // Set timer to flush buffer if no more chunks arrive soon
+          bufferTimer = window.setTimeout(flushBuffer, BUFFER_TIMEOUT);
+        }
+      };
+
+      mediaRecorder.onstart = () => {
         console.log('MediaRecorder started');
+        setSession(prev => ({ ...prev, isRecording: true }));
       };
 
-      mediaRecorderRef.current.onstop = () => {
+      mediaRecorder.onstop = () => {
         console.log('MediaRecorder stopped. Sending EOS to backend.');
         
         // Flush any remaining buffered audio
@@ -358,98 +376,100 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         }
         flushBuffer();
         
+        setSession(prev => ({ ...prev, isRecording: false }));
+        
         if (wsRef.current?.readyState === WebSocket.OPEN) {
             wsRef.current.send(JSON.stringify({ type: "eos" }));
         }
       };
       
-      mediaRecorderRef.current.onerror = (event) => {
+      mediaRecorder.onerror = (event) => {
         console.error('MediaRecorder error:', event);
         onError?.('MediaRecorder error. Please check microphone.');
       };
 
-      // Initialize VAD
+      // Initialize VAD with optimized parameters for voice conversation
       console.log('Initializing VAD...');
-      if (vadRef.current) { // Destroy any existing VAD instance
+      if (vadRef.current) {
         console.log('Destroying existing VAD instance...');
-        vadRef.current.destroy();
+        try {
+          vadRef.current.destroy();
+        } catch (vadDestroyError) {
+          console.warn('Error destroying existing VAD:', vadDestroyError);
+        }
         vadRef.current = null;
       }
 
-      let myVad: MicVAD | null = null; // Explicitly define type
+      let myVad: MicVAD | null = null;
       try {
         myVad = await MicVAD.new({
           stream: streamRef.current,
           onSpeechStart: () => {
             console.log("VAD: Speech started");
+            setSession(prev => ({ ...prev, isSpeaking: true }));
             if (mediaRecorderRef.current?.state === 'inactive') {
-              mediaRecorderRef.current.start(120); // Use consistent 120ms timeslice
+              mediaRecorderRef.current.start(BUFFER_TIMEOUT); // Use consistent timing
             }
           },
           onSpeechEnd: (audio: Float32Array) => {
-            // audio is a Float32Array of PCM data from the speech segment, can be used for local processing if needed
-            console.log('VAD EOS detected by Silero VAD.'); // Clarified log
+            console.log('VAD: Speech ended, audio length:', audio.length);
+            setSession(prev => ({ ...prev, isSpeaking: false }));
             if (mediaRecorderRef.current?.state === 'recording') {
-              console.log('VAD EOS: Stopping MediaRecorder.');
-              mediaRecorderRef.current.stop(); // Triggers ondataavailable (final) and then onstop
+              console.log('VAD EOS: Stopping MediaRecorder');
+              mediaRecorderRef.current.stop();
             }
-            // EOS message is now sent in mediaRecorder.onstop
-            // setSession(prev => ({ ...prev, isRecording: false })); // Moved to onstop for consistency
           },
-          minSpeechFrames: 3,
-          positiveSpeechThreshold: 0.8,
-          negativeSpeechThreshold: 0.4,
-          minSilenceFrames: 10, // ~100ms of silence - THIS IS A VALID OPTION
-          redemptionFrames: 30,
+          // Optimized VAD parameters for responsive voice conversation
+          minSpeechFrames: 3,              // Minimum frames to consider as speech start
+          positiveSpeechThreshold: 0.7,    // Lower threshold for more sensitivity
+          negativeSpeechThreshold: 0.35,   // Balanced threshold for speech end
+          minSilenceFrames: 8,             // ~80ms of silence before ending speech
+          redemptionFrames: 25,            // Frames to "forgive" brief silences
+          preSpeechPadFrames: 1,           // Frames to include before speech starts
           onVADMisfire: () => {
-            console.warn("VAD Misfire detected");
+            console.warn("VAD: Misfire detected - brief speech detection");
           },
-        } as any); // Type assertion to bypass strict type checking for VAD options
+        } as any); // Type assertion for extended VAD options
       } catch (vadCreationError) {
-        console.error('Critical error during MicVAD.new():', vadCreationError);
+        console.error('Critical error during VAD initialization:', vadCreationError);
         let errorMessage = 'Failed to initialize Voice Activity Detection.';
         if (vadCreationError instanceof Error) {
           errorMessage += ` Details: ${vadCreationError.message}`;
-          if (vadCreationError.message.toLowerCase().includes('onnx') || vadCreationError.message.toLowerCase().includes('runtime')) {
-            errorMessage += ' This might be due to ONNX runtime issues.';
+          if (vadCreationError.message.toLowerCase().includes('onnx') || 
+              vadCreationError.message.toLowerCase().includes('runtime')) {
+            errorMessage += ' This might be due to ONNX runtime issues. Please refresh the page.';
           }
-          if (vadCreationError.message.toLowerCase().includes('model') || vadCreationError.message.toLowerCase().includes('silero')) {
+          if (vadCreationError.message.toLowerCase().includes('model') || 
+              vadCreationError.message.toLowerCase().includes('silero')) {
             errorMessage += ' This might be due to VAD model loading issues.';
           }
         }
         onError?.(errorMessage);
-        return; // Exit initializeAudio
+        return;
       }
 
       if (!myVad) {
-        console.error('MicVAD.new() completed but returned a null instance. Cannot start VAD.');
+        console.error('VAD initialization returned null instance');
         onError?.('Failed to initialize Voice Activity Detection: Null instance returned.');
-        return; // Exit initializeAudio
+        return;
       }
 
       vadRef.current = myVad;
       
-      if (vadRef.current) {
-        try {
-          vadRef.current.start();
-          console.log('VAD initialized and successfully started.'); // Moved success log here
-        } catch (vadStartError) {
-          console.error('Error when calling vadRef.current.start():', vadStartError);
-          onError?.('Failed to start Voice Activity Detection after initialization.');
-          if (vadRef.current) { // Attempt to clean up if start failed
-            vadRef.current.destroy();
-            vadRef.current = null;
-          }
-          return; // Exit initializeAudio if VAD start fails
+      try {
+        vadRef.current.start();
+        console.log('VAD initialized and started successfully');
+      } catch (vadStartError) {
+        console.error('Error starting VAD:', vadStartError);
+        onError?.('Failed to start Voice Activity Detection after initialization.');
+        if (vadRef.current) {
+          vadRef.current.destroy();
+          vadRef.current = null;
         }
-      } else {
-        // This case should ideally not be hit if !myVad check above worked.
-        console.error('VAD instance (vadRef.current) is null just before attempting to start. This indicates an unexpected issue.');
-        onError?.('Internal error: VAD instance became null unexpectedly before start.');
-        return; // Exit initializeAudio
+        return;
       }
 
-      // Set up audio level monitoring
+      // Set up enhanced audio level monitoring
       const audioContext = new AudioContext();
       audioContextRef.current = audioContext;
       
@@ -458,26 +478,41 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       
       const analyser = audioContext.createAnalyser();
       analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.8; // Smooth audio level changes
       source.connect(analyser);
 
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
       
       const updateAudioLevel = () => {
-        analyser.getByteFrequencyData(dataArray);
-        const average = dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length;
-        setAudioLevel(average / 255);
-        requestAnimationFrame(updateAudioLevel);
+        if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+          analyser.getByteFrequencyData(dataArray);
+          const average = dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length;
+          setAudioLevel(Math.min(average / 255, 1.0)); // Ensure value is between 0 and 1
+          requestAnimationFrame(updateAudioLevel);
+        }
       };
       
       updateAudioLevel();
 
-      // Start recording in 120ms chunks
-      console.log('Starting MediaRecorder...');
-      mediaRecorder.start(120);
+      console.log('Audio initialization completed successfully');
 
     } catch (error) {
       console.error('Failed to initialize audio:', error);
-      onError?.('Microphone access denied or not available');
+      
+      // Provide more specific error messages
+      if (error instanceof Error) {
+        if (error.name === 'NotAllowedError') {
+          onError?.('Microphone access denied. Please allow microphone access and refresh the page.');
+        } else if (error.name === 'NotFoundError') {
+          onError?.('No microphone found. Please connect a microphone and try again.');
+        } else if (error.name === 'NotSupportedError') {
+          onError?.('Audio recording not supported in this browser. Please use Chrome, Firefox, or Safari.');
+        } else {
+          onError?.(`Audio initialization failed: ${error.message}`);
+        }
+      } else {
+        onError?.('Unknown error occurred during audio initialization.');
+      }
     }
   }, [onError]);
 
@@ -563,42 +598,107 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
     console.log('Cleaning up session...');
     
     try {
-      // Stop recording
-      if (mediaRecorderRef.current?.state !== 'inactive') {
-        mediaRecorderRef.current?.stop();
+      // Clear any pending timeouts first
+      if (keepAliveIntervalRef.current) {
+        clearInterval(keepAliveIntervalRef.current);
+        keepAliveIntervalRef.current = null;
+      }
+      if (keepAliveTimeoutRef.current) {
+        clearTimeout(keepAliveTimeoutRef.current);
+        keepAliveTimeoutRef.current = null;
       }
 
-      // Close audio resources with proper checks
-      streamRef.current?.getTracks().forEach(track => track.stop());
+      // Stop VAD first to prevent new speech detection
+      if (vadRef.current) {
+        try {
+          vadRef.current.destroy();
+          console.log('VAD destroyed successfully');
+        } catch (vadError) {
+          console.error('Error destroying VAD:', vadError);
+        }
+        vadRef.current = null;
+      }
+
+      // Stop MediaRecorder
+      if (mediaRecorderRef.current?.state !== 'inactive') {
+        try {
+          mediaRecorderRef.current?.stop();
+          console.log('MediaRecorder stopped');
+        } catch (recorderError) {
+          console.error('Error stopping MediaRecorder:', recorderError);
+        }
+      }
+      mediaRecorderRef.current = null;
+
+      // Stop media stream tracks
+      if (streamRef.current) {
+        try {
+          streamRef.current.getTracks().forEach(track => {
+            track.stop();
+            console.log(`Stopped track: ${track.kind}`);
+          });
+        } catch (streamError) {
+          console.error('Error stopping stream tracks:', streamError);
+        }
+        streamRef.current = null;
+      }
       
+      // Disconnect audio nodes
       if (sourceRef.current) {
         try {
           sourceRef.current.disconnect();
-        } catch (e) {
-          // Already disconnected, ignore error
+          console.log('Audio source disconnected');
+        } catch (sourceError) {
+          console.error('Error disconnecting audio source:', sourceError);
         }
         sourceRef.current = null;
       }
+
+      if (pcmPlayerNodeRef.current) {
+        try {
+          pcmPlayerNodeRef.current.disconnect();
+          console.log('PCM player node disconnected');
+        } catch (pcmError) {
+          console.error('Error disconnecting PCM player node:', pcmError);
+        }
+        pcmPlayerNodeRef.current = null;
+      }
       
+      // Close AudioContext
       if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-        audioContextRef.current.close().catch(console.error);
+        try {
+          audioContextRef.current.close().then(() => {
+            console.log('AudioContext closed successfully');
+          }).catch(closeError => {
+            console.error('Error closing AudioContext:', closeError);
+          });
+        } catch (contextError) {
+          console.error('Error initiating AudioContext close:', contextError);
+        }
         audioContextRef.current = null;
       }
       
-      // Clean up any TTS audio player
+      // Clean up TTS audio player
       if (ttsAudioPlayerRef.current) {
-        ttsAudioPlayerRef.current.cleanup();
+        try {
+          ttsAudioPlayerRef.current.cleanup();
+          console.log('TTS audio player cleaned up');
+        } catch (ttsError) {
+          console.error('Error cleaning up TTS audio player:', ttsError);
+        }
         ttsAudioPlayerRef.current = null;
       }
 
       // Close WebSocket
       if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.close();
+        try {
+          wsRef.current.close(1000, "Session ended gracefully");
+          console.log('WebSocket closed');
+        } catch (wsError) {
+          console.error('Error closing WebSocket:', wsError);
+        }
       }
       wsRef.current = null;
-      
-      // Clear stream reference
-      streamRef.current = null;
 
       // Reset state
       setSession({
@@ -617,6 +717,11 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         aiResponse: '',
         isAiResponding: false,
       });
+
+      setAudioLevel(0);
+      setLatency(0);
+      
+      console.log('Session cleanup completed successfully');
       
     } catch (error) {
       console.error('Error during cleanup:', error);
@@ -624,7 +729,8 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       // Reset cleanup flag after a delay to allow for any pending operations
       setTimeout(() => {
         isCleaningUpRef.current = false;
-      }, 100);
+        console.log('Cleanup flag reset, ready for new session');
+      }, 500); // Increased delay for better safety
     }
   }, []);
 
