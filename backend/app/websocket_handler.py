@@ -103,8 +103,9 @@ class WebSocketHandler:
         try:
             self.session_logger.debug(f"Received binary message: {len(audio_data)} bytes")
             
-            if len(audio_data) == 0:
-                self.session_logger.debug("Received empty audio chunk, skipping")
+            # Validate audio input early - reject empty or too small chunks
+            if not audio_data or len(audio_data) < 100:
+                self.session_logger.debug(f"Rejecting invalid audio chunk: {len(audio_data) if audio_data else 0} bytes")
                 return
                 
             # Minimum chunk size check - using config setting
@@ -134,7 +135,14 @@ class WebSocketHandler:
 
             # Send error to frontend if all processing failed
             if not pcm_data:
-                await self._send_error("Audio processing failed - invalid format or corrupted data")
+                error_msg = "Audio processing failed - invalid format or corrupted data"
+                self.session_logger.warning(f"Audio conversion failed for chunk of {len(audio_data)} bytes")
+                await self._send_error(error_msg)
+                return
+
+            # Validate PCM data quality
+            if len(pcm_data) < 160:  # Minimum for 10ms at 16kHz
+                self.session_logger.warning(f"PCM data too short: {len(pcm_data)} bytes, skipping")
                 return
 
             # Add PCM data to buffer for frame processing
@@ -150,6 +158,10 @@ class WebSocketHandler:
                 frame = bytes(self.audio_buffer[:frame_size])
                 self.audio_buffer = self.audio_buffer[frame_size:]
                 self.session_logger.debug(f"Processing frame of {len(frame)} bytes, buffer remaining: {len(self.audio_buffer)}")
+                
+                # DEBUG: Verify frame size calculation
+                samples_in_frame = len(frame) // 2  # 16-bit samples
+                self.session_logger.debug(f"Frame contains {samples_in_frame} samples (expected: {frame_size // 2})")
                 
                 # Process frame asynchronously
                 task = asyncio.create_task(self._process_audio_frame(frame))
@@ -357,10 +369,16 @@ class WebSocketHandler:
                     await self.websocket.close(code=1000, reason="Session ended")
                     
             elif message_type == "ping": # Keep-alive ping
-                self.session_logger.info(f"Received ping: {data}") # Keep-alive ping
+                self.session_logger.debug(f"Received ping: {data}") 
                 self.last_audio_time = time.time() # Update activity time on ping
-                await self.websocket.send_json({"type": "pong", "t": data.get("t")}) # Keep-alive ping
-                self.session_logger.info("Sent pong") # Keep-alive ping
+                # Echo back the timestamp for latency calculation
+                pong_response = {"type": "pong"}
+                if "timestamp" in data:
+                    pong_response["timestamp"] = data["timestamp"]
+                elif "t" in data:  # Support legacy format
+                    pong_response["timestamp"] = data["t"]
+                await self.websocket.send_json(pong_response)
+                self.session_logger.debug("Sent pong response")
 
             elif message_type == "eos": # End of stream
                 self.session_logger.info("EOS received from client")
@@ -521,14 +539,26 @@ class WebSocketHandler:
             target_sample_rate = settings.sample_rate
             target_channels = settings.channels
             
-            # Check if this looks like valid WebM data
+            # Enhanced format detection
             is_webm = audio_data.startswith(b'\x1a\x45\xdf\xa3')  # WebM magic bytes
+            is_wav = audio_data.startswith(b'RIFF') and b'WAVE' in audio_data[:20]  # WAV magic bytes
+            is_ogg = audio_data.startswith(b'OggS')  # Ogg magic bytes
             
             # Try different FFmpeg approaches based on data characteristics
             pcm_data = None
             
-            # Method 1: Try as WebM container first (most common from browsers)
-            if is_webm or len(audio_data) > 500:
+            # Method 1: Handle WAV format first (often more reliable)
+            if is_wav or (len(audio_data) > 44 and not is_webm and not is_ogg):
+                pcm_data = await self._run_ffmpeg_conversion(
+                    audio_data, 
+                    ['-f', 'wav'], 
+                    target_sample_rate, 
+                    target_channels,
+                    "WAV format"
+                )
+            
+            # Method 2: Try as WebM container (most common from browsers)
+            if pcm_data is None and (is_webm or len(audio_data) > 500):
                 pcm_data = await self._run_ffmpeg_conversion(
                     audio_data, 
                     ['-f', 'matroska'], 
@@ -537,7 +567,17 @@ class WebSocketHandler:
                     "WebM format"
                 )
             
-            # Method 2: Try auto-detect format if WebM failed
+            # Method 3: Try as Ogg/Opus
+            if pcm_data is None and (is_ogg or len(audio_data) > 500):
+                pcm_data = await self._run_ffmpeg_conversion(
+                    audio_data, 
+                    ['-f', 'ogg'], 
+                    target_sample_rate, 
+                    target_channels,
+                    "Ogg format"
+                )
+            
+            # Method 4: Try auto-detect format
             if pcm_data is None and len(audio_data) > 1000:
                 pcm_data = await self._run_ffmpeg_conversion(
                     audio_data, 
@@ -547,17 +587,7 @@ class WebSocketHandler:
                     "auto-detect format"
                 )
             
-            # Method 3: Try as Ogg/Opus if still no success
-            if pcm_data is None and len(audio_data) > 500:
-                pcm_data = await self._run_ffmpeg_conversion(
-                    audio_data, 
-                    ['-f', 'ogg'], 
-                    target_sample_rate, 
-                    target_channels,
-                    "Ogg format"
-                )
-            
-            # Method 4: Handle failed chunks with retry logic
+            # Method 5: Handle failed chunks with retry logic
             if pcm_data is None:
                 pcm_data = await self._handle_failed_chunk(audio_data, target_sample_rate, target_channels)
             
@@ -606,6 +636,10 @@ class WebSocketHandler:
                     self.session_logger.warning(f"FFmpeg {format_name} produced no PCM data")
                     return None
                 else:
+                    # DEBUG: Analyze the PCM data produced by FFmpeg
+                    samples_produced = len(pcm_data) // 2  # 16-bit samples
+                    duration_ms = (samples_produced / target_sample_rate) * 1000
+                    self.session_logger.debug(f"FFmpeg {format_name} success: {len(pcm_data)} bytes = {samples_produced} samples = {duration_ms:.1f}ms @ {target_sample_rate}Hz")
                     self.session_logger.debug(f"Successfully converted audio to PCM via {format_name}. PCM data length: {len(pcm_data)}")
                     return pcm_data
                     

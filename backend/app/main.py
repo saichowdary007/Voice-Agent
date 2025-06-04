@@ -12,11 +12,11 @@ from fastapi.responses import JSONResponse
 from fastapi.websockets import WebSocketState
 import structlog
 
-from ..services.vad_service import VADService
-from ..services.stt_service import STTService
-from ..services.tts_service import TTSService
-from ..services.llm_service import LLMService
-from ..services.audio_service import AudioService
+from backend.services.vad_service import VADService
+from backend.services.stt_service import STTService
+from backend.services.tts_service import TTSService
+from backend.services.llm_service import LLMService
+from backend.services.audio_service import AudioService
 
 from .websocket_handler import WebSocketHandler
 from .utils.logging import setup_logging
@@ -238,6 +238,9 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close(code=1011) 
         return
 
+    # IMPORTANT: Accept the WebSocket connection first before doing anything else
+    await websocket.accept()
+    
     if not await session_manager.create_session(websocket):
         await websocket.close(code=1013, reason="Server overloaded or session creation failed")
         return
@@ -263,8 +266,7 @@ async def websocket_endpoint(websocket: WebSocket):
     )
     
     try:
-        # Send initial status (ready, config) to client
-        # This could be moved into WebSocketHandler.handle_connection if preferred
+        # Send initial status (ready, config) to client AFTER accepting connection
         await handler._send_message({
             "type": "status",
             "session_id": session_id,

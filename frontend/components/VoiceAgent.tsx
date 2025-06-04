@@ -66,7 +66,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
   const [latency, setLatency] = useState<number>(0);
 
   // WebSocket URL
-  const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8001/ws';
+  const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8003/ws';
 
   // Initialize WebSocket connection
   const connectWebSocket = useCallback(() => {
@@ -84,21 +84,21 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         console.log('WebSocket connected');
         setSession(prev => ({ ...prev, isConnected: true, sessionEnded: false, isReconnecting: false }));
         lastServerMessageTimeRef.current = Date.now();
-        // Start keep-alive ping from client
+        
+        // Start keep-alive ping every 15s as suggested
         if (keepAliveIntervalRef.current) clearInterval(keepAliveIntervalRef.current);
         keepAliveIntervalRef.current = setInterval(() => {
           if (wsRef.current?.readyState === WebSocket.OPEN) {
             const now = Date.now();
-            if (now - lastServerMessageTimeRef.current > 10000) {
-              console.warn('No server message for over 10 seconds. Closing connection.');
+            if (now - lastServerMessageTimeRef.current > 30000) { // 30 second timeout
+              console.warn('No server message for over 30 seconds. Closing connection.');
               wsRef.current.close(1000, "Keep-alive timeout"); 
-              // Consider implementing a reconnect strategy here
             } else {
-                // Send ping to server
-                wsRef.current.send(JSON.stringify({ type: "ping", t: Date.now() }));
+              // Send ping to server with timestamp for latency measurement
+              wsRef.current.send(JSON.stringify({ type: "ping", timestamp: now }));
             }
           }
-        }, 5000); // Send ping every 5 seconds
+        }, 15000); // Send ping every 15 seconds as suggested
       };
 
       ws.onmessage = async (event) => {
@@ -173,8 +173,14 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         break;
 
       case 'pong':
-        lastServerMessageTimeRef.current = Date.now(); // Clear keep-alive timeout
-        // console.log("Pong received from server");
+        lastServerMessageTimeRef.current = Date.now(); 
+        // Calculate and log latency if timestamp was provided
+        if (data.timestamp) {
+          const latency = Date.now() - data.timestamp;
+          console.log(`Pong received with ${latency}ms latency`);
+        } else {
+          console.log("Pong received from server");
+        }
         break;
 
       case 'transcript':
@@ -244,6 +250,11 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
 
       case 'error':
         console.error('Server error:', data.message);
+        // Handle specific audio processing errors
+        if (data.message && data.message.includes('Audio processing failed')) {
+          console.warn('Audio processing error detected, may need to restart recording');
+          // Could potentially restart recording or switch formats here
+        }
         onError?.(data.message);
         break;
 
@@ -269,10 +280,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
           channelCount: 1,        // Mono audio for voice processing
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true,
-          // Additional constraints for better voice processing
-          latency: 0.01,         // Low latency requirement
-          volume: 1.0            // Full volume
+          autoGainControl: true
         },
         video: false
       };
@@ -295,30 +303,68 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         mediaRecorderRef.current = null;
       }
 
-      // Set up MediaRecorder with optimized settings
-      let mediaRecorder: MediaRecorder;
-      try {
-        // Try WebM/Opus first (best compression and quality for voice)
-        mediaRecorder = new MediaRecorder(stream, {
-          mimeType: 'audio/webm;codecs=opus',
-          audioBitsPerSecond: 32000 // 32 kbps for voice
+      // Debug: Log all supported formats for troubleshooting
+      const logFormatSupport = () => {
+        const testFormats = [
+          'audio/webm',
+          'audio/webm;codecs=opus',
+          'audio/webm;codecs=vp8',
+          'audio/ogg',
+          'audio/ogg;codecs=opus',
+          'audio/wav',
+          'audio/mp4',
+          'audio/mpeg'
+        ];
+        
+        console.log('=== MediaRecorder Format Support ===');
+        testFormats.forEach(format => {
+          const supported = MediaRecorder.isTypeSupported(format);
+          console.log(`${format}: ${supported ? '✅' : '❌'}`);
         });
-        console.log('MediaRecorder initialized with WebM/Opus');
-      } catch (webmError) {
-        console.warn('WebM/Opus not supported, trying alternatives:', webmError);
-        try {
-          // Fallback to WebM without codec specification
+        console.log('=====================================');
+      };
+      
+      logFormatSupport();
+      
+      // Set up MediaRecorder with optimized settings and better fallback
+      let mediaRecorder: MediaRecorder;
+      let preferredMimeType = 'unknown';
+      
+      // Test format support and choose the best available option
+      const formatTests = [
+        { mimeType: 'audio/webm;codecs=opus', description: 'WebM/Opus' },
+        { mimeType: 'audio/webm', description: 'WebM (generic)' },
+        { mimeType: 'audio/wav', description: 'WAV' },
+        { mimeType: 'audio/ogg;codecs=opus', description: 'Ogg/Opus' }
+      ];
+      
+      let selectedFormat = null;
+      for (const format of formatTests) {
+        if (MediaRecorder.isTypeSupported(format.mimeType)) {
+          selectedFormat = format;
+          console.log(`Format supported: ${format.description} (${format.mimeType})`);
+          break;
+        }
+      }
+      
+      try {
+        if (selectedFormat) {
           mediaRecorder = new MediaRecorder(stream, {
-            mimeType: 'audio/webm',
-            audioBitsPerSecond: 32000
+            mimeType: selectedFormat.mimeType,
+            audioBitsPerSecond: selectedFormat.mimeType.includes('wav') ? 128000 : 32000 // Higher bitrate for WAV
           });
-          console.log('MediaRecorder initialized with WebM (generic)');
-        } catch (webmGenericError) {
-          console.warn('WebM not supported, using default format:', webmGenericError);
+          preferredMimeType = selectedFormat.mimeType;
+          console.log(`MediaRecorder initialized with ${selectedFormat.description}`);
+        } else {
           // Final fallback to default
           mediaRecorder = new MediaRecorder(stream);
-          console.log('MediaRecorder initialized with default format');
+          preferredMimeType = mediaRecorder.mimeType || 'default';
+          console.log('MediaRecorder initialized with browser default format');
         }
+      } catch (error) {
+        console.error('All MediaRecorder initialization attempts failed:', error);
+        onError?.('Failed to initialize audio recording. Please try refreshing the page.');
+        return;
       }
       
       mediaRecorderRef.current = mediaRecorder;
@@ -330,16 +376,48 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
 
       const flushBuffer = () => {
         if (audioChunks.length > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
-          const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
+          const audioBlob = new Blob(audioChunks, { type: preferredMimeType });
           
-          audioBlob.arrayBuffer().then(buffer => {
-            if (wsRef.current?.readyState === WebSocket.OPEN) {
-              wsRef.current.send(buffer);
-              console.log(`Sent audio chunk: ${buffer.byteLength} bytes`);
-            }
-          }).catch(error => {
-            console.error('Error converting audio blob to buffer:', error);
-          });
+          // Prevent race conditions - check if cleanup is in progress
+          if (isCleaningUpRef.current) {
+            console.log('Cleanup in progress, skipping audio send');
+            return;
+          }
+
+          // Enhanced MIME type validation
+          const supportedTypes = ['audio/webm', 'audio/ogg', 'audio/wav'];
+          const mimeType = preferredMimeType || 'unknown';
+          const isSupported = supportedTypes.some(type => mimeType.includes(type));
+          
+          if (!isSupported && mimeType !== 'default') {
+            console.warn(`Unsupported MIME type: ${mimeType}, attempting to send anyway`);
+          }
+
+          // Enhanced size validation - different minimums for different formats
+          let minSize = 100; // Default minimum
+          if (mimeType.includes('wav')) minSize = 200; // WAV has larger headers
+          if (mimeType.includes('webm')) minSize = 150; // WebM has container overhead
+          
+          if (audioBlob.size > minSize) {
+            audioBlob.arrayBuffer().then(buffer => {
+              if (wsRef.current?.readyState === WebSocket.OPEN && !isCleaningUpRef.current) {
+                // Validate the buffer has reasonable audio data
+                const view = new Uint8Array(buffer);
+                const hasValidData = view.some(byte => byte !== 0); // Check it's not all zeros
+                
+                if (hasValidData) {
+                  wsRef.current.send(buffer);
+                  console.log(`Sent audio chunk: ${buffer.byteLength} bytes, MIME: ${mimeType}`);
+                } else {
+                  console.warn(`Skipping empty audio data: ${buffer.byteLength} bytes`);
+                }
+              }
+            }).catch(error => {
+              console.error('Error converting audio blob to buffer:', error);
+            });
+          } else {
+            console.log(`Skipping small audio chunk: ${audioBlob.size} bytes (min: ${minSize}), MIME: ${mimeType}`);
+          }
           
           audioChunks = [];
         }
@@ -347,6 +425,9 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
 
       // Enhanced MediaRecorder event handlers
       mediaRecorder.ondataavailable = (event) => {
+        // Prevent processing during cleanup
+        if (isCleaningUpRef.current) return;
+
         if (event.data.size > 0) {
           console.log(`Audio chunk received: ${event.data.size} bytes`);
           audioChunks.push(event.data);
@@ -405,6 +486,9 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         myVad = await MicVAD.new({
           stream: streamRef.current,
           onSpeechStart: () => {
+            // Prevent processing during cleanup
+            if (isCleaningUpRef.current) return;
+            
             console.log("VAD: Speech started");
             setSession(prev => ({ ...prev, isSpeaking: true }));
             if (mediaRecorderRef.current?.state === 'inactive') {
@@ -412,6 +496,9 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
             }
           },
           onSpeechEnd: (audio: Float32Array) => {
+            // Prevent processing during cleanup
+            if (isCleaningUpRef.current) return;
+            
             console.log('VAD: Speech ended, audio length:', audio.length);
             setSession(prev => ({ ...prev, isSpeaking: false }));
             if (mediaRecorderRef.current?.state === 'recording') {
@@ -541,10 +628,9 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       }
       
       // Play audio using the persistent audio player
-      await ttsAudioPlayerRef.current.playAudio(bytes.buffer, () => {
-        // Audio playback finished callback
-        console.log('TTS audio chunk finished playing');
-      });
+      await ttsAudioPlayerRef.current.playAudioData(bytes.buffer);
+      
+      console.log('TTS audio chunk finished playing');
       
     } catch (error) {
       console.error('Failed to play TTS audio:', error);
@@ -563,8 +649,8 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
     const newMutedState = !session.isMuted;
     
     sendWebSocketMessage({
-      type: 'mute',
-      muted: newMutedState
+      type: 'control',
+      action: newMutedState ? 'mute' : 'unmute'
     });
 
     if (newMutedState && mediaRecorderRef.current?.state === 'recording') {
@@ -619,16 +705,21 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         vadRef.current = null;
       }
 
-      // Stop MediaRecorder
-      if (mediaRecorderRef.current?.state !== 'inactive') {
+      // Stop MediaRecorder with proper state checking
+      if (mediaRecorderRef.current) {
         try {
-          mediaRecorderRef.current?.stop();
-          console.log('MediaRecorder stopped');
+          if (mediaRecorderRef.current.state === 'recording') {
+            mediaRecorderRef.current.stop();
+            console.log('MediaRecorder stopped');
+          } else if (mediaRecorderRef.current.state === 'paused') {
+            mediaRecorderRef.current.stop();
+            console.log('MediaRecorder stopped from paused state');
+          }
         } catch (recorderError) {
           console.error('Error stopping MediaRecorder:', recorderError);
         }
+        mediaRecorderRef.current = null;
       }
-      mediaRecorderRef.current = null;
 
       // Stop media stream tracks
       if (streamRef.current) {
@@ -681,7 +772,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       // Clean up TTS audio player
       if (ttsAudioPlayerRef.current) {
         try {
-          ttsAudioPlayerRef.current.cleanup();
+          ttsAudioPlayerRef.current.dispose();
           console.log('TTS audio player cleaned up');
         } catch (ttsError) {
           console.error('Error cleaning up TTS audio player:', ttsError);
@@ -690,15 +781,24 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       }
 
       // Close WebSocket
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
+      if (wsRef.current) {
         try {
-          wsRef.current.close(1000, "Session ended gracefully");
-          console.log('WebSocket closed');
+          if (wsRef.current.readyState === WebSocket.OPEN) {
+            wsRef.current.close(1000, "Session ended gracefully");
+            console.log('WebSocket closed');
+          } else if (wsRef.current.readyState === WebSocket.CONNECTING) {
+            // If still connecting, wait a bit then force close
+            setTimeout(() => {
+              if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) {
+                wsRef.current.close(1000, "Force close during cleanup");
+              }
+            }, 1000);
+          }
         } catch (wsError) {
           console.error('Error closing WebSocket:', wsError);
         }
+        wsRef.current = null;
       }
-      wsRef.current = null;
 
       // Reset state
       setSession({

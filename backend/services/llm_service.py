@@ -25,8 +25,12 @@ class LLMService:
     async def initialize(self):
         """Initialize the Gemini model"""
         try:
-            if not self.api_key or self.api_key == "test_key_for_demo":
+            # Check for valid API key (exclude common placeholders)
+            invalid_keys = ["test_key_for_demo", "your-google-api-key-here", "", None]
+            if not self.api_key or self.api_key in invalid_keys:
                 logger.warning("No valid Gemini API key provided, using mock responses")
+                logger.info("To enable Gemini LLM: Get API key from https://aistudio.google.com/apikey")
+                logger.info("Then update GOOGLE_API_KEY in your .env file")
                 self.is_available = False
                 return
                 

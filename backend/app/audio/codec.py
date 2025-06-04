@@ -6,6 +6,9 @@ import opuslib
 import ffmpeg
 import structlog
 
+# Import standardized configuration
+from ..config import settings
+
 logger = structlog.get_logger()
 
 
@@ -13,9 +16,10 @@ class OpusCodec:
     """High-performance Opus codec for real-time audio streaming"""
     
     def __init__(self):
-        self.sample_rate = int(os.getenv('SAMPLE_RATE', '16000'))
-        self.channels = 1  # Mono
-        self.frame_duration = int(os.getenv('AUDIO_FRAME_MS', '120'))  # 120ms frames
+        # Use standardized configuration instead of hardcoded values
+        self.sample_rate = settings.sample_rate
+        self.channels = settings.channels
+        self.frame_duration = settings.audio_frame_ms  # Use config instead of hardcoded 120ms
         self.bitrate = 32000  # 32 kbps for voice
         
         # Opus encoder/decoder

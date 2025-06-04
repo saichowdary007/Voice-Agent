@@ -36,17 +36,42 @@ class AudioService:
             # Check FFmpeg availability first
             await self._check_ffmpeg_availability()
             
-            # Initialize Opus codec
-            self.opus_decoder = opuslib.Decoder(fs=self.sample_rate, channels=self.channels)
-            self.opus_encoder = opuslib.Encoder(fs=self.sample_rate, channels=self.channels, application=opuslib.APPLICATION_VOIP)
+            # Initialize Opus codec with safe parameters
+            try:
+                self.opus_decoder = opuslib.Decoder(fs=self.sample_rate, channels=self.channels)
+                logger.info(f"✅ Opus decoder initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Opus decoder: {e}")
+                self.opus_decoder = None
             
-            # Set encoder parameters for low latency
-            self.opus_encoder.bitrate = 32000  # 32 kbps for voice
-            self.opus_encoder.signal = opuslib.SIGNAL_VOICE
-            self.opus_encoder.complexity = 5  # Balance between quality and CPU
+            try:
+                # Use AUDIO application instead of VOIP for better compatibility
+                self.opus_encoder = opuslib.Encoder(
+                    fs=self.sample_rate, 
+                    channels=self.channels, 
+                    application=opuslib.APPLICATION_AUDIO
+                )
+                
+                # Set encoder parameters for low latency - with error handling
+                try:
+                    self.opus_encoder.bitrate = 32000  # 32 kbps for voice
+                    self.opus_encoder.signal = opuslib.SIGNAL_VOICE
+                    self.opus_encoder.complexity = 5  # Balance between quality and CPU
+                except Exception as e:
+                    logger.warning(f"Could not set all Opus encoder parameters: {e}")
+                
+                logger.info(f"✅ Opus encoder initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Opus encoder: {e}")
+                self.opus_encoder = None
             
-            self.is_available = True
-            logger.info(f"✅ Audio service initialized successfully - Sample rate: {self.sample_rate}Hz, Channels: {self.channels}, FFmpeg: {self.ffmpeg_available}")
+            # Service is available if at least one codec works
+            self.is_available = (self.opus_decoder is not None or self.opus_encoder is not None)
+            
+            if self.is_available:
+                logger.info(f"✅ Audio service initialized successfully - Sample rate: {self.sample_rate}Hz, Channels: {self.channels}, FFmpeg: {self.ffmpeg_available}")
+            else:
+                logger.error("❌ Audio service failed - no working codecs")
             
         except Exception as e:
             logger.error(f"Failed to initialize audio service: {e}")

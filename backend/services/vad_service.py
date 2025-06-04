@@ -64,6 +64,9 @@ class VADService:
             else:
                 audio_data = audio_frame
                 
+            # DEBUG: Log the actual audio data size
+            logger.debug(f"VAD processing: received {len(audio_frame)} bytes = {len(audio_data)} samples")
+                
             # Process audio frame
             def process_vad():
                 # Ensure audio is the right format
@@ -77,6 +80,9 @@ class VADService:
                     processed_audio = processed_audio.astype(np.float32)
                 if np.max(np.abs(processed_audio)) > 1.0:
                     processed_audio = processed_audio / np.max(np.abs(processed_audio))
+                
+                # DEBUG: Log the processed audio size before sending to VAD model
+                logger.debug(f"VAD model input: {len(processed_audio)} samples")
                     
                 # Convert to tensor
                 audio_tensor = torch.from_numpy(processed_audio)

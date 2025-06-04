@@ -13,7 +13,7 @@ class AppSettings(BaseSettings):
     # Audio Processing - Standardized PCM format for all services
     sample_rate: int = Field(16000, description="Audio sample rate in Hz - standardized across all services")
     channels: int = Field(1, description="Number of audio channels - mono for voice processing")
-    audio_frame_ms: int = Field(120, description="Duration of audio frames in milliseconds")
+    audio_frame_ms: int = Field(32, description="Duration of audio frames in milliseconds - optimized for VAD (512 samples at 16kHz)")
     vad_threshold: float = Field(default_factory=lambda: float(os.getenv("VAD_THRESHOLD", "0.6")), description="Voice activity detection sensitivity (0.1-0.9)")
     tts_speed: float = Field(default_factory=lambda: float(os.getenv("TTS_SPEED", "1.0")), description="Text-to-speech speed (0.5-2.0)")
 
@@ -40,7 +40,7 @@ class AppSettings(BaseSettings):
     small_chunk_buffer_threshold: int = Field(100, description="Minimum chunk size in bytes to process immediately")
     
     # Watchdog Timer Settings
-    watchdog_inactivity_timeout: int = Field(10, description="Seconds of inactivity before closing WebSocket connection")
+    watchdog_inactivity_timeout: int = Field(30, description="Seconds of inactivity before closing WebSocket connection")
     watchdog_check_interval: int = Field(1, description="Watchdog timer check interval in seconds")
 
     class Config:

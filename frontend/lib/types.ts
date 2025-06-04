@@ -203,8 +203,8 @@ export const DEFAULT_AUDIO_CONFIG: AudioConfig = {
 };
 
 export const DEFAULT_VOICE_AGENT_CONFIG: VoiceAgentConfig = {
-  wsUrl: process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8001/ws',
-  apiUrl: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8001',
+  wsUrl: process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8003/ws',
+  apiUrl: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8003',
   apiKey: process.env.NEXT_PUBLIC_API_KEY || '',
   autoConnect: false,
   reconnectAttempts: 5,
