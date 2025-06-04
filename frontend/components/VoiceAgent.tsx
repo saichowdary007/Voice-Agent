@@ -372,7 +372,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       // Audio chunk buffering for improved streaming
       let audioChunks: Blob[] = [];
       let bufferTimer: number | null = null;
-      const BUFFER_TIMEOUT = 120; // 120ms to match backend frame size
+      const BUFFER_TIMEOUT = 128; // 128ms (4 * 32ms backend frame) for better alignment
 
       const flushBuffer = () => {
         if (audioChunks.length > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
@@ -1097,4 +1097,4 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       )}
     </div>
   );
-} 
+}

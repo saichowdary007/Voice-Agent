@@ -12,11 +12,12 @@ from fastapi.responses import JSONResponse
 from fastapi.websockets import WebSocketState
 import structlog
 
+# Ensure correct import paths if services are directly under backend/services
 from backend.services.vad_service import VADService
 from backend.services.stt_service import STTService
 from backend.services.tts_service import TTSService
 from backend.services.llm_service import LLMService
-from backend.services.audio_service import AudioService
+from backend.services.audio_service import AudioService # Assuming audio_service is the correct one
 
 from .websocket_handler import WebSocketHandler
 from .utils.logging import setup_logging
@@ -27,7 +28,7 @@ from .config import settings
 # Global state
 services: Dict[str, Any] = {}
 metrics: Optional[MetricsCollector] = None
-logger: Optional[structlog.BoundLogger] = None
+logger: Optional[structlog.BoundLogger] = None # Define logger type for clarity
 
 class SessionManager:
     """Manage WebSocket sessions with state tracking"""
@@ -38,23 +39,23 @@ class SessionManager:
     
     async def create_session(self, websocket: WebSocket) -> bool:
         """Create a new session"""
-        if logger is None: # Should not happen after lifespan
-            logging.error("Logger not initialized in SessionManager") # fallback logging
+        if logger is None: 
+            logging.error("Logger not initialized in SessionManager") 
             return False
 
         if len(self.sessions) >= self.max_sessions:
-            logger.warning(f"Max sessions ({self.max_sessions}) reached")
+            logger.warning(f"Max sessions ({self.max_sessions}) reached, rejecting new session.")
             return False
         
-        session_id = f"session_{int(time.time() * 1000)}"
+        # Generate a more unique session ID including part of client info
+        session_id = f"session_{int(time.time() * 1000)}_{websocket.client.host}_{websocket.client.port}"
         
-        # Simplified initial session state, WebSocketHandler will manage more details
         self.sessions[websocket] = {
             "id": session_id,
             "created_at": time.time(),
         }
         
-        logger.info(f"Created session {session_id}")
+        logger.info(f"Created session {session_id} for {websocket.client.host}:{websocket.client.port}")
         return True
     
     def get_session(self, websocket: WebSocket) -> Optional[Dict[str, Any]]:
@@ -64,7 +65,7 @@ class SessionManager:
     def remove_session(self, websocket: WebSocket):
         """Remove session"""
         session = self.sessions.pop(websocket, None)
-        if session and logger: # Check logger for safety
+        if session and logger:
             logger.info(f"Removed session {session['id']}")
     
     def get_active_sessions(self) -> int:
@@ -79,79 +80,64 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     global services, metrics, logger
     
-    # Setup logging
     setup_logging(log_level=settings.log_level)
-    logger = structlog.get_logger("app.main")
+    logger = structlog.get_logger("app.main") # Ensure logger is structlog bound logger
     
-    # Initialize metrics
     if settings.enable_metrics:
         metrics = MetricsCollector()
+        logger.info("Metrics collection enabled.")
+    else:
+        logger.info("Metrics collection disabled.")
     
-    # Initialize services
     logger.info("Initializing AI services...", app_name=settings.app_name, app_version=settings.app_version)
     
     try:
-        # Create service instances
         services['vad'] = VADService(threshold=settings.vad_threshold)
         services['stt'] = STTService()
         services['tts'] = TTSService()
         services['llm'] = LLMService()
-        services['audio'] = AudioService(sample_rate=settings.sample_rate)
+        # Ensure 'audio' key is used if that's what WebSocketHandler expects
+        services['audio'] = AudioService(sample_rate=settings.sample_rate) 
         
-        # Initialize all services
-        init_tasks = [
-            services['vad'].initialize(),
-            services['stt'].initialize(),
-            services['tts'].initialize(),
-            services['llm'].initialize(),
-            services['audio'].initialize()
-        ]
-        
+        init_tasks = [srv.initialize() for srv_name, srv in services.items() if hasattr(srv, 'initialize')]
         await asyncio.gather(*init_tasks)
         
-        # Check service status
-        services_status_summary = {name: srv.is_available for name, srv in services.items() if hasattr(srv, 'is_available')}
-        available_services = sum(services_status_summary.values())
+        services_status_summary = {name: (srv.is_available if hasattr(srv, 'is_available') else srv.get_status().get('available', False) if hasattr(srv, 'get_status') else 'unknown') for name, srv in services.items()}
+        available_services = sum(1 for status in services_status_summary.values() if status is True) # Count True statuses
         total_services = len(services_status_summary)
         
-        logger.info(f"Services initialized: {available_services}/{total_services}")
+        logger.info(f"Services initialized: {available_services}/{total_services} available.")
         for service_name, status in services_status_summary.items():
-            logger.info(f"  {service_name}: {'✅' if status else '❌'}")
+            logger.info(f"  {service_name}: {'✅ Available' if status is True else ('❌ Not Available' if status is False else '❓ Unknown')}")
         
         if available_services < total_services:
-            logger.warning("Some services failed to initialize - running in degraded mode")
+            logger.warning("Some services failed to initialize - application running in degraded mode.")
 
-        # Preload models if enabled (assuming services have a preload method)
         if settings.preload_models:
             logger.info("Preloading models...")
-            preload_tasks = []
-            for srv_name, srv_instance in services.items():
-                if hasattr(srv_instance, 'preload'):
-                    preload_tasks.append(srv_instance.preload())
+            preload_tasks = [srv.preload() for srv_name, srv in services.items() if hasattr(srv, 'preload')]
             if preload_tasks:
                 await asyncio.gather(*preload_tasks)
-            logger.info("Models preloaded successfully (if preload methods exist and were called)")
+            logger.info("Models preloading complete (if applicable).")
             
     except Exception as e:
-        logger.error(f"Failed to initialize services: {e}", exc_info=True)
-        # Depending on severity, might want to prevent app startup
-        # For now, it will start in a degraded state if some services fail
-        raise # Reraise to indicate critical startup failure
+        logger.error(f"Critical failure during service initialization: {e}", exc_info=True)
+        raise # Reraise to indicate critical startup failure, preventing app from starting misconfigured
     
     yield
     
-    # Cleanup
     logger.info("Shutting down services...")
-    for service_name, service_instance in services.items():
-        if hasattr(service_instance, 'cleanup'):
-            try:
-                await service_instance.cleanup()
-                logger.info(f"Service {service_name} cleaned up.")
-            except Exception as e:
-                logger.error(f"Error cleaning up service {service_name}: {e}", exc_info=True)
+    cleanup_tasks = [srv.cleanup() for srv_name, srv in services.items() if hasattr(srv, 'cleanup')]
+    if cleanup_tasks:
+        results = await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        for (srv_name, srv_instance), result in zip(services.items(), results):
+            if isinstance(result, Exception):
+                logger.error(f"Error cleaning up service {srv_name}: {result}", exc_info=result)
+            else:
+                logger.info(f"Service {srv_name} cleaned up successfully.")
+    logger.info("Application shutdown complete.")
 
 
-# Create FastAPI app
 app = FastAPI(
     title=settings.app_name,
     description="Service-oriented voice assistant with Gemini Flash, sherpa-ncnn, and Piper TTS",
@@ -159,10 +145,9 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # Consider restricting this in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -171,44 +156,45 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for load balancers"""
-    if logger is None: # Should not happen
-        logging.error("Logger not initialized for health_check")
+    if logger is None: 
+        logging.error("Logger not initialized for health_check") # Basic fallback
         return JSONResponse(status_code=503, content={"status": "unhealthy", "error": "logger not available"})
 
     try:
-        # Check if all services are ready
         service_status_details = {}
         all_ready = True
         for name, service_instance in services.items():
-            if hasattr(service_instance, 'get_status'):
+            status = "unknown"
+            is_srv_ready = False
+            if hasattr(service_instance, 'get_status') and callable(service_instance.get_status):
                 status_detail = service_instance.get_status()
                 service_status_details[name] = status_detail
-                # Assuming get_status returns a dict with a 'ready' boolean or similar
-                if isinstance(status_detail, dict) and not status_detail.get('ready', True): # Default to True if no ready field
-                    all_ready = False
-            elif hasattr(service_instance, 'is_available'): # Fallback to is_available
-                is_avail = service_instance.is_available
-                service_status_details[name] = {"available": is_avail}
-                if not is_avail:
-                    all_ready = False
+                is_srv_ready = status_detail.get('available', False) if isinstance(status_detail, dict) else False
+            elif hasattr(service_instance, 'is_available'):
+                is_srv_ready = service_instance.is_available
+                service_status_details[name] = {"available": is_srv_ready}
             else:
-                service_status_details[name] = {"status": "unknown"}
-
-
+                 service_status_details[name] = {"status": "unknown (no status method)"}
+            
+            if not is_srv_ready:
+                all_ready = False
+        
         current_memory_usage = metrics.get_memory_usage() if metrics else 0
         
         return JSONResponse(
             status_code=200 if all_ready else 503,
             content={
                 "status": "healthy" if all_ready else "degraded",
+                "timestamp": time.time(),
+                "app_version": settings.app_version,
                 "services": service_status_details,
                 "active_sessions": session_manager.get_active_sessions(),
-                "memory_usage_mb": current_memory_usage,
+                "memory_usage_mb": round(current_memory_usage, 2),
                 "config_summary": {
                     "sample_rate": settings.sample_rate,
                     "max_sessions": settings.max_concurrent_sessions,
-                    "metrics_enabled": settings.enable_metrics
+                    "metrics_enabled": settings.enable_metrics,
+                    "log_level": settings.log_level
                 }
             }
         )
@@ -221,103 +207,112 @@ async def health_check():
 
 
 @app.get("/metrics")
-async def get_metrics():
-    """Metrics endpoint for monitoring"""
-    if not metrics: # metrics can be None if not enabled
-        raise HTTPException(status_code=503, detail="Metrics not available (disabled or not initialized)")
+async def get_metrics_endpoint(): # Renamed to avoid conflict with global 'metrics'
+    if not settings.enable_metrics or metrics is None:
+        raise HTTPException(status_code=404, detail="Metrics not enabled or not available.")
     
+    # Example: Return as Prometheus format or JSON
+    # For Prometheus, you'd typically use a dedicated library.
+    # Here's a simple JSON representation:
     return JSONResponse(content=metrics.get_all_metrics())
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """Main WebSocket endpoint for voice agent communication"""
-    if logger is None: # Should not happen
-        logging.error("Logger not initialized for websocket_endpoint")
-        # Cannot send WebSocket message if logger failed, so close abnormally
-        await websocket.close(code=1011) 
+    global logger # Ensure we are using the initialized global logger
+    if logger is None:
+        # This case should ideally not be hit if lifespan initializes logger correctly
+        logging.basicConfig(level="ERROR") # Basic fallback logging
+        logging.error("Critical: Global logger not initialized at websocket_endpoint entry.")
+        await websocket.accept() # Accept to send error, then close
+        await websocket.close(code=1011, reason="Server logger not initialized")
         return
 
-    # IMPORTANT: Accept the WebSocket connection first before doing anything else
     await websocket.accept()
     
     if not await session_manager.create_session(websocket):
+        logger.warning("Failed to create session (max sessions or other issue). Closing WebSocket.")
         await websocket.close(code=1013, reason="Server overloaded or session creation failed")
         return
     
     session_data = session_manager.get_session(websocket)
-    if not session_data: # Should not happen if create_session succeeded
-        logger.error("Session data not found after creation.")
-        await websocket.close(code=1011, reason="Internal server error creating session")
+    if not session_data: 
+        logger.error("Session data not found immediately after creation. This should not happen.")
+        await websocket.close(code=1011, reason="Internal server error: session data unavailable post-creation")
         return
         
     session_id = session_data["id"]
-    # Create a session-specific logger by re-binding the main logger with session_id
-    session_logger = logger.bind(session_id=session_id) 
-    session_logger.info(f"WebSocket connected", client=str(websocket.client))
+    # Create a session-specific logger
+    session_logger = logger.bind(session_id=session_id, client_ip=websocket.client.host) 
+    session_logger.info(f"WebSocket connection accepted.")
 
-    # Pass the global services, metrics, and a session-specific logger to the handler
-    # The WebSocketHandler will manage its own detailed session state.
     handler = WebSocketHandler(
         websocket=websocket,
         services=services,
-        metrics=metrics,
-        logger=session_logger
+        metrics=metrics, # Pass the global metrics collector
+        logger=session_logger # Pass the session-specific logger
     )
     
     try:
-        # Send initial status (ready, config) to client AFTER accepting connection
-        await handler._send_message({
-            "type": "status",
-            "session_id": session_id,
-            "ready": True,
-            "config": {
-                "sample_rate": settings.sample_rate,
-                "frame_duration_ms": settings.audio_frame_ms
-            }
-        })
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await handler._send_message({
+                "type": "status",
+                "session_id": session_id,
+                "ready": True,
+                "config": {
+                    "sample_rate": settings.sample_rate,
+                    "frame_duration_ms": settings.audio_frame_ms
+                }
+            })
 
         await handler.handle_connection()
         
-    except WebSocketDisconnect:
-        session_logger.info(f"WebSocket client disconnected")
-    except ConnectionResetError: # Specific error for abrupt client disconnects
-        session_logger.warning(f"WebSocket connection reset by client")
+    except WebSocketDisconnect: # More specific exception for client disconnects
+        session_logger.info(f"WebSocket client disconnected.")
+    except ConnectionResetError:
+        session_logger.warning(f"WebSocket connection reset by client.")
     except Exception as e:
-        # Log with session_id for better traceability
-        session_logger.error(f"WebSocket error: {str(e)}", exc_info=True)
-        try:
-            # Try to send a clean error message to the client
-            if websocket.client_state == WebSocketState.CONNECTED: # Ensure WebSocket is still connected
-                 await handler._send_error(f"Internal server error: {str(e)}")
-        except Exception as send_exc:
-            session_logger.error(f"Failed to send error to client after WebSocket error", send_error_exc_info=send_exc)
-            pass 
+        session_logger.error(f"Unhandled error in WebSocket connection: {str(e)}", exc_info=True)
+        if websocket.client_state == WebSocketState.CONNECTED:
+            try:
+                await handler._send_error(f"An unexpected server error occurred: {str(e)}")
+            except Exception as send_err_exc:
+                session_logger.error(f"Failed to send error to client after WebSocket error: {send_err_exc}", exc_info=True)
     finally:
-        session_logger.info(f"Cleaning up WebSocket session")
-        await handler.cleanup()
+        session_logger.info(f"Performing cleanup for WebSocket session.")
+        await handler.cleanup() # Ensure handler's cleanup is called
         session_manager.remove_session(websocket)
-        session_logger.info(f"WebSocket connection closed. Active sessions: {session_manager.get_active_sessions()}")
+        session_logger.info(f"WebSocket connection closed and session removed. Active sessions: {session_manager.get_active_sessions()}")
 
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
+    global logger
+    if logger: # Check if logger is initialized
+        logger.info("Root endpoint accessed.")
     return {
         "service_name": settings.app_name,
         "version": settings.app_version,
         "status": "running",
         "active_sessions": session_manager.get_active_sessions(),
-        "documentation": "/docs"
+        "documentation_url": "/docs", # Point to Swagger/OpenAPI docs
+        "health_check_url": "/health"
     }
 
 
 if __name__ == "__main__":
-    # Development server
+    # This block is for direct execution (e.g., python -m app.main)
+    # Ensure logging is set up even if not run via uvicorn command that sets log level
+    if logger is None: # If not already set up by lifespan (e.g. if uvicorn isn't managing lifespan)
+        setup_logging(log_level=os.getenv("LOG_LEVEL", "INFO").upper())
+        logger = structlog.get_logger("app.main.direct_run")
+        logger.info("Running Uvicorn server directly...")
+
     uvicorn.run(
-        "app.main:app",
+        "app.main:app", # Make sure this matches your app path
         host=settings.ws_server_host,
         port=settings.ws_server_port,
         reload=os.getenv("UVICORN_RELOAD", "true").lower() == 'true',
-        log_level=settings.log_level.lower()
-    ) 
+        log_level=settings.log_level.lower(), # Uvicorn's own log level
+        # Removed 'logger' from uvicorn.run as structlog handles it
+    )
