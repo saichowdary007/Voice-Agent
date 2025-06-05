@@ -17,6 +17,11 @@ RUN apt-get update && apt-get install -y \
     libsndfile1-dev \
     libopus-dev \
     libopusfile-dev \
+    python3-dev \
+    espeak \
+    libespeak-dev \
+    libssl-dev \
+    libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Create models directory
@@ -41,6 +46,13 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
+
+# Install Azure Speech SDK dependencies 
+RUN apt-get update && apt-get install -y \
+    libssl-dev \
+    libasound2 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy source code
 COPY . .

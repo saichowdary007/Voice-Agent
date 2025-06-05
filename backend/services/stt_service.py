@@ -1,372 +1,271 @@
-import os
 import asyncio
+import time
 import logging
+import os
+from typing import Optional, Dict, Any, List
+import azure.cognitiveservices.speech as speechsdk
 import numpy as np
-import soundfile as sf
-import tempfile
-from typing import Optional, Dict, Any, AsyncGenerator
 from dataclasses import dataclass
-import sherpa_ncnn
+import structlog
 
-logger = logging.getLogger(__name__)
+# Configuration from environment or settings
+from app.config import settings
+
+logger = structlog.get_logger(__name__)
 
 @dataclass
 class STTResult:
-    """STT processing result"""
-    partial_text: str
-    final_text: str
-    is_final: bool
-    confidence: float
-    timestamp: float = 0.0
+    """Speech-to-text processing result"""
+    partial_text: str = ""
+    final_text: str = ""
+    confidence: float = 0.0
+    metadata: Dict[str, Any] = None
+    alternatives: List[Dict[str, Any]] = None
 
 class STTService:
-    """Speech-to-Text service using sherpa-ncnn 2.1.11 for ultra-fast streaming ASR"""
+    """Microsoft Azure Speech-to-Text service implementation"""
     
-    def __init__(self):
-        self.recognizer = None
+    def __init__(self, api_key: Optional[str] = None, region: Optional[str] = None):
+        self.api_key = api_key or os.getenv('AZURE_SPEECH_KEY', settings.azure_speech_key)
+        self.region = region or os.getenv('AZURE_SPEECH_REGION', settings.azure_speech_region)
+        self.language = settings.azure_speech_language
+        self.sample_rate = settings.sample_rate
+        self.channels = settings.channels
+        
+        # Speech recognition state
         self.is_available = False
-        self.sample_rate = 16000
+        self.is_initialized = False
+        self.partial_result = ""
+        self.latest_partial_result = ""
+        self.final_result = ""
         
-        # Model paths - will be downloaded at build time
-        self.model_dir = os.getenv("MODEL_PATH", "/app/models")
+        # Azure Speech SDK components
+        self.speech_config = None
+        self.audio_config = None
+        self.speech_recognizer = None
+        self.push_stream = None
         
-        # Audio buffer for streaming
-        self.audio_buffer = []
-        self.total_audio_duration = 0.0
+        # Session management
+        self.is_listening = False
+        self.current_session_id = None
+        self.buffer = bytearray()
+        self.lock = asyncio.Lock()  # Add a lock for thread safety
+        self.last_activity_time = time.time()
+        
+        logger.info(f"Azure STT Service initialized with region: {self.region}, language: {self.language}")
         
     async def initialize(self):
-        """Initialize the sherpa-ncnn ASR model"""
+        """Initialize the Azure STT service"""
         try:
-            logger.info("Initializing sherpa-ncnn 2.1.11 model...")
-            
-            # Use the correct API for sherpa-ncnn 2.1.11
-            # Based on documentation: direct Recognizer initialization
-            def create_recognizer():
-                return sherpa_ncnn.Recognizer(
-                    tokens=f"{self.model_dir}/tokens.txt",
-                    encoder_param=f"{self.model_dir}/encoder_jit_trace-pnnx.ncnn.param",
-                    encoder_bin=f"{self.model_dir}/encoder_jit_trace-pnnx.ncnn.bin",
-                    decoder_param=f"{self.model_dir}/decoder_jit_trace-pnnx.ncnn.param",
-                    decoder_bin=f"{self.model_dir}/decoder_jit_trace-pnnx.ncnn.bin",
-                    joiner_param=f"{self.model_dir}/joiner_jit_trace-pnnx.ncnn.param",
-                    joiner_bin=f"{self.model_dir}/joiner_jit_trace-pnnx.ncnn.bin",
-                    num_threads=2,
-                )
-            
-            self.recognizer = await asyncio.to_thread(create_recognizer)
-            
-            if not self.recognizer:
-                raise Exception("Failed to create recognizer")
+            if not self.api_key:
+                logger.error("Azure Speech API key not provided. Service will not be available.")
+                self.is_available = False
+                return
                 
+            # Create speech config with the specified Azure region
+            self.speech_config = speechsdk.SpeechConfig(subscription=self.api_key, region=self.region)
+            self.speech_config.speech_recognition_language = self.language
+            
+            # Configure timeouts for silence detection
+            self.speech_config.set_property(
+                speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, 
+                str(settings.azure_speech_initial_silence_timeout_ms)
+            )
+            self.speech_config.set_property(
+                speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, 
+                str(settings.azure_speech_end_silence_timeout_ms)
+            )
+            
+            # Create an audio configuration with a custom push stream
+            self.push_stream = speechsdk.audio.PushAudioInputStream()
+            self.audio_config = speechsdk.audio.AudioConfig(stream=self.push_stream)
+            
+            # Create speech recognizer
+            self.speech_recognizer = speechsdk.SpeechRecognizer(
+                speech_config=self.speech_config, 
+                audio_config=self.audio_config
+            )
+            
+            # Set up event handlers
+            self.speech_recognizer.recognizing.connect(self._recognizing_callback)
+            self.speech_recognizer.recognized.connect(self._recognized_callback)
+            self.speech_recognizer.session_started.connect(self._session_started_callback)
+            self.speech_recognizer.session_stopped.connect(self._session_stopped_callback)
+            self.speech_recognizer.canceled.connect(self._canceled_callback)
+            
+            # Start continuous recognition
+            await self._restart_continuous_recognition()
+            
+            self.is_initialized = True
             self.is_available = True
-            logger.info("✅ sherpa-ncnn 2.1.11 initialized successfully")
+            logger.info(f"Azure STT service initialized successfully with language: {self.language}")
             
         except Exception as e:
-            logger.error(f"Failed to initialize sherpa-ncnn: {e}")
+            logger.error(f"Failed to initialize Azure STT service: {e}", exc_info=True)
             self.is_available = False
-
+    
+    async def _restart_continuous_recognition(self):
+        """Safely restart continuous recognition"""
+        try:
+            if self.speech_recognizer:
+                if self.is_listening:
+                    logger.debug("Stopping existing continuous recognition session")
+                    self.speech_recognizer.stop_continuous_recognition_async()
+                    await asyncio.sleep(0.2)  # Short wait to ensure it stops
+                
+                logger.debug("Starting continuous recognition session")
+                self.speech_recognizer.start_continuous_recognition_async()
+                self.is_listening = True
+        except Exception as e:
+            logger.error(f"Error restarting continuous recognition: {e}", exc_info=True)
+            
+    def _recognizing_callback(self, evt):
+        """Callback for partial recognition results"""
+        if evt.result.reason == speechsdk.ResultReason.RecognizingSpeech:
+            self.partial_result = evt.result.text
+            self.latest_partial_result = evt.result.text
+            self.last_activity_time = time.time()
+            logger.debug(f"RECOGNIZING: {self.partial_result}")
+        
+    def _recognized_callback(self, evt):
+        """Callback for final recognition results"""
+        if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
+            self.final_result = evt.result.text  # Store the final result
+            self.partial_result = ""  # Clear partial result
+            self.last_activity_time = time.time()
+            logger.info(f"RECOGNIZED: {self.final_result}")
+            
+    def _session_started_callback(self, evt):
+        """Callback for session start events"""
+        self.current_session_id = evt.session_id
+        logger.info(f"Speech recognition session started: {self.current_session_id}")
+        
+    def _session_stopped_callback(self, evt):
+        """Callback for session stop events"""
+        logger.info(f"Speech recognition session stopped: {self.current_session_id}")
+        self.current_session_id = None
+        
+    def _canceled_callback(self, evt):
+        """Callback for cancellation events"""
+        logger.warning(f"Speech recognition canceled: {evt.reason}")
+        if evt.reason == speechsdk.CancellationReason.Error:
+            logger.error(f"Error details: {evt.error_details}")
+            # Try to automatically recover from error
+            asyncio.create_task(self._restart_continuous_recognition())
+            
     async def process_frame(self, audio_frame: bytes) -> STTResult:
-        """Process audio frame and return streaming STT result"""
-        if not self.is_available:
-            return STTResult(
-                partial_text="",
-                final_text="",
-                is_final=False,
-                confidence=0.0,
-                timestamp=0.0
-            )
-        
+        """Process a single audio frame for incremental speech recognition"""
+        if not self.is_available or not self.is_initialized:
+            logger.warning("Azure STT service not available or not initialized")
+            return STTResult()
+            
         try:
-            # Convert bytes to numpy array (mono 16-bit PCM)
-            if isinstance(audio_frame, bytes):
-                audio_samples = np.frombuffer(audio_frame, dtype=np.int16).astype(np.float32) / 32768.0
-            else:
-                audio_samples = audio_frame
+            async with self.lock:  # Use lock for thread safety
+                # Add frame to buffer
+                self.buffer.extend(audio_frame)
                 
-            # Add to audio buffer
-            self.audio_buffer.extend(audio_samples.tolist())
-            
-            # Wait for enough audio before processing
-            min_samples = int(self.sample_rate * 0.03)  # 30ms
-            
-            if len(self.audio_buffer) >= min_samples:
-                # Extract audio chunk
-                audio_chunk = np.array(self.audio_buffer)
-                self.audio_buffer = []
+                # Push audio data to the stream
+                if self.push_stream and self.is_listening:
+                    self.push_stream.write(audio_frame)
                     
-                # Feed audio to recognizer (sherpa-ncnn 2.1.11 API)
-                def process_audio():
-                    logger.debug(f"STT:process_audio: About to call accept_waveform. Audio chunk shape: {audio_chunk.shape}, dtype: {audio_chunk.dtype}")
+                # Return the latest partial result
+                partial_text = self.latest_partial_result
+                
+                # Don't clear the latest partial result until finalization
+                # This ensures we don't lose partial transcriptions between frames
+                
+                return STTResult(partial_text=partial_text)
+        except Exception as e:
+            logger.error(f"Error processing audio frame: {e}", exc_info=True)
+            return STTResult()
+            
+    async def finalize(self) -> STTResult:
+        """Finalize speech recognition and get final transcript"""
+        if not self.is_available or not self.is_initialized:
+            logger.warning("Azure STT service not available or not initialized for finalization")
+            return STTResult()
+            
+        try:
+            async with self.lock:  # Use lock for thread safety
+                # Signal end of stream
+                if self.push_stream:
+                    # Push a bit of silence to ensure recognition completes
+                    silence = bytes([0] * 3200)  # 100ms of silence at 16kHz
+                    self.push_stream.write(silence)
                     
-                    # Ensure audio data is 1D before sending to recognizer
-                    if len(audio_chunk.shape) > 1:
-                        logger.warning(f"Audio chunk has {len(audio_chunk.shape)} dimensions, flattening to 1D")
-                        audio_chunk_1d = audio_chunk.flatten()
-                    else:
-                        audio_chunk_1d = audio_chunk
-                        
-                    self.recognizer.accept_waveform(self.sample_rate, audio_chunk_1d)
-                    logger.debug("STT:process_audio: accept_waveform completed. About to get text.")
-                    text_result = self.recognizer.text.strip()
-                    logger.debug(f"STT:process_audio: Got text: '{text_result}'")
-                    return text_result
+                # Wait for final results
+                await asyncio.sleep(0.5)
                 
-                partial_text = await asyncio.to_thread(process_audio)
+                # First try to get the final result from the callback
+                final_text = self.final_result
                 
-                # Update audio duration
-                audio_duration = len(audio_chunk) / self.sample_rate
-                self.total_audio_duration += audio_duration
+                # If no final result, use the latest partial result
+                if not final_text:
+                    final_text = self.partial_result
                 
-                return STTResult(
-                    partial_text=partial_text,
-                    final_text="",
-                    is_final=False,
-                    confidence=0.95,
-                    timestamp=self.total_audio_duration
-                )
-            else:
-                # Not enough audio yet
-                return STTResult(
-                    partial_text="",
-                    final_text="",
-                    is_final=False,
-                    confidence=0.0,
-                    timestamp=self.total_audio_duration
-                )
+                # Clear all results for the next utterance
+                self.partial_result = ""
+                self.latest_partial_result = ""
+                self.final_result = ""
                 
+                # Reset recognizer to ensure a clean state
+                await self._restart_continuous_recognition()
+                
+                # Clear buffer
+                self.buffer.clear()
+                
+                logger.info(f"STT finalization complete. Final text: '{final_text}'")
+                return STTResult(final_text=final_text)
         except Exception as e:
-            logger.error(f"STT processing error: {e}", exc_info=True)
-            return STTResult(
-                partial_text="",
-                final_text="",
-                is_final=False,
-                confidence=0.0,
-                timestamp=self.total_audio_duration
-            )
-
-    async def finalize(self) -> Optional[STTResult]:
-        """Finalize current utterance and get final result"""
+            logger.error(f"Error finalizing speech recognition: {e}", exc_info=True)
+            return STTResult()
+            
+    async def reset_stream(self):
+        """Reset the speech recognition stream"""
         try:
-            if not self.is_available:
-                return None
-                
-            def finalize_recognition():
-                # Process any remaining audio
-                if self.audio_buffer:
-                    audio_chunk = np.array(self.audio_buffer)
-                    self.audio_buffer = []
-                    self.recognizer.accept_waveform(self.sample_rate, audio_chunk)
+            async with self.lock:
+                if self.is_initialized and self.speech_recognizer:
+                    self.partial_result = ""
+                    self.latest_partial_result = ""
+                    self.final_result = ""
+                    self.buffer.clear()
                     
-                # Add tail padding for complete recognition
-                tail_paddings = np.zeros(int(self.sample_rate * 0.5), dtype=np.float32)
-                self.recognizer.accept_waveform(self.sample_rate, tail_paddings)
-                
-                # Signal input finished for final result
-                self.recognizer.input_finished()
-                
-                # Get final result
-                final_text = self.recognizer.text.strip()
-                
-                # Reset for next utterance
-                self.recognizer.reset()
-                
-                return final_text
-            
-            final_text = await asyncio.to_thread(finalize_recognition)
-            
-            if final_text:
-                logger.debug(f"STT finalized with text: {final_text}")
-                
-                return STTResult(
-                    partial_text="",
-                    final_text=final_text,
-                    is_final=True,
-                    confidence=0.95,
-                    timestamp=self.total_audio_duration
-                )
-            else:
-                logger.debug("STT finalization returned no text")
-                return None
-                
+                    # Restart recognition
+                    await self._restart_continuous_recognition()
+                    logger.info("Azure STT stream reset successfully")
         except Exception as e:
-            logger.error(f"STT finalization error: {e}")
-            return None
-    
-    async def transcribe_streaming(self, audio_data: bytes) -> Dict[str, Any]:
-        """
-        Transcribe audio data in streaming mode
-        
-        Args:
-            audio_data: Raw audio bytes (PCM 16-bit, 16kHz, mono)
+            logger.error(f"Error resetting Azure STT stream: {e}", exc_info=True)
             
-        Returns:
-            Dict with partial transcript and completion status
-        """
-        if not self.is_available:
-            return {
-                "partial": "",
-                "final": "",
-                "is_complete": False,
-                "confidence": 0.0,
-                "error": "STT service not available"
-            }
-        
-        try:
-            # Convert bytes to numpy array
-            audio_samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-            
-            # Use sherpa-ncnn 2.1.11 streaming API
-            def process_streaming():
-                self.recognizer.accept_waveform(self.sample_rate, audio_samples)
-                return self.recognizer.text
-            
-            result_text = await asyncio.to_thread(process_streaming)
-            
-            # For streaming, we return partial results
-            return {
-                "partial": result_text,
-                "final": "",
-                "is_complete": False,
-                "confidence": 0.95,  # sherpa-ncnn doesn't provide confidence
-                "tokens": []
-            }
-                
-        except Exception as e:
-            logger.error(f"Streaming transcription failed: {e}")
-            return {
-                "partial": "",
-                "final": "",
-                "is_complete": False,
-                "confidence": 0.0,
-                "error": str(e)
-            }
-    
-    async def transcribe_audio(self, audio_data: bytes, language: str = "en") -> Dict[str, Any]:
-        """
-        Transcribe complete audio data (offline mode)
-        
-        Args:
-            audio_data: Raw audio bytes
-            language: Language code (ignored for now)
-            
-        Returns:
-            Dict with transcript, confidence, and metadata
-        """
-        if not self.is_available:
-            return {
-                "transcript": "",
-                "confidence": 0.0,
-                "language": "en",
-                "error": "STT service not available"
-            }
-        
-        try:
-            # Convert bytes to numpy array
-            audio_samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-            
-            def transcribe_complete():
-                # Use sherpa-ncnn 2.1.11 API for complete transcription
-                self.recognizer.accept_waveform(self.sample_rate, audio_samples)
-                
-                # Add tail padding for complete recognition
-                tail_paddings = np.zeros(int(self.sample_rate * 0.5), dtype=np.float32)
-                self.recognizer.accept_waveform(self.sample_rate, tail_paddings)
-                
-                # Signal input finished for final result
-                self.recognizer.input_finished()
-                
-                return self.recognizer.text.strip()
-            
-            transcript = await asyncio.to_thread(transcribe_complete)
-                
-            logger.info(f"STT transcribed: '{transcript}'")
-                
-            return {
-                "transcript": transcript,
-                "confidence": 0.95,
-                "language": "en",
-                "duration": len(audio_samples) / self.sample_rate,
-                "tokens": []
-            }
-                    
-        except Exception as e:
-            logger.error(f"STT transcription failed: {e}")
-            return {
-                "transcript": "",
-                "confidence": 0.0,
-                "language": "en",
-                "error": str(e)
-            }
-    
-    def reset_stream(self):
-        """Reset the streaming session"""
-        try:
-            if self.recognizer:
-                # Reset recognizer state for new stream
-                self.recognizer.reset()
-                self.audio_buffer = []
-                self.total_audio_duration = 0.0
-                logger.debug("STT stream reset successfully")
-        except Exception as e:
-            logger.warning(f"Failed to reset stream: {e}")
-    
-    async def test_connection(self) -> bool:
-        """Test STT service"""
-        if not self.is_available:
-            return False
-        
-        try:
-            # Test with small audio buffer
-            test_audio = np.zeros(1600, dtype=np.float32)  # 100ms of silence
-            test_bytes = (test_audio * 32768).astype(np.int16).tobytes()
-            result = await self.transcribe_audio(test_bytes)
-            return not result.get("error")
-        except Exception as e:
-            logger.error(f"STT connection test failed: {e}")
-            return False
-    
     def get_status(self) -> Dict[str, Any]:
-        """Get STT service status"""
+        """Get the status of the STT service"""
         return {
             "available": self.is_available,
-            "service": "Sherpa-NCNN" if self.is_available else "Not Available",
+            "service": "Azure Speech Service",
             "sample_rate": self.sample_rate,
-            "model_path": self.model_dir,
-            "streaming": True
+            "model_path": "Microsoft Azure Cloud",
+            "streaming": True,
+            "region": self.region
         }
-    
+        
     async def cleanup(self):
-        """Clean up STT resources"""
+        """Clean up resources"""
         try:
-            logger.info("Cleaning up STT service...")
-            
-            # Mark service as unavailable first to prevent new operations
-            self.is_available = False
-            
-            # Clear audio buffer first
-            self.audio_buffer = []
-            
-            # Clean up recognizer with proper error handling
-            if self.recognizer:
-                try:
-                    # Try to reset before deletion to ensure clean state
-                    self.recognizer.reset()
-                except Exception as reset_error:
-                    logger.warning(f"Error resetting recognizer during cleanup: {reset_error}")
+            if self.is_initialized and self.speech_recognizer:
+                self.speech_recognizer.stop_continuous_recognition_async()
                 
-                try:
-                    # Don't explicitly delete - let Python's GC handle it
-                    # This prevents double free errors
-                    pass
-                except Exception as del_error:
-                    logger.warning(f"Error during recognizer cleanup: {del_error}")
-                finally:
-                    # Always set to None to prevent double cleanup
-                    self.recognizer = None
-                    
-            logger.info("STT service cleaned up")
+            self.is_listening = False
+            self.is_available = False
+            self.is_initialized = False
+            self.buffer.clear()
+            self.partial_result = ""
+            self.latest_partial_result = ""
             
+            # Help GC by clearing references
+            self.speech_recognizer = None
+            self.audio_config = None
+            self.speech_config = None
+            self.push_stream = None
+            
+            logger.info("Azure STT service cleaned up")
         except Exception as e:
-            logger.error(f"STT cleanup error: {e}")
-            # Ensure recognizer is None even if cleanup fails
-            self.recognizer = None 
+            logger.error(f"Error cleaning up Azure STT service: {e}", exc_info=True) 

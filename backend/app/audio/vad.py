@@ -40,7 +40,9 @@ class VADEngine:
         
         # Audio buffer for processing
         self.audio_buffer = []
-        self.buffer_size = 1024  # Process in 1024 sample chunks
+        # Use 512 samples (32ms at 16kHz) to match the expected frame size
+        self.buffer_size = 512  # Process in 512 sample chunks for 16kHz
+        logger.info(f"VAD Engine initialized with buffer size: {self.buffer_size}, sample rate: {self.sample_rate}")
         
     async def initialize(self):
         """Initialize Silero VAD model"""
@@ -77,7 +79,7 @@ class VADEngine:
             await self.initialize()
             
         # Warm up with dummy audio (512 samples for 16kHz)
-        dummy_audio = torch.zeros(512, dtype=torch.float32)
+        dummy_audio = torch.zeros(self.buffer_size, dtype=torch.float32)
         with torch.no_grad():
             _ = self.model(dummy_audio, self.sample_rate)
             
@@ -89,6 +91,7 @@ class VADEngine:
             # Convert bytes to numpy array
             if isinstance(audio_frame, bytes):
                 audio_data = np.frombuffer(audio_frame, dtype=np.int16)
+                logger.debug(f"Received audio frame: {len(audio_data)} samples")
             else:
                 audio_data = audio_frame
                 
@@ -97,12 +100,14 @@ class VADEngine:
             
             # Add to buffer
             self.audio_buffer.extend(audio_float)
+            logger.debug(f"Buffer size after adding frame: {len(self.audio_buffer)} samples")
             
             # Process when we have enough samples
             if len(self.audio_buffer) >= self.buffer_size:
                 # Extract chunk
                 chunk = np.array(self.audio_buffer[:self.buffer_size])
                 self.audio_buffer = self.audio_buffer[self.buffer_size:]
+                logger.debug(f"Processing chunk of {len(chunk)} samples, remaining buffer: {len(self.audio_buffer)}")
                 
                 # Run VAD
                 result = await self._detect_speech(chunk)
@@ -110,6 +115,7 @@ class VADEngine:
             else:
                 # Not enough data yet
                 current_time = self.frame_count * self.buffer_size / self.sample_rate
+                logger.debug(f"Not enough data for VAD processing yet. Current buffer: {len(self.audio_buffer)}/{self.buffer_size}")
                 return VADResult(
                     is_speech=self.is_speaking,
                     is_end_of_speech=False,

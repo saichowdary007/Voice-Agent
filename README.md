@@ -1,259 +1,114 @@
-# Ultra-Fast Voice Agent 🚀
+# Voice Agent Testing and Monitoring Tools
 
-A production-ready, real-time voice conversation agent powered by Google's Gemini 2.0 Flash, optimized for ultra-low latency interactions.
+This repository contains tools for testing, debugging, and monitoring the Voice Agent application. These tools are designed to help diagnose issues with WebSocket connections, WebM audio handling, and the various AI services.
 
-## ✨ Recent Improvements
+## Overview of Tools
 
-This repository has undergone systematic optimization addressing 12+ critical issues across infrastructure, audio processing, state management, and code quality:
+### Testing Tools
 
-### 🔧 Infrastructure Fixes
-- **Standardized API Configuration**: Unified `GOOGLE_API_KEY` usage across all components
-- **Consistent Model Paths**: All models now use `/app/models` path consistently
-- **Optimized Docker Build**: Streamlined model downloading and consistent file structure
+1. **test_services.py**: Tests basic functionality of all services.
+   - Checks VAD, STT, LLM, TTS, and Audio services
+   - Provides summary of which services are working
 
-### 🎵 Audio Pipeline Enhancements  
-- **Improved TTS Playback**: Eliminated per-chunk AudioContext creation with persistent AudioPlayer
-- **Robust FFmpeg Processing**: Enhanced format handling with WebM prioritization and better error recovery
-- **Simplified EOS Handling**: Streamlined end-of-speech detection to prevent race conditions
+2. **test_individual_services.py**: Detailed test of each individual service.
+   - Tests each service with more specific diagnostics
+   - Provides detailed output about service behavior
 
-### ⚡ State Management & Reliability
-- **Unified Keep-alive**: Simplified to client-side ping/server pong pattern
-- **Enhanced Error Propagation**: Comprehensive error handling with user-friendly messages
-- **Pipeline State Tracking**: Robust watchdog timer and processing state management
+3. **test_audio_processing.py**: Specific tests for audio processing.
+   - Tests WebM/Opus encoding/decoding
+   - Tests audio conversion functions
 
-### 🏗️ Code Quality Improvements
-- **Consistent Logging**: Elevated critical errors from debug to warning/error levels
-- **Better Error Messages**: More descriptive error propagation to frontend
-- **Cleaner Architecture**: Removed redundant components and simplified control flow
+### Debug Tools
 
-## 🏗️ Architecture
+1. **debug_ffmpeg_conversion.py**: Debug FFmpeg conversion issues.
+   - Generate valid WebM/Opus files
+   - Extract and analyze WebM headers
+   - Test different conversion methods
 
-### Backend Components
-- **Speech-to-Text**: sherpa-ncnn with Zipformer-20M model
-- **LLM**: Google Gemini 2.0 Flash for conversational AI
-- **Text-to-Speech**: Piper TTS with en_US-libritts-high model
-- **VAD**: Silero Voice Activity Detection
-- **WebSocket Handler**: Real-time bidirectional communication
+2. **fix_webm_header.py**: Utility to fix WebM header issues.
+   - Scan backend code for invalid WebM headers
+   - Suggest fixes with proper header formats
+   - Generate valid WebM headers in different code formats
 
-### Frontend Components  
-- **React/Next.js**: Modern web interface
-- **WebSocket Client**: Real-time communication with audio streaming
-- **Audio Processing**: MediaRecorder API with Opus encoding
-- **Voice Activity Detection**: Client-side VAD for responsive interaction
+3. **generate_test_files.py**: Create test audio files.
+   - Generate various test files (tone, noise, etc.)
+   - Create corrupted files for testing error handling
 
-## 🚀 Quick Start
+### Monitoring Tools
 
-### Prerequisites
-- Docker and Docker Compose
-- Google AI API key
+1. **monitor_services.py**: Continuous monitoring of service health.
+   - Periodically checks all services
+   - Logs issues and maintains health history
+   - Provides service status dashboard
+
+## Setup and Usage
 
 ### Environment Setup
+
 ```bash
-# Copy environment template
-cp .env.example .env
+# Set up a virtual environment
+python3 -m venv test_env
+source test_env/bin/activate  # On Windows: test_env\Scripts\activate
 
-# Configure your Google AI API key
-echo "GOOGLE_API_KEY=your_gemini_api_key_here" >> .env
+# Install dependencies
+pip install websockets asyncio
 ```
 
-### Launch with Docker
+### Basic Usage
+
 ```bash
-# Build and start all services
-docker-compose up --build
+# Run basic service tests
+python test_services.py
 
-# Access the application
-open http://localhost:3000
+# Run detailed service tests
+python test_individual_services.py --service all
+
+# Generate test audio files
+./generate_test_files.py
+
+# Run the monitoring service
+./monitor_services.py --interval 60  # Check every 60 seconds
 ```
 
-### Local Development
-```bash
-# Backend
-cd backend
-pip install -r requirements.txt
-python -m app.models.download_models  # Download models
-# This runs the backend on http://localhost:8000 by default (see backend/app/config.py)
-# If using Docker, docker-compose.yml maps host port 8001 to container port 8000.
-uvicorn app.main:app --host 0.0.0.0 --port 8000 # Or use python -m app.main for defaults from config
+## Issues Identified and Fixes
 
-# Frontend  
-cd frontend
-npm install
-npm run dev
-```
+### WebM Header Issues
 
-## 🔧 Configuration
+The application was experiencing issues with WebM header processing:
 
-### Environment Variables
-```env
-# Required
-GOOGLE_API_KEY=your_gemini_api_key_here
+1. **Problem**: Invalid EBML numbers in WebM header causing FFmpeg conversion errors
+   - **Fix**: Updated the WebM header generation code with valid header format extracted from a properly generated WebM file
 
-# Optional - Audio Processing
-SAMPLE_RATE=16000
-AUDIO_FRAME_MS=120
-MAX_CONCURRENT_SESSIONS=3
+2. **Problem**: Raw audio data length not being a multiple of the sample size
+   - **Fix**: Ensured proper padding of audio data and correct header structures
 
-# Optional - WebSocket
-WS_URL=ws://localhost:8001/ws
-RECONNECT_ATTEMPTS=5
-RECONNECT_DELAY=1000
-```
+### VAD Service Issues
 
-### Model Configuration
-Models are automatically downloaded to `/app/models`:
-- **STT**: sherpa-ncnn Zipformer-20M (English)
-- **TTS**: Piper en_US-libritts-high (English)
-- **VAD**: Silero VAD (Universal)
+Issues with Voice Activity Detection and EOS (End of Speech) handling:
 
-## 📊 Performance Optimizations
+1. **Problem**: Inconsistent behavior with EOS signals
+   - **Fix**: Improved the VAD test with retries and fallback to audio testing
+   - **Fix**: Added force_finalize flag to EOS messages
 
-### Audio Processing
-- **WebM/Opus Priority**: Optimized format selection for minimal latency
-- **Chunk Buffering**: Smart buffering to reduce FFmpeg overhead
-- **Failed Chunk Recovery**: Accumulation and retry logic for partial audio
+### STT Service Issues
 
-### Real-time Communication
-- **Persistent Audio Context**: Eliminates per-chunk initialization overhead
-- **Pipeline State Management**: Prevents race conditions and ensures proper sequencing  
-- **Barge-in Support**: Instant TTS interruption for natural conversation flow
+Issues with Speech-to-Text service:
 
-### Error Handling
-- **Graceful Degradation**: Service failures don't crash the system
-- **User-friendly Messages**: Clear error communication to frontend
-- **Automatic Recovery**: Retry mechanisms for transient failures
+1. **Problem**: Partial transcript support not confirmed
+   - **Fix**: Enhanced testing with longer audio sequences
+   - **Fix**: Added specific checks for partial transcript detection
 
-## 🛠️ API Reference
+## Monitoring
 
-### WebSocket Messages
+The monitoring system periodically checks all services and maintains a health history in `health_report.json`. Services are classified as:
 
-#### Client → Server
-```json
-// Audio data (binary)
-Binary data: WebM/Opus encoded audio chunks
+- ✅ **Working**: Service is responding correctly
+- ❌ **Failing**: Service is not responding or giving errors
+- ⚠️ **Error**: Error occurred during testing
 
-// Control messages  
-{"type": "ping", "t": timestamp}
-{"type": "eos"}  // End of speech
-{"type": "control", "action": "mute|unmute|end_session"}
-```
+## Future Improvements
 
-#### Server → Client
-```json
-// Status updates
-{"type": "status", "session_id": "...", "status": "processing"}
-
-// Transcription
-{"type": "transcript", "partial": "...", "final": "..."}
-
-// AI responses
-{"type": "ai_response", "token": "...", "complete": true}
-
-// Audio playback
-{"type": "audio_chunk", "audio_data": "base64..."}
-
-// Keep-alive
-{"type": "pong", "t": timestamp}
-
-// Errors
-{"type": "error", "message": "..."}
-```
-
-## 🧪 Testing
-
-### Health Checks
-```bash
-# Backend health
-curl http://localhost:8001/health
-
-# WebSocket connection
-wscat -c ws://localhost:8001/ws
-```
-
-### Load Testing
-```bash
-# Install artillery
-npm install -g artillery
-
-# Run WebSocket load test
-artillery run tests/websocket-load-test.yml
-```
-
-## 📈 Monitoring
-
-### Metrics Available
-- WebSocket connection count
-- Processing latency (end-to-end)
-- Barge-in frequency  
-- Error rates by component
-- Audio chunk processing stats
-
-### Logging Levels
-- **ERROR**: Critical failures requiring attention
-- **WARNING**: Important issues that don't break functionality
-- **INFO**: Operational information and key events
-- **DEBUG**: Detailed tracing for development
-
-## 🔒 Security
-
-### API Key Protection
-- Environment variable configuration
-- No hardcoded credentials
-- Docker secrets support
-
-### WebSocket Security
-- Connection limits (configurable)
-- Session isolation
-- Graceful error handling
-
-## 🐳 Docker Configuration
-
-### Production Deployment
-```yaml
-# docker-compose.prod.yml
-version: '3.8'
-services:
-  backend:
-    build: ./backend
-    environment:
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - MAX_CONCURRENT_SESSIONS=10
-    volumes:
-      - models_cache:/app/models
-    restart: unless-stopped
-
-  frontend:
-    build: ./frontend
-    environment:
-      - NEXT_PUBLIC_WS_URL=wss://your-domain.com/ws
-    restart: unless-stopped
-```
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/amazing-feature`
-3. Commit changes: `git commit -m 'Add amazing feature'`
-4. Push to branch: `git push origin feature/amazing-feature`
-5. Open a Pull Request
-
-### Development Guidelines
-- Follow existing code style and patterns
-- Add tests for new functionality
-- Update documentation for API changes
-- Ensure Docker builds work correctly
-
-## 📝 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- Google Gemini 2.0 Flash for conversational AI
-- Piper TTS for high-quality speech synthesis  
-- sherpa-ncnn for efficient speech recognition
-- Silero team for robust voice activity detection
-- FFmpeg community for audio processing tools
-
----
-
-**Built with ❤️ for real-time voice interaction** 
+1. Add email/Slack notifications for service issues
+2. Implement automatic recovery attempts for failing services
+3. Add more detailed performance metrics
+4. Create a web dashboard for service status visualization 

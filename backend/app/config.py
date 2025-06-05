@@ -13,7 +13,7 @@ class AppSettings(BaseSettings):
     # Audio Processing - Standardized PCM format for all services
     sample_rate: int = Field(16000, description="Audio sample rate in Hz - standardized across all services")
     channels: int = Field(1, description="Number of audio channels - mono for voice processing")
-    audio_frame_ms: int = Field(32, description="Duration of audio frames in milliseconds - optimized for VAD (512 samples at 16kHz)")
+    frame_duration_ms: int = Field(32, description="Duration of audio frames in milliseconds - used for Opus codec and VAD (512 samples at 16kHz)")
     vad_threshold: float = Field(default_factory=lambda: float(os.getenv("VAD_THRESHOLD", "0.6")), description="Voice activity detection sensitivity (0.1-0.9)")
     tts_speed: float = Field(default_factory=lambda: float(os.getenv("TTS_SPEED", "1.0")), description="Text-to-speech speed (0.5-2.0)")
 
@@ -29,6 +29,25 @@ class AppSettings(BaseSettings):
 
     # API Keys - Standardized naming
     google_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("GOOGLE_API_KEY"), description="Google AI API Key for Gemini")
+    azure_speech_key: Optional[str] = Field(default_factory=lambda: os.getenv("AZURE_SPEECH_KEY", "3AbXttS4rrG8QqKcH9dEEJePfgzR6Rkssg6rCX3FAioVRBzdKonlJQQJ99BFACYeBjFXJ3w3AAAYACOGaRsS"), description="Azure Speech API Key")
+    azure_speech_region: Optional[str] = Field(default_factory=lambda: os.getenv("AZURE_SPEECH_REGION", "eastus"), description="Azure Speech Service Region")
+    
+    # Azure STT specific settings
+    azure_speech_language: str = Field(default_factory=lambda: os.getenv("AZURE_SPEECH_LANGUAGE", "en-US"), description="Speech recognition language")
+    azure_speech_initial_silence_timeout_ms: int = Field(default_factory=lambda: int(os.getenv("AZURE_SPEECH_INITIAL_SILENCE_TIMEOUT", "5000")), 
+                                                description="Initial silence timeout in milliseconds")
+    azure_speech_end_silence_timeout_ms: int = Field(default_factory=lambda: int(os.getenv("AZURE_SPEECH_END_SILENCE_TIMEOUT", "1000")), 
+                                               description="End of speech silence timeout in milliseconds")
+
+    # TTS Settings
+    tts_model: str = Field(default_factory=lambda: os.getenv("TTS_MODEL", "en_US-libritts-high"), description="TTS model name")
+    tts_voice: str = Field(default_factory=lambda: os.getenv("TTS_VOICE", "en-US-Neural"), description="TTS voice name")
+    
+    # LLM Settings
+    llm_model: str = Field(default_factory=lambda: os.getenv("LLM_MODEL", "gemini-2.0-flash-exp"), description="LLM model name")
+    llm_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("LLM_API_KEY"), description="LLM API key")
+    llm_temperature: float = Field(default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.7")), description="LLM temperature (0.0-1.0)")
+    llm_max_tokens: int = Field(default_factory=lambda: int(os.getenv("LLM_MAX_TOKENS", "1024")), description="LLM maximum tokens")
 
     # Feature Flags
     enable_metrics: bool = Field(default_factory=lambda: os.getenv("ENABLE_METRICS", "true").lower() == 'true', description="Enable Prometheus metrics collection")

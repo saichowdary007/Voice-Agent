@@ -9,7 +9,7 @@ from fastapi.websockets import WebSocketState
 
 from .ai.context_manager import ContextManager
 from .config import settings
-from services.vad_service import VADResult  # Import VADResult class
+from services.vad_service import VADResult  # Direct import to match Docker structure
 
 
 class WebSocketHandler:
@@ -47,6 +47,7 @@ class WebSocketHandler:
         self.last_audio_time: float = time.time() # For watchdog
         self.pipeline_running: bool = False # True if STT, AI, or TTS is active
         self.watchdog_task: Optional[asyncio.Task] = None
+        self.is_finalizing: bool = False
         
     async def handle_connection(self):
         """Main connection handler loop"""
@@ -123,8 +124,10 @@ class WebSocketHandler:
                 self.session_logger.debug(f"Audio conversion by AudioService returned None for chunk of {len(audio_data)} bytes (may be buffering).")
                 return
 
-            if len(pcm_data) < (settings.sample_rate * settings.audio_frame_ms // 1000 * 2 * settings.channels / 2) : # Min e.g. 10ms
-                self.session_logger.warning(f"PCM data too short after conversion: {len(pcm_data)} bytes, skipping processing for this chunk.")
+            # Too small, not worth processing - would be a tiny fraction of an audio frame
+            # Note: This is a heuristic to determine if the data is too small to be meaningful (less than half a frame)
+            if len(pcm_data) < (settings.sample_rate * settings.frame_duration_ms // 1000 * 2 * settings.channels / 2) : # Min e.g. 10ms
+                self.session_logger.debug(f"Skipping small audio data: {len(pcm_data)} bytes")
                 return
 
             # Add to buffer with error handling
@@ -192,9 +195,10 @@ class WebSocketHandler:
                 self.session_logger.error("VAD or STT service not available.")
                 await self._send_error("Voice processing services are currently unavailable.")
                 self.pipeline_running = False
+                self.is_finalizing = False  # Reset the finalizing flag
                 return
 
-            # Wrap VAD processing in try/except to prevent server crashes
+            # Process frame with VAD
             try:
                 vad_result = await vad_service.process_frame(frame)
                 self.session_logger.debug(f"VAD: speech={vad_result.is_speech}, end={vad_result.is_end_of_speech}, conf={vad_result.confidence:.2f}")
@@ -202,7 +206,11 @@ class WebSocketHandler:
                 self.session_logger.error(f"VAD processing error: {vad_e}", exc_info=True)
                 # Create a default negative result if VAD fails
                 vad_result = VADResult(is_speech=False, is_end_of_speech=False, confidence=0.0, timestamp=0.0)
+                self.is_finalizing = False  # Reset the finalizing flag if VAD processing fails
+                self.pipeline_running = False
+                return
             
+            # Process frame with STT if VAD detected speech
             if vad_result.is_speech:
                 if not self.is_speaking: # Start of user's speech segment
                     self.is_speaking = True
@@ -212,40 +220,50 @@ class WebSocketHandler:
                         self.session_logger.info("Barge-in: User started speaking during TTS.")
                         await self._handle_barge_in()
                 
-                # Wrap STT processing in try/except to prevent server crashes
+                # Process frame with STT
                 try:        
                     stt_result = await stt_service.process_frame(frame)
-                    if stt_result.partial_text:
+                    if stt_result.partial_text and stt_result.partial_text.strip():
+                        self.session_logger.debug(f"STT partial: '{stt_result.partial_text}'")
                         await self._send_message({"type": "transcript", "partial": stt_result.partial_text})
                 except Exception as stt_e:
                     self.session_logger.error(f"STT processing error: {stt_e}", exc_info=True)
                     # Continue without speech-to-text if it fails
             
-            elif vad_result.is_end_of_speech and self.is_speaking: # End of user's speech segment
+            # Handle end of speech
+            elif vad_result.is_end_of_speech and self.is_speaking: 
+                if self.is_finalizing:
+                    self.session_logger.info("VAD EOS: Finalization already in progress, skipping.")
+                    return
+                
+                self.is_finalizing = True
                 self.session_logger.info("User speech segment ended (VAD). Finalizing STT.")
                 self.is_speaking = False # Reset user speaking state
                 
-                final_stt_text = None
+                # Get final transcript
                 try:
-                    if hasattr(stt_service, 'finalize') and callable(stt_service.finalize):
-                        final_result_obj = await stt_service.finalize()
-                        if final_result_obj and final_result_obj.final_text:
-                            final_stt_text = final_result_obj.final_text.strip()
+                    final_result_obj = await stt_service.finalize()
+                    final_stt_text = final_result_obj.final_text.strip() if final_result_obj and final_result_obj.final_text else ""
+                    
+                    if final_stt_text:
+                        self.session_logger.info(f"STT Final: '{final_stt_text}'")
+                        await self._send_message({"type": "transcript", "final": final_stt_text})
+                        
+                        # Process with AI in a separate task
+                        ai_task = asyncio.create_task(self._process_with_ai(final_stt_text))
+                        self.processing_tasks.add(ai_task)
+                        ai_task.add_done_callback(self.processing_tasks.discard)
+                    else:
+                        self.session_logger.info("STT finalization yielded no text after VAD EOS.")
+                        self.is_finalizing = False # Reset finalization flag
+                        self.pipeline_running = False # No AI to run, pipeline idle
+                        
                 except Exception as finalize_e:
                     self.session_logger.error(f"STT finalization error: {finalize_e}", exc_info=True)
-                
-                if final_stt_text:
-                    self.session_logger.info(f"STT Final: '{final_stt_text}'")
-                    await self._send_message({"type": "transcript", "final": final_stt_text})
-                    # Create a new task for AI processing to not block this audio frame loop
-                    ai_task = asyncio.create_task(self._process_with_ai(final_stt_text))
-                    self.processing_tasks.add(ai_task)
-                    ai_task.add_done_callback(self.processing_tasks.discard)
-                else:
-                    self.session_logger.info("STT finalization yielded no text after VAD EOS.")
-                    self.pipeline_running = False # No AI to run, pipeline idle for now
+                    self.is_finalizing = False # Reset flag on error
+                    self.pipeline_running = False
             
-            # If it's silence but not end of a speech segment, and no TTS is active.
+            # If it's silence but not end of a speech segment, and no TTS is active
             elif not vad_result.is_speech and not self.is_speaking and not self.tts_active:
                  self.pipeline_running = False
 
@@ -253,6 +271,7 @@ class WebSocketHandler:
             self.session_logger.error(f"Error in _process_audio_frame: {e}", exc_info=True)
             await self._send_error("Error during voice processing.")
             self.pipeline_running = False # Reset on error
+            self.is_finalizing = False # Reset flag on error
         # Note: pipeline_running is primarily set to False by AI/TTS completion or specific idle conditions.
 
     async def _handle_barge_in(self):
@@ -276,69 +295,70 @@ class WebSocketHandler:
 
     async def _process_with_ai(self, text: str):
         """Process transcript with AI and generate response."""
-        try:
-            self.session_logger.info(f"Processing transcript with AI: {text}")
-            llm_service = self.services.get('llm')
-            
-            if not llm_service:
-                self.session_logger.error("LLM service not available for AI processing")
-                await self._send_error("AI response service is currently unavailable.")
-                return
-            
-            # Add AI processing time measurement
-            self.processing_start_time = time.time()
-            
-            messages = self.context_manager.get_messages_for_llm(text)
-            
-            # Create a task for AI response generation with timeout handling
-            try:
-                async def generate_ai_response():
-                    async for chunk in llm_service.generate_response_stream(messages):
-                        if self.should_interrupt_tts:
-                            self.session_logger.info("AI response generation interrupted by client.")
-                            break
-                        
-                        # Add chunk to context manager
-                        self.context_manager.add_ai_response_chunk(chunk)
-                        
-                        # Send partial response to frontend
-                        await self._send_message({
-                            "type": "ai_response",
-                            "text": chunk,
-                            "final": False
-                        })
-                    
-                    # Send TTS only after AI generation is complete and not interrupted
-                    if not self.should_interrupt_tts:
-                        full_response = self.context_manager.get_last_ai_response()
-                        await self._start_tts_streaming(full_response)
-                        
-                        # Send final response
-                        await self._send_message({
-                            "type": "ai_response",
-                            "text": full_response,
-                            "final": True
-                        })
-                        
-                        # Record total time if we track performance
-                        if self.processing_start_time and self.metrics:
-                            processing_time = time.time() - self.processing_start_time
-                            self.metrics.record_latency('ai_response_time', processing_time)
-                            self.session_logger.info(f"AI processing completed in {processing_time:.2f}s")
-                
-                # Use the configured timeout from settings
-                await asyncio.wait_for(generate_ai_response(), timeout=settings.ai_response_timeout)
-                
-            except asyncio.TimeoutError:
-                self.session_logger.error(f"AI response generation timed out after {settings.ai_response_timeout}s")
-                await self._send_error("AI response generation timed out. Please try again.")
-            except Exception as e:
-                self.session_logger.error(f"Error during AI response generation: {e}", exc_info=True)
-                await self._send_error("An error occurred while generating the AI response.")
+        self.session_logger.info(f"Processing transcript with AI: {text}")
+
+        # Handle empty text gracefully
+        if not text or text.strip() == "":
+            self.session_logger.warning("Received empty text for AI processing, skipping.")
+            self.pipeline_running = False
+            self.is_finalizing = False
+            return
+
+        # Add to conversation context
+        self.context_manager.add_user_message(text)
+
+        llm_service = self.services.get('llm')
+        if not llm_service:
+            self.session_logger.error("LLM service not available.")
+            await self._send_error("The AI service is currently unavailable.")
+            self.pipeline_running = False
+            self.is_finalizing = False # Reset flag on error
+            return
         
+        try:
+            # Generate the response and stream TTS
+            async def generate_ai_response():
+                response_generator = llm_service.generate_response_stream(
+                    self.context_manager.get_context_for_llm(), 
+                    self.session_id
+                )
+                
+                # Stream the response for immediate feedback
+                response_text = ""
+                async for chunk in response_generator:
+                    response_text += chunk
+                    await self._send_message({
+                        "type": "ai_response",
+                        "text": chunk,
+                        "final": False
+                    })
+                
+                return response_text
+
+            ai_response_text = await asyncio.wait_for(generate_ai_response(), timeout=settings.ai_response_timeout)
+            
+            if ai_response_text:
+                self.context_manager.add_assistant_message(ai_response_text)
+                await self._start_tts_streaming(ai_response_text)
+            else:
+                self.session_logger.warning("AI response was empty.")
+                await self._send_message({"type": "ai_response", "text": "I'm sorry, I couldn't generate a response.", "final": True})
+            
+            # Signal completion of AI response
+            await self._send_message({"type": "ai_response", "text": ai_response_text or "", "final": True})
+            duration = time.time() - self.processing_start_time if self.processing_start_time else 0
+            self.session_logger.info(f"AI processing completed in {duration:.2f}s")
+
+        except asyncio.TimeoutError:
+            self.session_logger.error("AI response generation timed out.")
+            await self._send_error("The AI took too long to respond.")
         except Exception as e:
-            self.session_logger.error(f"Error in AI processing pipeline: {e}", exc_info=True)
-            await self._send_error("An error occurred during AI processing.")
+            self.session_logger.error(f"Error during AI processing: {e}", exc_info=True)
+            await self._send_error("An error occurred while processing your request.")
+        finally:
+            self.processing_start_time = None
+            self.pipeline_running = False
+            self.is_finalizing = False # Reset finalization flag in finally block
 
     async def _start_tts_streaming(self, text: str):
         """Start text-to-speech generation and streaming"""
@@ -442,26 +462,35 @@ class WebSocketHandler:
                     await self._send_error("Empty text command received")
 
             elif message_type == "eos": # Client explicitly signals end of their speech
-                self.session_logger.info("Client signaled EOS (End of Speech).")
-                self.is_speaking = False # User has finished speaking based on client EOS
+                if self.is_finalizing:
+                    self.session_logger.info("Client EOS: Finalization already in progress, skipping.")
+                    return
 
+                self.is_finalizing = True
+                self.session_logger.info("Client signaled EOS (End of Speech).")
+                # This is a client-side VAD based EOS. We should finalize the STT.
+                final_stt_text = None
                 stt_service = self.services.get('stt')
                 if stt_service:
-                    final_stt_result_obj = await stt_service.finalize()
-                    if final_stt_result_obj and final_stt_result_obj.final_text and final_stt_result_obj.final_text.strip():
-                        final_text = final_stt_result_obj.final_text.strip()
-                        self.session_logger.info(f"STT Final (from client EOS): '{final_text}'")
-                        await self._send_message({"type": "transcript", "final": final_text})
-                        # Create a task for AI processing to avoid blocking
-                        ai_task = asyncio.create_task(self._process_with_ai(final_text))
-                        self.processing_tasks.add(ai_task)
-                        ai_task.add_done_callback(self.processing_tasks.discard)
-                    else:
-                        self.session_logger.info("STT finalization on client EOS yielded no significant text.")
-                        self.pipeline_running = False # No text, pipeline idle
+                    try:
+                        final_stt_result_obj = await stt_service.finalize()
+                        if final_stt_result_obj and final_stt_result_obj.final_text and final_stt_result_obj.final_text.strip():
+                            final_text = final_stt_result_obj.final_text.strip()
+                            self.session_logger.info(f"STT Final (from client EOS): '{final_text}'")
+                            await self._send_message({"type": "transcript", "final": final_text})
+                            # Create a task for AI processing to avoid blocking
+                            ai_task = asyncio.create_task(self._process_with_ai(final_text))
+                            self.processing_tasks.add(ai_task)
+                            ai_task.add_done_callback(self.processing_tasks.discard)
+                        else:
+                            self.session_logger.info("STT finalization on client EOS yielded no significant text.")
+                            self.is_finalizing = False
+                    except Exception as e:
+                        self.session_logger.error(f"Error finalizing STT on client EOS: {e}", exc_info=True)
+                        self.is_finalizing = False
                 else:
                     self.session_logger.error("STT service not available for EOS finalization.")
-                    self.pipeline_running = False
+                    self.is_finalizing = False
             else:
                 self.session_logger.warning(f"Unknown message type received: {message_type}, data: {data}")
         except Exception as e:
@@ -495,7 +524,7 @@ class WebSocketHandler:
         
     def _get_frame_size(self) -> int:
         """Calculate frame size in bytes based on standardized configuration."""
-        return settings.sample_rate * settings.audio_frame_ms // 1000 * settings.channels * 2
+        return settings.sample_rate * settings.frame_duration_ms // 1000 * settings.channels * 2
         
     async def cleanup(self):
         """Clean up resources when WebSocket connection is closed or handler is destroyed."""

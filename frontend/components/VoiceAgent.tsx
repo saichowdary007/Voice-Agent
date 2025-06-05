@@ -272,7 +272,6 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
             console.error('Message missing type field even after shim:', data);
             return;
           }
-          console.log('📨 Received WebSocket message:', data.type, data);
           await handleWebSocketMessage(data);
         } catch (e) {
           console.error('Failed to parse WebSocket message:', e, 'Raw data:', event.data);

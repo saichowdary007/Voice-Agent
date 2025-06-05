@@ -12,23 +12,26 @@ from fastapi.responses import JSONResponse
 from fastapi.websockets import WebSocketState
 import structlog
 
-# Assuming services are in services package relative to the project root
+# Setup logging first
+from app.utils.logging import setup_logging
+from app.config import settings
+
+# Initialize logging
+setup_logging(settings.log_level)
+logger = structlog.get_logger("app.main_lifespan")
+
+# Import services after logging is set up
 from services.vad_service import VADService
 from services.stt_service import STTService
 from services.tts_service import TTSService
 from services.llm_service import LLMService
 from services.audio_service import AudioService
-
-from .websocket_handler import WebSocketHandler
-from .utils.logging import setup_logging # Assuming this setup structlog
-from .utils.metrics import MetricsCollector
-from .config import settings
-
+from app.utils.metrics import MetricsCollector
+from app.websocket_handler import WebSocketHandler
 
 # Global state, initialized in lifespan
 services: Dict[str, Any] = {}
 metrics: Optional[MetricsCollector] = None
-logger: Optional[structlog.BoundLogger] = None # Define type for global logger
 
 class SessionManager:
     """Manage WebSocket sessions with state tracking"""
@@ -78,106 +81,124 @@ session_manager = SessionManager() # Instantiate the manager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan manager for startup and shutdown events."""
-    global services, metrics, logger # Allow modification of global variables
+    """Startup and shutdown hooks for the FastAPI application"""
+    # Create application-wide service containers
+    services = {}
+    metrics = MetricsCollector() if settings.enable_metrics else None
     
-    # Setup logging as the very first step
-    # The log_level from settings will be used by setup_logging
-    setup_logging(log_level=settings.log_level)
-    logger = structlog.get_logger("app.main_lifespan") # Get a logger instance
-    
-    logger.info("Application startup sequence initiated...", 
-                app_name=settings.app_name, 
-                app_version=settings.app_version,
-                log_level=settings.log_level)
-    
-    # Initialize metrics collector
-    if settings.enable_metrics:
-        metrics = MetricsCollector()
-        logger.info("Metrics collection enabled.")
-    else:
-        metrics = None # Explicitly None if disabled
-        logger.info("Metrics collection disabled.")
-    
-    logger.info("Initializing AI and Audio services...")
     try:
-        # Create service instances
-        services['vad'] = VADService(threshold=settings.vad_threshold)
-        services['stt'] = STTService()
-        services['tts'] = TTSService()
-        services['llm'] = LLMService()
-        services['audio'] = AudioService(sample_rate=settings.sample_rate, channels=settings.channels)
+        logger.info(
+            "Application startup sequence initiated...",
+            app_name=settings.app_name,
+            app_version=settings.app_version,
+            log_level=settings.log_level
+        )
         
-        # Asynchronously initialize all services
-        init_coroutines = []
-        for service_name, service_instance in services.items():
-            if hasattr(service_instance, 'initialize') and callable(service_instance.initialize):
-                init_coroutines.append(service_instance.initialize())
-        
-        results = await asyncio.gather(*init_coroutines, return_exceptions=True)
-        
-        # Detailed status logging after initialization attempts
-        services_status_summary = {}
-        all_services_ready = True
-        for (service_name, service_instance), result in zip(services.items(), results):
-            if isinstance(result, Exception):
-                logger.error(f"Failed to initialize service '{service_name}': {result}", exc_info=result)
-                services_status_summary[service_name] = {"available": False, "error": str(result)}
-                all_services_ready = False
-            else:
-                # Check is_available or get_status after successful initialize()
-                status = False
-                if hasattr(service_instance, 'is_available'): status = service_instance.is_available
-                elif hasattr(service_instance, 'get_status'): status = service_instance.get_status().get('available', False)
-                services_status_summary[service_name] = {"available": status}
-                if not status: all_services_ready = False
-                logger.info(f"Service '{service_name}' initialized. Available: {status}")
-
-        if not all_services_ready:
-            logger.warning("One or more services failed to initialize. Application may run in a degraded state or fail if critical services are down.")
-            # Consider raising an exception here if certain services are absolutely critical for startup
-            # For example: if 'audio' service fails, it might be unrecoverable.
-            # if not services.get('audio') or not services['audio'].is_available:
-            #     raise RuntimeError("Critical AudioService failed to initialize. Application cannot start.")
-
-        # Preload models if enabled (and if services support it)
-        if settings.preload_models:
-            logger.info("Attempting to preload AI models...")
-            preload_coroutines = []
-            for service_name, service_instance in services.items():
-                if hasattr(service_instance, 'preload') and callable(service_instance.preload):
-                     if hasattr(service_instance, 'is_available') and service_instance.is_available: # Only preload if service is available
-                        preload_coroutines.append(service_instance.preload())
-                     elif not hasattr(service_instance, 'is_available'): # If no is_available, assume preload can be tried
-                        preload_coroutines.append(service_instance.preload())
-
-            if preload_coroutines:
-                await asyncio.gather(*preload_coroutines, return_exceptions=True) # Handle preload errors too
-            logger.info("Model preloading process completed (if applicable for services).")
+        # Set up metrics collection if enabled
+        if metrics:
+            logger.info("Metrics collection enabled.")
             
+        # Initialize services
+        logger.info("Initializing AI and Audio services...")
+        
+        # Initialize VAD service
+        try:
+            services['vad'] = VADService(threshold=settings.vad_threshold)
+            await services['vad'].initialize()
+        except Exception as vad_e:
+            logger.critical(f"A critical error occurred initializing VAD service: {vad_e}", exc_info=True)
+            services['vad'] = None
+        
+        # Initialize STT service
+        try:
+            services['stt'] = STTService(api_key=settings.azure_speech_key, region=settings.azure_speech_region)
+            await services['stt'].initialize()
+        except Exception as stt_e:
+            logger.critical(f"A critical error occurred initializing STT service: {stt_e}", exc_info=True)
+            services['stt'] = None
+        
+        # Initialize TTS service - using default constructor
+        try:
+            services['tts'] = TTSService()
+            await services['tts'].initialize()
+            logger.info(f"TTS Service initialized")
+        except Exception as tts_e:
+            logger.critical(f"A critical error occurred initializing TTS service: {tts_e}", exc_info=True)
+            services['tts'] = None
+        
+        # Initialize LLM service - using default constructor
+        try:
+            services['llm'] = LLMService()
+            await services['llm'].initialize()
+            print(f"LLM Service initialized")
+        except Exception as llm_e:
+            logger.critical(f"A critical error occurred initializing LLM service: {llm_e}", exc_info=True)
+            services['llm'] = None
+        
+        # Initialize Audio service
+        try:
+            services['audio'] = AudioService(
+                sample_rate=settings.sample_rate,
+                channels=settings.channels
+            )
+            await services['audio'].initialize()
+            print(f"AudioService configured: SR={settings.sample_rate}Hz, Chan={settings.channels}")
+        except Exception as audio_e:
+            logger.critical(f"A critical error occurred initializing Audio service: {audio_e}", exc_info=True)
+            services['audio'] = None
+        
+        # Check service availability
+        for service_name, service in services.items():
+            available = service is not None and getattr(service, 'is_available', True)
+            logger.info(f"Service '{service_name}' initialized. Available: {available}")
+        
+        # Try to preload AI models if supported by services
+        logger.info("Attempting to preload AI models...")
+        
+        # Preload VAD model
+        if services.get('vad') and hasattr(services['vad'], 'preload'):
+            try:
+                await services['vad'].preload()
+            except Exception as e:
+                logger.warning(f"Failed to preload VAD model: {e}")
+        
+        logger.info("Model preloading process completed (if applicable for services).")
+        
+        # Pass the initialized services to the application state
+        app.state.services = services
+        app.state.metrics = metrics
+        app.state.session_manager = SessionManager()
+        
+        logger.info("Application startup complete. Listening for requests...")
+        
+        yield
+        
+        # Shutdown and cleanup
+        logger.info("Application shutdown initiated...")
+        
+        # Close and clean up services
+        for service_name, service in services.items():
+            if service and hasattr(service, 'cleanup'):
+                logger.info(f"Cleaning up {service_name} service...")
+                try:
+                    # Handle both sync and async cleanup methods
+                    if asyncio.iscoroutinefunction(service.cleanup):
+                        await service.cleanup()
+                    else:
+                        service.cleanup()
+                    logger.info(f"{service_name} service cleaned up successfully")
+                except Exception as e:
+                    logger.error(f"Error cleaning up {service_name} service: {e}")
+        
+        if metrics:
+            metrics.cleanup()
+            
+        logger.info("Application shutdown complete.")
+        
     except Exception as e:
         logger.critical(f"A critical error occurred during service initialization: {e}", exc_info=True)
-        # This exception will prevent the app from starting if it occurs here.
-        raise
-    
-    logger.info("Application startup complete. Listening for requests...")
-    yield # Application runs here
-    
-    # Shutdown sequence
-    logger.info("Application shutdown sequence initiated...")
-    cleanup_coroutines = []
-    for service_name, service_instance in services.items():
-        if hasattr(service_instance, 'cleanup') and callable(service_instance.cleanup):
-            cleanup_coroutines.append(service_instance.cleanup())
-    
-    if cleanup_coroutines:
-        results = await asyncio.gather(*cleanup_coroutines, return_exceptions=True)
-        for (service_name, _), result in zip(services.items(), results):
-            if isinstance(result, Exception):
-                logger.error(f"Error during cleanup of service '{service_name}': {result}", exc_info=result)
-            else:
-                logger.info(f"Service '{service_name}' cleaned up successfully.")
-    logger.info("Application shutdown complete.")
+        # We still yield to allow the app to start, but it may be in a degraded state
+        yield
 
 
 app = FastAPI(
@@ -206,7 +227,7 @@ async def health_check_endpoint(): # Renamed to avoid conflict
     try:
         service_status_details = {}
         all_services_operational = True
-        for name, service_instance in services.items():
+        for name, service_instance in app.state.services.items():
             status_info = {"available": False, "details": "Status method not found"}
             if hasattr(service_instance, 'get_status') and callable(service_instance.get_status):
                 try:
@@ -225,7 +246,7 @@ async def health_check_endpoint(): # Renamed to avoid conflict
             
             service_status_details[name] = status_info
 
-        current_memory_mb = metrics.get_memory_usage() if metrics else 0.0
+        current_memory_mb = app.state.metrics.get_memory_usage() if app.state.metrics else 0.0
         
         # Check all services and determine if they're ready
         essential_services = ['vad', 'stt', 'audio']
@@ -250,13 +271,13 @@ async def health_check_endpoint(): # Renamed to avoid conflict
             "status": status,
             "timestamp": time.time(),
             "app_version": settings.app_version,
-            "active_sessions": session_manager.get_active_sessions_count(),
+            "active_sessions": app.state.session_manager.get_active_sessions_count(),
             "memory_usage_mb": round(current_memory_mb, 2),
             "services": service_status_details,
             "config_summary": {
                 "sample_rate": settings.sample_rate,
                 "channels": settings.channels,
-                "audio_frame_ms": settings.audio_frame_ms,
+                "audio_frame_ms": settings.frame_duration_ms,
                 "max_concurrent_sessions": settings.max_concurrent_sessions,
                 "metrics_enabled": settings.enable_metrics,
                 "log_level": settings.log_level,
@@ -277,10 +298,10 @@ async def health_check_endpoint(): # Renamed to avoid conflict
 @app.get("/metrics", summary="Application performance metrics (if enabled)")
 async def metrics_endpoint():
     """Exports collected performance metrics."""
-    if not settings.enable_metrics or metrics is None:
+    if not settings.enable_metrics or app.state.metrics is None:
         raise HTTPException(status_code=404, detail="Metrics collection is disabled or not available.")
     # Consider Prometheus format output here if that's the target system
-    return JSONResponse(content=metrics.get_all_metrics())
+    return JSONResponse(content=app.state.metrics.get_all_metrics())
 
 
 @app.websocket("/ws")
@@ -332,7 +353,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "ready": True,
                     "config": { # Send relevant backend config to client
                         "sample_rate": settings.sample_rate,
-                        "frame_duration_ms": settings.audio_frame_ms,
+                        "frame_duration_ms": settings.frame_duration_ms,
                         "channels": settings.channels
                     }
                 })

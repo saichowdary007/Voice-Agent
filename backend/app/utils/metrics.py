@@ -296,6 +296,19 @@ class MetricsCollector:
                 
         return '\n'.join(lines)
 
+    def cleanup(self):
+        """Clean up resources used by the metrics collector"""
+        logger.info("Cleaning up metrics collector...")
+        with self.lock:
+            # Clear all metrics
+            self.latency_metrics.clear()
+            self.counter_metrics.clear()
+            self.gauge_metrics.clear()
+            self.request_times.clear()
+            self.error_counts.clear()
+            self.system_stats.clear()
+        logger.info("Metrics collector cleaned up successfully")
+
 
 class PerformanceMonitor:
     """Real-time performance monitoring"""

@@ -36,7 +36,7 @@ class AudioService:
         self.last_processed_chunk_size: int = 0  # Track size of last successfully processed chunk
         
         # Frame size in samples per channel for Opus codec
-        self.opus_frame_duration_ms: int = settings.audio_frame_ms # Use configured frame duration for Opus
+        self.opus_frame_duration_ms: int = settings.frame_duration_ms # Use configured frame duration for Opus
         self.opus_frame_size_samples: int = int(self.sample_rate * self.opus_frame_duration_ms / 1000)
         
         # Frame size in bytes for general PCM processing (16-bit)

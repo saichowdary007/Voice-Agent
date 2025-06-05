@@ -19,7 +19,7 @@ class OpusCodec:
         # Use standardized configuration instead of hardcoded values
         self.sample_rate = settings.sample_rate
         self.channels = settings.channels
-        self.frame_duration = settings.audio_frame_ms  # Use config instead of hardcoded 120ms
+        self.frame_duration = settings.frame_duration_ms  # Use config instead of hardcoded 120ms
         self.bitrate = 32000  # 32 kbps for voice
         
         # Opus encoder/decoder
