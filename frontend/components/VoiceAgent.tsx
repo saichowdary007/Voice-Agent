@@ -63,7 +63,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
   const [latency, setLatency] = useState<number>(0);
   const [isUserSpeaking, setIsUserSpeaking] = useState(false); // For client-side VAD indication
 
-  const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8003/ws';
+  const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/ws';
 
   const connectWebSocket = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN || isCleaningUpRef.current) {
@@ -234,7 +234,23 @@ async function handleWebSocketMessage(data: any) {
     }
 
     try {
-      console.log('Requesting microphone access...');
+      console.log('🎤 Starting microphone access request...');
+      
+      // Check if getUserMedia is available
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('getUserMedia not supported in this browser');
+      }
+      
+      console.log('🔍 Checking available audio devices...');
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const audioInputs = devices.filter(device => device.kind === 'audioinput');
+        console.log(`Found ${audioInputs.length} audio input devices:`, audioInputs.map(d => d.label || 'Unnamed device'));
+      } catch (e) {
+        console.warn('Could not enumerate devices:', e);
+      }
+
+      console.log('📋 Requesting microphone access with constraints...');
       const constraints: MediaStreamConstraints = {
         audio: {
           sampleRate: 16000,
@@ -245,9 +261,22 @@ async function handleWebSocketMessage(data: any) {
         },
         video: false
       };
+      console.log('Constraints:', constraints);
+      
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       streamRef.current = stream;
-      console.log('Microphone access granted. Track settings:', stream.getAudioTracks()[0]?.getSettings());
+      
+      const track = stream.getAudioTracks()[0];
+      if (!track) {
+        throw new Error('No audio track found in the stream');
+      }
+      
+      console.log('✅ Microphone access granted!');
+      console.log('Track settings:', track.getSettings());
+      console.log('Track capabilities:', track.getCapabilities());
+      console.log('Track state:', track.readyState);
+      console.log('Track enabled:', track.enabled);
+      console.log('Track muted:', track.muted);
 
       const logFormatSupport = () => {
         const testFormats = ['audio/webm;codecs=opus', 'audio/webm', 'audio/wav', 'audio/ogg;codecs=opus', 'audio/mp4', 'audio/mpeg'];
@@ -475,12 +504,12 @@ async function handleWebSocketMessage(data: any) {
     sendWebSocketMessage({ type: 'end_session' });
     // Delay cleanup to allow message to send
     setTimeout(() => handleEndSession(false), 100); // Pass false: user initiated
-  }, [sendWebSocketMessage, handleEndSession]);
+  }, [sendWebSocketMessage]);
 
 
   /**
    * Ends the current voice session and performs a full cleanup.
-   * A regular (hoisted) function prevents “used before declaration” errors.
+   * A regular (hoisted) function prevents "used before declaration" errors.
    */
   function handleEndSession(backendInitiated = false) {
     if (isCleaningUpRef.current) {
@@ -556,7 +585,7 @@ async function handleWebSocketMessage(data: any) {
 
 
   const startNewSession = useCallback(async () => {
-    console.log('Starting new session attempt...');
+    console.log('🚀 Starting new session attempt...');
     if (isCleaningUpRef.current) {
       console.log('StartNewSession: Cleanup in progress. Will retry in 550ms.');
       setTimeout(startNewSession, 550); // Retry after cleanup timeout
@@ -601,13 +630,15 @@ async function handleWebSocketMessage(data: any) {
         keepAliveIntervalRef.current = null;
       }
     };
-  }, [connectWebSocket, handleEndSession, session.isConnected, session.sessionEnded]);
+  }, [connectWebSocket, session.isConnected, session.sessionEnded]);
 
   useEffect(() => {
     // Attempt to initialize audio once connected and if not already initialized/cleaning up
     if (session.isConnected && !streamRef.current && !vadRef.current && !isCleaningUpRef.current) {
-      console.log("useEffect: Connection active, attempting to initialize audio.");
-      initializeAudio();
+      console.log("🔊 useEffect: Connection active, attempting to initialize audio.");
+      initializeAudio().then(success => {
+        console.log(`🎯 Audio initialization ${success ? 'succeeded' : 'failed'}`);
+      });
     }
   }, [session.isConnected, initializeAudio]);
 
