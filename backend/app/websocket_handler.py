@@ -108,6 +108,7 @@ class WebSocketHandler:
                 )
             except asyncio.TimeoutError:
                 self.session_logger.warning(f"Audio conversion timed out for chunk of {len(audio_data)} bytes")
+                # Don't send error to client for individual chunk failures
                 return
             except Exception as e:
                 self.session_logger.error(f"Audio conversion failed: {e}", exc_info=True)
@@ -116,8 +117,6 @@ class WebSocketHandler:
 
             if not pcm_data:
                 # Error already logged by _convert_audio_via_service if it fails consistently
-                # Send error to client only if it's a persistent issue (handled by retry logic in _convert)
-                # If _convert_audio_via_service returns None after retries, it means it's unrecoverable for this stream of chunks
                 self.session_logger.debug(f"Audio conversion by AudioService returned None for chunk of {len(audio_data)} bytes (may be buffering).")
                 return
 
@@ -125,7 +124,12 @@ class WebSocketHandler:
                 self.session_logger.warning(f"PCM data too short after conversion: {len(pcm_data)} bytes, skipping processing for this chunk.")
                 return
 
-            self.audio_buffer.extend(pcm_data)
+            # Add to buffer with error handling
+            try:
+                self.audio_buffer.extend(pcm_data)
+            except Exception as e:
+                self.session_logger.error(f"Error extending audio buffer: {e}", exc_info=True)
+                self.audio_buffer = bytearray(pcm_data)  # Reset and try again
 
             # Process audio with timeout and error recovery
             try:

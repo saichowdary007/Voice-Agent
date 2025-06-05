@@ -192,6 +192,54 @@ class LLMService:
                 yield word + " "
                 await asyncio.sleep(0.05)
     
+    async def generate_response_stream(self, messages: list) -> AsyncGenerator[str, None]:
+        """
+        Generate streaming response from a list of messages
+        
+        Args:
+            messages: List of message objects with role and content
+            
+        Yields:
+            Response tokens as they are generated
+        """
+        if not self.is_available:
+            # Mock streaming response
+            mock_response = self._get_mock_response()
+            words = mock_response.split()
+            for word in words:
+                yield word + " "
+                await asyncio.sleep(0.05)  # Simulate streaming delay
+            return
+        
+        try:
+            # Extract the latest user message
+            user_message = None
+            for message in reversed(messages):
+                if message.role == "user" and message.content:
+                    user_message = message.content
+                    break
+            
+            if not user_message:
+                logger.warning("No valid user message found in messages list")
+                mock_response = self._get_mock_response()
+                for word in mock_response.split():
+                    yield word + " "
+                    await asyncio.sleep(0.05)
+                return
+                
+            # Use the existing generate_streaming method with the extracted user message
+            async for chunk in self.generate_streaming(user_message):
+                yield chunk
+                
+        except Exception as e:
+            logger.error(f"LLM response stream failed: {e}")
+            # Fallback to mock response
+            mock_response = self._get_mock_response()
+            words = mock_response.split()
+            for word in words:
+                yield word + " "
+                await asyncio.sleep(0.05)
+    
     def _build_prompt(self, user_input: str) -> str:
         """Build prompt with conversation context"""
         if not self.conversation_history:

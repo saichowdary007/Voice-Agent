@@ -98,8 +98,12 @@ class STTService:
                     
                 # Feed audio to recognizer (sherpa-ncnn 2.1.11 API)
                 def process_audio():
+                    logger.debug(f"STT:process_audio: About to call accept_waveform. Audio chunk shape: {audio_chunk.shape}, dtype: {audio_chunk.dtype}")
                     self.recognizer.accept_waveform(self.sample_rate, audio_chunk)
-                    return self.recognizer.text.strip()
+                    logger.debug("STT:process_audio: accept_waveform completed. About to get text.")
+                    text_result = self.recognizer.text.strip()
+                    logger.debug(f"STT:process_audio: Got text: '{text_result}'")
+                    return text_result
                 
                 partial_text = await asyncio.to_thread(process_audio)
                 

@@ -17,6 +17,10 @@ class ConversationSession:
     messages: List[Message] = field(default_factory=list)
     user_preferences: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Add a field to track the latest AI response
+    last_ai_response: str = ""
+    # Track AI response chunks
+    ai_response_chunks: List[str] = field(default_factory=list)
 
 
 class ContextManager:
@@ -80,6 +84,7 @@ class ContextManager:
         
         session.messages.append(message)
         session.last_activity = time.time()
+        session.last_ai_response = content  # Store the complete response
         
         if metadata:
             session.metadata.update(metadata)
@@ -113,6 +118,61 @@ class ContextManager:
             messages = session.messages
             
         return messages
+    
+    def get_messages_for_llm(self, user_text: str) -> List[Message]:
+        """Get formatted messages for LLM processing, including the current user text"""
+        # First get existing context
+        messages = self.get_messages()
+        
+        # Add the current user message if it's not already in the context
+        if not messages or messages[-1].role != 'user' or messages[-1].content != user_text:
+            user_message = Message(
+                role='user',
+                content=user_text,
+                timestamp=time.time()
+            )
+            # Add to the temporary list for LLM processing
+            messages.append(user_message)
+            
+            # Also add to the session history
+            session = self.get_current_session()
+            session.messages.append(user_message)
+            session.last_activity = time.time()
+            self._manage_context_size()
+            
+        return messages
+    
+    def add_ai_response_chunk(self, chunk: str):
+        """Add a chunk of the AI response for streaming responses"""
+        session = self.get_current_session()
+        if not session:
+            return
+            
+        # Add to chunks list
+        session.ai_response_chunks.append(chunk)
+        session.last_activity = time.time()
+    
+    def get_last_ai_response(self) -> str:
+        """Get the complete last AI response (from chunks or stored response)"""
+        session = self.get_current_session()
+        if not session:
+            return ""
+            
+        # If we have chunks, join them to get the complete response
+        if session.ai_response_chunks:
+            complete_response = "".join(session.ai_response_chunks)
+            
+            # Store the complete response and clear chunks
+            session.last_ai_response = complete_response
+            session.ai_response_chunks = []
+            
+            # Also add it as a formal message in the conversation history
+            self.add_ai_message(complete_response)
+            
+            return complete_response
+        
+        # Otherwise return the last stored response
+        return session.last_ai_response
         
     def _manage_context_size(self):
         """Manage context size and create summaries when needed"""
