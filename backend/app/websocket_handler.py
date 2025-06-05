@@ -100,7 +100,19 @@ class WebSocketHandler:
             # Skip small chunk buffering - let AudioService handle it with its chunk buffering
             self.last_audio_time = time.time() # Update activity time
 
-            pcm_data = await self._convert_audio_via_service(audio_data)
+            # Add timeout and better error handling for audio conversion
+            try:
+                pcm_data = await asyncio.wait_for(
+                    self._convert_audio_via_service(audio_data), 
+                    timeout=settings.audio_conversion_timeout  # Use configured timeout
+                )
+            except asyncio.TimeoutError:
+                self.session_logger.warning(f"Audio conversion timed out for chunk of {len(audio_data)} bytes")
+                return
+            except Exception as e:
+                self.session_logger.error(f"Audio conversion failed: {e}", exc_info=True)
+                # Don't send error to client for individual chunk failures
+                return
 
             if not pcm_data:
                 # Error already logged by _convert_audio_via_service if it fails consistently
@@ -114,23 +126,42 @@ class WebSocketHandler:
                 return
 
             self.audio_buffer.extend(pcm_data)
-            self.session_logger.debug(f"PCM data added to buffer. Current audio_buffer size: {len(self.audio_buffer)} bytes")
+
+            # Process audio with timeout and error recovery
+            try:
+                await asyncio.wait_for(self._process_audio_buffer(), timeout=settings.audio_processing_timeout)
+            except asyncio.TimeoutError:
+                self.session_logger.warning("Audio buffer processing timed out")
+                # Clear buffer to prevent backlog
+                self.audio_buffer.clear()
+            except Exception as e:
+                self.session_logger.error(f"Audio buffer processing failed: {e}", exc_info=True)
+                # Clear buffer to prevent further issues
+                self.audio_buffer.clear()
+
+        except Exception as e:
+            self.session_logger.error(f"Critical error in handle_audio_chunk: {e}", exc_info=True)
+            # Don't re-raise to prevent WebSocket disconnection
+            # Clear audio buffer to prevent issues with subsequent chunks
+            self.audio_buffer.clear()
+
+    async def _process_audio_buffer(self):
+        """Process accumulated audio buffer with frame extraction."""
+        frame_size_bytes = self._get_frame_size() 
+        
+        while len(self.audio_buffer) >= frame_size_bytes:
+            frame_to_process = bytes(self.audio_buffer[:frame_size_bytes])
+            self.audio_buffer = self.audio_buffer[frame_size_bytes:]
             
-            frame_size_bytes = self._get_frame_size() 
+            self.session_logger.debug(f"Extracted frame of {len(frame_to_process)} bytes for processing. Buffer remaining: {len(self.audio_buffer)}")
             
-            while len(self.audio_buffer) >= frame_size_bytes:
-                frame_to_process = bytes(self.audio_buffer[:frame_size_bytes])
-                self.audio_buffer = self.audio_buffer[frame_size_bytes:]
-                
-                self.session_logger.debug(f"Extracted frame of {len(frame_to_process)} bytes for processing. Buffer remaining: {len(self.audio_buffer)}")
-                
+            # Process frame with error handling to prevent task accumulation
+            try:
                 task = asyncio.create_task(self._process_audio_frame(frame_to_process))
                 self.processing_tasks.add(task)
                 task.add_done_callback(self.processing_tasks.discard) # Auto-remove task when done
-                
-        except Exception as e:
-            self.session_logger.error(f"Error in handle_audio_chunk: {e}", exc_info=True)
-            await self._send_error(f"Server error during audio handling: {str(e)}")
+            except Exception as e:
+                self.session_logger.error(f"Failed to create audio processing task: {e}", exc_info=True)
 
     async def _process_audio_frame(self, frame: bytes):
         """Process a single PCM audio frame through VAD and potentially STT/AI pipeline."""
@@ -220,61 +251,70 @@ class WebSocketHandler:
             self.session_logger.error(f"Error in barge-in handling: {e}")
 
     async def _process_with_ai(self, text: str):
-        """Process user input with AI and initiate TTS response"""
-        self.pipeline_running = True # Mark pipeline as active
+        """Process transcript with AI and generate response."""
         try:
+            self.session_logger.info(f"Processing transcript with AI: {text}")
+            llm_service = self.services.get('llm')
+            
+            if not llm_service:
+                self.session_logger.error("LLM service not available for AI processing")
+                await self._send_error("AI response service is currently unavailable.")
+                return
+            
+            # Add AI processing time measurement
             self.processing_start_time = time.time()
             
-            # Add to context
-            self.context_manager.add_user_message(text)
+            messages = self.context_manager.get_messages_for_llm(text)
             
-            # Get conversation context
-            messages = self.context_manager.get_conversation_context()
-            
-            # Get AI service
-            llm_service = self.services.get('llm')
-            if not llm_service:
-                await self._send_error("AI service is currently unavailable")
-                self.pipeline_running = False
-                return
-                
-            # Generate AI response
-            await self._send_message({"type": "ai_response", "token": "", "complete": False})
-            
-            full_response = ""
-            async for chunk in llm_service.generate_response_stream(messages):
-                if chunk.choices and chunk.choices[0].delta.content:
-                    token = chunk.choices[0].delta.content
-                    full_response += token
-                    await self._send_message({
-                        "type": "ai_response", 
-                        "token": token, 
-                        "complete": False
-                    })
+            # Create a task for AI response generation with timeout handling
+            try:
+                async def generate_ai_response():
+                    async for chunk in llm_service.generate_response_stream(messages):
+                        if self.should_interrupt_tts:
+                            self.session_logger.info("AI response generation interrupted by client.")
+                            break
+                        
+                        # Add chunk to context manager
+                        self.context_manager.add_ai_response_chunk(chunk)
+                        
+                        # Send partial response to frontend
+                        await self._send_message({
+                            "type": "ai_response",
+                            "text": chunk,
+                            "final": False
+                        })
                     
-                # Check for interruption
-                if self.should_interrupt_tts:
-                    self.session_logger.info("AI response generation interrupted")
-                    self.pipeline_running = False
-                    return
-                    
-            # Response complete
-            await self._send_message({"type": "ai_response", "token": "", "complete": True})
-            
-            if full_response.strip():
-                # Add AI response to context
-                self.context_manager.add_ai_message(full_response.strip())
+                    # Send TTS only after AI generation is complete and not interrupted
+                    if not self.should_interrupt_tts:
+                        full_response = self.context_manager.get_last_ai_response()
+                        await self._start_tts_streaming(full_response)
+                        
+                        # Send final response
+                        await self._send_message({
+                            "type": "ai_response",
+                            "text": full_response,
+                            "final": True
+                        })
+                        
+                        # Record total time if we track performance
+                        if self.processing_start_time and self.metrics:
+                            processing_time = time.time() - self.processing_start_time
+                            self.metrics.record_latency('ai_response_time', processing_time)
+                            self.session_logger.info(f"AI processing completed in {processing_time:.2f}s")
                 
-                # Start TTS
-                await self._start_tts_streaming(full_response.strip())
-            else:
-                self.session_logger.warning("AI generated empty response")
-                self.pipeline_running = False
+                # Use the configured timeout from settings
+                await asyncio.wait_for(generate_ai_response(), timeout=settings.ai_response_timeout)
                 
+            except asyncio.TimeoutError:
+                self.session_logger.error(f"AI response generation timed out after {settings.ai_response_timeout}s")
+                await self._send_error("AI response generation timed out. Please try again.")
+            except Exception as e:
+                self.session_logger.error(f"Error during AI response generation: {e}", exc_info=True)
+                await self._send_error("An error occurred while generating the AI response.")
+        
         except Exception as e:
-            self.session_logger.error(f"Error in AI processing: {e}", exc_info=True)
-            await self._send_error("Error generating AI response")
-            self.pipeline_running = False
+            self.session_logger.error(f"Error in AI processing pipeline: {e}", exc_info=True)
+            await self._send_error("An error occurred during AI processing.")
 
     async def _start_tts_streaming(self, text: str):
         """Start text-to-speech generation and streaming"""
@@ -360,6 +400,20 @@ class WebSocketHandler:
                 await self._send_message(pong_response)
                 self.session_logger.debug(f"Responded to ping with {pong_response}")
 
+            elif message_type == "text_command":
+                # Direct text command without going through STT
+                text = data.get("text", "").strip()
+                if text:
+                    self.session_logger.info(f"Received direct text command: '{text}'")
+                    await self._send_message({"type": "transcript", "final": text})
+                    # Create a task for AI processing
+                    ai_task = asyncio.create_task(self._process_with_ai(text))
+                    self.processing_tasks.add(ai_task)
+                    ai_task.add_done_callback(self.processing_tasks.discard)
+                else:
+                    self.session_logger.warning("Received empty text command")
+                    await self._send_error("Empty text command received")
+
             elif message_type == "eos": # Client explicitly signals end of their speech
                 self.session_logger.info("Client signaled EOS (End of Speech).")
                 self.is_speaking = False # User has finished speaking based on client EOS
@@ -391,9 +445,19 @@ class WebSocketHandler:
         """Send JSON message to frontend, checking WebSocket state."""
         if self.websocket.client_state == WebSocketState.CONNECTED:
             try:
-                await self.websocket.send_text(json.dumps(data))
+                await asyncio.wait_for(
+                    self.websocket.send_text(json.dumps(data)), 
+                    timeout=settings.message_send_timeout
+                )
+            except asyncio.TimeoutError:
+                self.session_logger.error(f"Message send timed out (type: {data.get('type', 'Unknown')})")
+                # Don't raise exception to prevent WebSocket disconnection
+            except ConnectionResetError:
+                self.session_logger.warning("Connection reset while sending message")
+                # Connection is lost, stop trying to send
             except Exception as e: # Catch errors during send_text specifically
                 self.session_logger.error(f"Failed to send message (type: {data.get('type', 'Unknown')}): {e}", exc_info=True)
+                # Don't re-raise to prevent WebSocket disconnection
         else:
             self.session_logger.warning(f"Attempted to send message on a non-connected WebSocket. State: {self.websocket.client_state.name}. Data: {str(data)[:100]}")
             
@@ -535,3 +599,52 @@ class WebSocketHandler:
             self.session_logger.error(f"Watchdog timer encountered an unhandled error: {e}", exc_info=True)
         finally:
             self.session_logger.info(f"Watchdog timer stopped for session {self.session_id}.")
+
+    async def _generate_tts(self, text: str):
+        """Generate TTS audio with proper error handling."""
+        try:
+            tts_service = self.services.get('tts')
+            if not tts_service:
+                self.session_logger.warning("TTS service not available")
+                return
+
+            self.tts_active = True
+            await self._send_message({"type": "tts_start"})
+            
+            # Generate TTS audio
+            async for audio_chunk in tts_service.generate_audio_stream(text):
+                if self.should_interrupt_tts:
+                    self.session_logger.info("TTS interrupted by user")
+                    break
+                    
+                if audio_chunk:
+                    await self._send_message({
+                        "type": "audio_chunk",
+                        "audio_data": audio_chunk
+                    })
+            
+            if not self.should_interrupt_tts:
+                await self._send_message({"type": "tts_complete"})
+                
+        except Exception as e:
+            self.session_logger.error(f"TTS generation error: {e}", exc_info=True)
+            await self._send_error("Audio generation failed")
+        finally:
+            self.tts_active = False
+            self.should_interrupt_tts = False
+
+    async def _check_connection_health(self):
+        """Periodically check WebSocket connection health."""
+        try:
+            while self.websocket.client_state == WebSocketState.CONNECTED:
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+                # Send ping to check connection
+                try:
+                    await self._send_message({"type": "ping", "timestamp": time.time()})
+                except Exception as e:
+                    self.session_logger.warning(f"Health check failed: {e}")
+                    break
+                    
+        except Exception as e:
+            self.session_logger.error(f"Connection health check error: {e}", exc_info=True)

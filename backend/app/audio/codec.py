@@ -7,7 +7,7 @@ import ffmpeg
 import structlog
 
 # Import standardized configuration
-from ..config import settings
+from app.config import settings
 
 logger = structlog.get_logger()
 

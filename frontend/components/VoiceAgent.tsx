@@ -52,6 +52,12 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
     isReconnecting: false,
   });
 
+  // Add reconnection state
+  const reconnectAttemptsRef = useRef<number>(0);
+  const maxReconnectAttempts = 5;
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const audioQueueRef = useRef<Blob[]>([]);
+
   const [transcript, setTranscript] = useState<TranscriptState>({
     partial: '',
     final: [],
@@ -157,6 +163,20 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
     }, 500);
   }
 
+  const flushAudioQueue = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN && audioQueueRef.current.length > 0) {
+      console.log(`Flushing ${audioQueueRef.current.length} queued audio chunks`);
+      
+      audioQueueRef.current.forEach(audioBlob => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(audioBlob);
+        }
+      });
+      
+      audioQueueRef.current = [];
+    }
+  }, []);
+
   const connectWebSocket = useCallback(() => {
     // Check if we should skip connection attempt
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -178,7 +198,11 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       // Close any existing connection first
       if (wsRef.current) {
         console.log('ConnectWebSocket: Closing existing connection before creating new one');
-        wsRef.current.close();
+        try {
+          wsRef.current.close();
+        } catch (e) {
+          console.error('Error closing existing WebSocket:', e);
+        }
         wsRef.current = null;
       }
 
@@ -186,18 +210,38 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       wsRef.current = ws;
       lastServerMessageTimeRef.current = Date.now();
 
+      // Set a connection timeout
+      const connectionTimeoutId = setTimeout(() => {
+        if (ws.readyState !== WebSocket.OPEN) {
+          console.error('WebSocket connection timeout');
+          ws.close();
+        }
+      }, 10000); // 10 second timeout for initial connection
+
       ws.onopen = () => {
+        clearTimeout(connectionTimeoutId);
         console.log('✅ WebSocket connected successfully');
         console.log('Setting session state: isConnected=true, sessionEnded=false');
+        
+        // Reset reconnection state on successful connection
+        reconnectAttemptsRef.current = 0;
+        if (reconnectTimeoutRef.current) {
+          clearTimeout(reconnectTimeoutRef.current);
+          reconnectTimeoutRef.current = null;
+        }
+        
         setSession(prev => ({ ...prev, isConnected: true, sessionEnded: false, isReconnecting: false }));
         lastServerMessageTimeRef.current = Date.now();
+        
+        // Flush any queued audio after successful reconnection
+        flushAudioQueue();
         
         if (keepAliveIntervalRef.current) clearInterval(keepAliveIntervalRef.current);
         keepAliveIntervalRef.current = setInterval(() => {
           if (wsRef.current?.readyState === WebSocket.OPEN) {
             const now = Date.now();
-            if (now - lastServerMessageTimeRef.current > 30000) { 
-              console.warn('No server message for over 30 seconds. Closing connection due to timeout.');
+            if (now - lastServerMessageTimeRef.current > 60000) { // Increased from 30s to 60s
+              console.warn('No server message for over 60 seconds. Closing connection due to timeout.');
               wsRef.current.close(1000, "Keep-alive timeout"); 
             } else {
               wsRef.current.send(JSON.stringify({ type: "ping", timestamp: now }));
@@ -228,6 +272,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
             console.error('Message missing type field even after shim:', data);
             return;
           }
+          console.log('📨 Received WebSocket message:', data.type, data);
           await handleWebSocketMessage(data);
         } catch (e) {
           console.error('Failed to parse WebSocket message:', e, 'Raw data:', event.data);
@@ -235,6 +280,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       };
 
       ws.onclose = (event: CloseEvent) => {
+        clearTimeout(connectionTimeoutId);
         console.log(`❌ WebSocket disconnected. Code: ${event.code}, Reason: ${event.reason}`);
         setSession(prev => ({ 
           ...prev, 
@@ -242,36 +288,63 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
           isRecording: false, 
           isProcessing: false, 
           isSpeaking: false, // AI speaking
-          // sessionEnded: event.code === 1000 ? prev.sessionEnded : true // Keep sessionEnded if closed gracefully by user
+          // Do not set sessionEnded here to allow reconnection
         }));
-        if (event.code !== 1000 && !sessionEndedRef.current) { // Use ref to avoid dependency issues
-          console.warn(`WebSocket closed unexpectedly. Code: ${event.code}. Reason: ${event.reason}`);
-          onError?.(`Connection lost (Code: ${event.code}). Please try again.`);
-        }
+        
         if (keepAliveIntervalRef.current) {
           clearInterval(keepAliveIntervalRef.current);
           keepAliveIntervalRef.current = null;
         }
+
+        // Handle reconnection for unexpected disconnections
+        if (event.code !== 1000 && !sessionEndedRef.current) { // Use ref to avoid dependency issues
+          console.warn(`WebSocket closed unexpectedly. Code: ${event.code}. Reason: ${event.reason}`);
+          
+          // Check if we should attempt reconnection
+          if (reconnectAttemptsRef.current < maxReconnectAttempts) {
+            const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 10000); // Exponential backoff, max 10s
+            reconnectAttemptsRef.current += 1;
+            
+            console.log(`Attempting reconnection ${reconnectAttemptsRef.current}/${maxReconnectAttempts} in ${delay}ms`);
+            setSession(prev => ({ ...prev, isReconnecting: true }));
+
+            reconnectTimeoutRef.current = setTimeout(() => {
+              console.log(`Reconnection attempt ${reconnectAttemptsRef.current}`);
+              connectWebSocket();
+            }, delay);
+          } else {
+            console.error('Max reconnection attempts reached');
+            setSession(prev => ({ ...prev, isReconnecting: false, sessionEnded: true }));
+            onError?.(`Connection lost (Code: ${event.code}). Max retries reached. Please start a new session.`);
+          }
+        } else if (event.code !== 1000) {
+          // If normal closure, don't show error, just end session
+          onError?.(`Connection lost (Code: ${event.code}). Please try again.`);
+        }
       };
 
       ws.onerror = (errorEvent) => {
+        clearTimeout(connectionTimeoutId);
         const error = errorEvent instanceof ErrorEvent ? errorEvent.message : 'Unknown WebSocket error';
         console.error(`❌ WebSocket error connecting to ${wsUrl}:`, error, errorEvent);
         
-        // Delay error reporting to prevent immediate re-renders that might cause unmounting
-        setTimeout(() => {
-          onError?.('WebSocket connection failed. Please check your connection and the server.');
-        }, 100);
-        
-        // Ensure state reflects disconnection
-        setSession(prev => ({ ...prev, isConnected: false, isReconnecting: false }));
+        // Only show error if not in reconnection mode
+        if (!session.isReconnecting) {
+          // Delay error reporting to prevent immediate re-renders that might cause unmounting
+          setTimeout(() => {
+            onError?.('WebSocket connection failed. Please check your connection and the server.');
+          }, 100);
+        }
       };
 
     } catch (error) {
       console.error(`❌ Failed to initiate WebSocket connection to ${wsUrl}:`, error);
-      onError?.('Failed to connect to the voice service.');
+      // Only show error if not in reconnection mode
+      if (!session.isReconnecting) {
+        onError?.('Failed to connect to the voice service.');
+      }
     }
-  }, [wsUrl, onError]); // Removed sessionEndedRef.current since refs don't need to be in dependencies
+  }, [wsUrl, onError, flushAudioQueue, session.isReconnecting]);
 
 async function handleWebSocketMessage(data: any) {
   console.log('📨 Received WebSocket message:', data.type, data);
@@ -458,17 +531,21 @@ async function handleWebSocketMessage(data: any) {
         
         if (audioBlob.size > minSize) {
           audioBlob.arrayBuffer().then(buffer => {
-            if (wsRef.current?.readyState === WebSocket.OPEN && !isCleaningUpRef.current) {
-              const view = new Uint8Array(buffer);
-              const hasValidData = view.some(byte => byte !== 0);
-              if (hasValidData) {
-                wsRef.current.send(buffer);
-                console.log(`Sent audio chunk: ${buffer.byteLength} bytes, MIME: ${preferredMimeType}`);
-              } else {
-                console.warn(`Skipping empty audio data: ${buffer.byteLength} bytes, MIME: ${preferredMimeType}`);
+            console.log(`Sent audio chunk: ${buffer.byteLength} bytes, MIME: ${preferredMimeType}`);
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(buffer);
+            } else {
+              // Queue audio if not connected
+              console.log('WebSocket not open, queuing audio chunk');
+              audioQueueRef.current.push(audioBlob);
+              
+              // Limit queue size to prevent memory issues
+              if (audioQueueRef.current.length > 50) {
+                console.warn('Audio queue size limit reached, dropping oldest chunk');
+                audioQueueRef.current.shift();
               }
             }
-          }).catch(error => console.error('Error converting audio blob to buffer:', error));
+          }).catch(e => console.error('Error sending audio chunk:', e));
         } else {
           console.log(`Skipping small/empty audio chunk: ${audioBlob.size} bytes (min: ${minSize}), MIME: ${preferredMimeType}`);
         }
@@ -688,6 +765,16 @@ async function handleWebSocketMessage(data: any) {
     return () => {
       console.log("VoiceAgent component unmounting. Performing cleanup.");
       clearTimeout(connectionTimer); // Cancel pending connection attempt
+      
+      // Clear reconnection timeout
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+      
+      // Clear audio queue
+      audioQueueRef.current = [];
+      
       handleEndSession(false); // User (component unmount) initiated
       if (keepAliveIntervalRef.current) {
         clearInterval(keepAliveIntervalRef.current);

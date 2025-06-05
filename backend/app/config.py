@@ -35,13 +35,19 @@ class AppSettings(BaseSettings):
     preload_models: bool = Field(default_factory=lambda: os.getenv("PRELOAD_MODELS", "true").lower() == 'true', description="Preload AI models on startup")
     
     # Audio Processing Pipeline Settings
-    max_failed_chunk_retries: int = Field(3, description="Maximum retry attempts for processing failed audio chunks")
-    failed_chunk_buffer_max_size: int = Field(50000, description="Maximum size of failed chunk buffer in bytes")
+    max_failed_chunk_retries: int = Field(5, description="Maximum retry attempts for processing failed audio chunks")
+    failed_chunk_buffer_max_size: int = Field(100000, description="Maximum size of failed chunk buffer in bytes")
     small_chunk_buffer_threshold: int = Field(100, description="Minimum chunk size in bytes to process immediately")
     
     # Watchdog Timer Settings
-    watchdog_inactivity_timeout: int = Field(30, description="Seconds of inactivity before closing WebSocket connection")
-    watchdog_check_interval: int = Field(1, description="Watchdog timer check interval in seconds")
+    watchdog_inactivity_timeout: int = Field(120, description="Seconds of inactivity before closing WebSocket connection")
+    watchdog_check_interval: int = Field(5, description="Watchdog timer check interval in seconds")
+
+    # Timeout Settings
+    audio_conversion_timeout: int = Field(20, description="Timeout in seconds for audio conversion")
+    audio_processing_timeout: int = Field(15, description="Timeout in seconds for audio processing")
+    ai_response_timeout: int = Field(60, description="Timeout in seconds for AI response generation")
+    message_send_timeout: int = Field(10, description="Timeout in seconds for sending WebSocket messages")
 
     class Config:
         env_prefix = 'APP_' # Optional: prefix for environment variables e.g. APP_LOG_LEVEL

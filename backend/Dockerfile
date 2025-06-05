@@ -40,8 +40,8 @@ COPY . .
 # Create app directory structure
 RUN mkdir -p app/models
 
-# Download models during build
-RUN python app/models/download_models.py
+# Download models during build (if download script exists)
+RUN if [ -f "app/models/download_models.py" ]; then python app/models/download_models.py; fi
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app_user && \
@@ -51,12 +51,12 @@ RUN useradd --create-home --shell /bin/bash app_user && \
 # Switch to non-root user
 USER app_user
 
-# Expose port
-EXPOSE 8000
+# Expose port 8003 to match our current setup
+EXPOSE 8003
 
-# Health check
+# Health check - check if server is responding
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-  CMD curl -f http://localhost:8000/health || exit 1
+  CMD curl -s http://localhost:8003/health | grep -q '"status"' || exit 1
 
-# Start the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"] 
+# Start the application with the correct module path
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8003", "--workers", "1"] 

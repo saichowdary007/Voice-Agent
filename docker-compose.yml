@@ -4,21 +4,18 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     ports:
-      - "8001:8000"
+      - "8003:8003"
     environment:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - MODEL_PATH=/app/models
       - HOST=0.0.0.0
-      - PORT=8000
+      - PORT=8003
     env_file:
       - ./backend/.env
     volumes:
       - ./backend:/app
+      - models:/app/models
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
     networks:
       - voice-agent-network
 
@@ -26,21 +23,19 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_WS_URL=ws://localhost:8003/ws
+        - NEXT_PUBLIC_API_URL=http://localhost:8003
     ports:
-      - "3001:3000"
+      - "3000:3000"
     environment:
-      - NEXT_PUBLIC_API_KEY=${GOOGLE_API_KEY:-}
-      - NEXT_PUBLIC_WS_URL=ws://localhost:8001/ws
-      - NEXT_PUBLIC_API_URL=http://localhost:8001
-      - NODE_ENV=production
-    env_file:
-      - ./frontend/.env.local
-    depends_on:
-      backend:
-        condition: service_healthy
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8003/ws
+      - NEXT_PUBLIC_API_URL=http://localhost:8003
     restart: unless-stopped
     networks:
       - voice-agent-network
+    depends_on:
+      - backend
 
 volumes:
   models:

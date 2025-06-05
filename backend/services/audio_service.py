@@ -8,8 +8,8 @@ import soundfile as sf # Ensure this is installed: pip install soundfile
 import subprocess
 import shutil # For shutil.which
 
-# Relative import for app config, assuming services is a package sibling to app
-from ..app.config import settings, get_sample_rate, get_channels 
+# Import for app config, using absolute path for Docker compatibility
+from app.config import settings, get_sample_rate, get_channels
 
 # Use standard Python logging for services, or pass structlog logger if standardized
 logger = logging.getLogger(__name__)

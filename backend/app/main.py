@@ -12,12 +12,12 @@ from fastapi.responses import JSONResponse
 from fastapi.websockets import WebSocketState
 import structlog
 
-# Assuming services are in backend.services package relative to the project root
-from backend.services.vad_service import VADService
-from backend.services.stt_service import STTService
-from backend.services.tts_service import TTSService
-from backend.services.llm_service import LLMService
-from backend.services.audio_service import AudioService
+# Assuming services are in services package relative to the project root
+from services.vad_service import VADService
+from services.stt_service import STTService
+from services.tts_service import TTSService
+from services.llm_service import LLMService
+from services.audio_service import AudioService
 
 from .websocket_handler import WebSocketHandler
 from .utils.logging import setup_logging # Assuming this setup structlog
