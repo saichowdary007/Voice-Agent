@@ -9,6 +9,7 @@ from fastapi.websockets import WebSocketState
 
 from .ai.context_manager import ContextManager
 from .config import settings
+from services.vad_service import VADResult  # Import VADResult class
 
 
 class WebSocketHandler:
@@ -188,8 +189,14 @@ class WebSocketHandler:
                 self.pipeline_running = False
                 return
 
-            vad_result = await vad_service.process_frame(frame)
-            self.session_logger.debug(f"VAD: speech={vad_result.is_speech}, end={vad_result.is_end_of_speech}, conf={vad_result.confidence:.2f}")
+            # Wrap VAD processing in try/except to prevent server crashes
+            try:
+                vad_result = await vad_service.process_frame(frame)
+                self.session_logger.debug(f"VAD: speech={vad_result.is_speech}, end={vad_result.is_end_of_speech}, conf={vad_result.confidence:.2f}")
+            except Exception as vad_e:
+                self.session_logger.error(f"VAD processing error: {vad_e}", exc_info=True)
+                # Create a default negative result if VAD fails
+                vad_result = VADResult(is_speech=False, is_end_of_speech=False, confidence=0.0, timestamp=0.0)
             
             if vad_result.is_speech:
                 if not self.is_speaking: # Start of user's speech segment
@@ -199,20 +206,28 @@ class WebSocketHandler:
                     if self.tts_active: # AI is currently speaking
                         self.session_logger.info("Barge-in: User started speaking during TTS.")
                         await self._handle_barge_in()
-                        
-                stt_result = await stt_service.process_frame(frame)
-                if stt_result.partial_text:
-                    await self._send_message({"type": "transcript", "partial": stt_result.partial_text})
+                
+                # Wrap STT processing in try/except to prevent server crashes
+                try:        
+                    stt_result = await stt_service.process_frame(frame)
+                    if stt_result.partial_text:
+                        await self._send_message({"type": "transcript", "partial": stt_result.partial_text})
+                except Exception as stt_e:
+                    self.session_logger.error(f"STT processing error: {stt_e}", exc_info=True)
+                    # Continue without speech-to-text if it fails
             
             elif vad_result.is_end_of_speech and self.is_speaking: # End of user's speech segment
                 self.session_logger.info("User speech segment ended (VAD). Finalizing STT.")
                 self.is_speaking = False # Reset user speaking state
                 
                 final_stt_text = None
-                if hasattr(stt_service, 'finalize') and callable(stt_service.finalize):
-                    final_result_obj = await stt_service.finalize()
-                    if final_result_obj and final_result_obj.final_text:
-                        final_stt_text = final_result_obj.final_text.strip()
+                try:
+                    if hasattr(stt_service, 'finalize') and callable(stt_service.finalize):
+                        final_result_obj = await stt_service.finalize()
+                        if final_result_obj and final_result_obj.final_text:
+                            final_stt_text = final_result_obj.final_text.strip()
+                except Exception as finalize_e:
+                    self.session_logger.error(f"STT finalization error: {finalize_e}", exc_info=True)
                 
                 if final_stt_text:
                     self.session_logger.info(f"STT Final: '{final_stt_text}'")

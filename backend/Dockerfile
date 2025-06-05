@@ -58,5 +58,8 @@ EXPOSE 8003
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
   CMD curl -s http://localhost:8003/health | grep -q '"status"' || exit 1
 
-# Start the application with the correct module path
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8003", "--workers", "1"] 
+# Install gunicorn for more stable process management
+RUN pip install --no-cache-dir gunicorn uvicorn
+
+# Start the application with uvicorn with better error handling options
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8003", "--lifespan", "on", "--log-level", "info", "--timeout-keep-alive", "120", "--timeout-graceful-shutdown", "30"] 

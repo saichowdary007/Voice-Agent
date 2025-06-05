@@ -266,64 +266,95 @@ async def websocket_endpoint(websocket: WebSocket):
     # Fallback for safety, though this indicates a deeper startup issue if logger is None.
     app_logger = logger if logger else structlog.get_logger("app.websocket_fallback")
 
-    await websocket.accept() # Accept connection first
-    
-    if not await session_manager.create_session(websocket):
-        app_logger.warning("Session creation failed (e.g., max sessions). Closing WebSocket.")
-        await websocket.close(code=1013, reason="Server overloaded or unable to create session.")
+    try:
+        await websocket.accept() # Accept connection first
+    except Exception as e:
+        app_logger.error(f"Failed to accept WebSocket connection: {e}", exc_info=True)
         return
-    
-    session_id = session_manager.get_session_id(websocket)
-    if not session_id: # Should not happen if create_session succeeded
-        app_logger.error("Critical: Session ID not found after successful session creation. Closing WebSocket.")
-        await websocket.close(code=1011, reason="Internal server error: Session ID missing.")
-        return
-        
-    # Create a logger instance bound with session-specific context
-    session_logger = app_logger.bind(session_id=session_id, client_host=websocket.client.host)
-    session_logger.info(f"WebSocket connection accepted.")
-
-    handler = WebSocketHandler(
-        websocket=websocket,
-        services=services,
-        metrics=metrics, 
-        logger=session_logger # Pass the new session-bound logger
-    )
     
     try:
-        # Send initial status/config to client only if WebSocket is still connected
-        if websocket.client_state == WebSocketState.CONNECTED:
-            await handler._send_message({
-                "type": "status",
-                "session_id": session_id, # Send the generated session_id to client
-                "ready": True,
-                "config": { # Send relevant backend config to client
-                    "sample_rate": settings.sample_rate,
-                    "frame_duration_ms": settings.audio_frame_ms,
-                    "channels": settings.channels
-                }
-            })
-        else: # Should not happen immediately after accept, but good check
-            session_logger.warning("WebSocket disconnected before initial status message could be sent.")
-            # Cleanup will be handled in finally block
+        if not await session_manager.create_session(websocket):
+            app_logger.warning("Session creation failed (e.g., max sessions). Closing WebSocket.")
+            await websocket.close(code=1013, reason="Server overloaded or unable to create session.")
             return
-
-        await handler.handle_connection() # Main message handling loop
         
-    except WebSocketDisconnect:
-        session_logger.info(f"Client disconnected WebSocket gracefully.")
-    except ConnectionResetError:
-        session_logger.warning(f"Client connection reset abruptly.")
-    except Exception as e: # Catch any other unhandled exceptions from handle_connection
-        session_logger.error(f"Unhandled error during WebSocket communication: {str(e)}", exc_info=True)
-        if websocket.client_state == WebSocketState.CONNECTED:
+        session_id = session_manager.get_session_id(websocket)
+        if not session_id: # Should not happen if create_session succeeded
+            app_logger.error("Critical: Session ID not found after successful session creation. Closing WebSocket.")
+            await websocket.close(code=1011, reason="Internal server error: Session ID missing.")
+            return
+            
+        # Create a logger instance bound with session-specific context
+        session_logger = app_logger.bind(session_id=session_id, client_host=websocket.client.host)
+        session_logger.info(f"WebSocket connection accepted.")
+
+        handler = WebSocketHandler(
+            websocket=websocket,
+            services=services,
+            metrics=metrics, 
+            logger=session_logger # Pass the new session-bound logger
+        )
+        
+        # Send initial status/config to client in a try-except block
+        try:
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await handler._send_message({
+                    "type": "status",
+                    "session_id": session_id, # Send the generated session_id to client
+                    "ready": True,
+                    "config": { # Send relevant backend config to client
+                        "sample_rate": settings.sample_rate,
+                        "frame_duration_ms": settings.audio_frame_ms,
+                        "channels": settings.channels
+                    }
+                })
+            else: # Should not happen immediately after accept, but good check
+                session_logger.warning("WebSocket disconnected before initial status message could be sent.")
+                # Cleanup will be handled in finally block
+                return
+        except Exception as msg_e:
+            session_logger.error(f"Failed to send initial status message: {msg_e}", exc_info=True)
+            # Continue anyway, since this is not critical
+
+        # Main connection handler - wrapped in a try-except with reconnection logic
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries and websocket.client_state == WebSocketState.CONNECTED:
             try:
-                await handler._send_error(f"A critical server error occurred. Please try reconnecting.")
-            except Exception as send_err:
-                session_logger.error(f"Failed to send final error message to client: {send_err}", exc_info=True)
+                await handler.handle_connection() # Main message handling loop
+                break  # If handle_connection returns normally, exit loop
+            except WebSocketDisconnect:
+                session_logger.info(f"Client disconnected WebSocket gracefully.")
+                break
+            except ConnectionResetError:
+                session_logger.warning(f"Client connection reset abruptly.")
+                break
+            except Exception as e: # Catch any other unhandled exceptions from handle_connection
+                session_logger.error(f"Unhandled error during WebSocket communication: {str(e)}", exc_info=True)
+                retry_count += 1
+                
+                if retry_count < max_retries and websocket.client_state == WebSocketState.CONNECTED:
+                    session_logger.warning(f"Attempting to recover WebSocket handler (retry {retry_count}/{max_retries})...")
+                    await asyncio.sleep(0.5)  # Brief pause before retry
+                    try:
+                        await handler._send_error("A temporary server error occurred. Reconnecting...")
+                    except:
+                        pass  # Ignore if we can't send the error
+                else:
+                    if websocket.client_state == WebSocketState.CONNECTED:
+                        try:
+                            await handler._send_error(f"A critical server error occurred. Please try reconnecting.")
+                        except Exception as send_err:
+                            session_logger.error(f"Failed to send final error message to client: {send_err}", exc_info=True)
+                    break
     finally:
         session_logger.info(f"Performing final cleanup for WebSocket session...")
-        await handler.cleanup() # Ensure handler's internal cleanup is called
+        try:
+            await handler.cleanup() # Ensure handler's internal cleanup is called
+        except Exception as cleanup_e:
+            session_logger.error(f"Error during handler cleanup: {cleanup_e}", exc_info=True)
+            
         session_manager.remove_session(websocket) # Remove from global session manager
         
         # Final log to confirm closure and state, checking client_state one last time
