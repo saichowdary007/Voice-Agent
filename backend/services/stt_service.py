@@ -296,6 +296,7 @@ class STTService:
                 self.recognizer.reset()
                 self.audio_buffer = []
                 self.total_audio_duration = 0.0
+                logger.debug("STT stream reset successfully")
         except Exception as e:
             logger.warning(f"Failed to reset stream: {e}")
     
@@ -327,12 +328,35 @@ class STTService:
     async def cleanup(self):
         """Clean up STT resources"""
         try:
-            if self.recognizer:
-                del self.recognizer
-                self.recognizer = None
-                
+            logger.info("Cleaning up STT service...")
+            
+            # Mark service as unavailable first to prevent new operations
             self.is_available = False
+            
+            # Clear audio buffer first
+            self.audio_buffer = []
+            
+            # Clean up recognizer with proper error handling
+            if self.recognizer:
+                try:
+                    # Try to reset before deletion to ensure clean state
+                    self.recognizer.reset()
+                except Exception as reset_error:
+                    logger.warning(f"Error resetting recognizer during cleanup: {reset_error}")
+                
+                try:
+                    # Don't explicitly delete - let Python's GC handle it
+                    # This prevents double free errors
+                    pass
+                except Exception as del_error:
+                    logger.warning(f"Error during recognizer cleanup: {del_error}")
+                finally:
+                    # Always set to None to prevent double cleanup
+                    self.recognizer = None
+                    
             logger.info("STT service cleaned up")
             
         except Exception as e:
-            logger.error(f"STT cleanup error: {e}") 
+            logger.error(f"STT cleanup error: {e}")
+            # Ensure recognizer is None even if cleanup fails
+            self.recognizer = None 

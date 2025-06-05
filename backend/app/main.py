@@ -355,7 +355,6 @@ async def root_endpoint(): # Renamed to avoid conflict
 
 if __name__ == "__main__":
     # This block is for running the app directly with `python -m backend.app.main`
-    # Uvicorn's `reload=True` might interfere with `lifespan` context on reloads.
     # For development, `uvicorn backend.app.main:app --reload` is often preferred.
     
     # Ensure logging is set up if this script is run directly and not via uvicorn CLI that might handle it.
@@ -366,11 +365,33 @@ if __name__ == "__main__":
         logger = structlog.get_logger("app.main_direct_run_fallback") 
         logger.info("Running Uvicorn server directly from __main__...")
 
+    # Configure reload settings to avoid hot-reload storms from generated files
+    reload_config = os.getenv("UVICORN_RELOAD", "true").lower() == 'true'
+    reload_dirs = None
+    reload_excludes = None
+    
+    if reload_config:
+        # Only watch specific directories and exclude problematic patterns
+        reload_dirs = ["backend/app", "backend/services"]
+        reload_excludes = [
+            "__pycache__",
+            "*.pyc", 
+            "*.pyo",
+            "*__pydantic_*",  # Exclude pydantic generated files
+            "*.onnx",         # Exclude model files
+            "*.log",          # Exclude log files
+            "temp_*",         # Exclude temporary files
+            ".DS_Store"       # Exclude macOS files
+        ]
+        logger.info(f"Reload enabled with dirs: {reload_dirs}, excludes: {reload_excludes}")
+
     uvicorn.run(
         "backend.app.main:app", # Path to the FastAPI app instance
         host=settings.ws_server_host,
         port=settings.ws_server_port,
-        reload=os.getenv("UVICORN_RELOAD", "true").lower() == 'true',
+        reload=reload_config,
+        reload_dirs=reload_dirs,
+        reload_excludes=reload_excludes,
         log_level=settings.log_level.lower(), # Uvicorn's native log level
         # Use default uvicorn logger or configure uvicorn logging separately if needed
         # It's generally better to let structlog handle app logs and uvicorn handle access logs.

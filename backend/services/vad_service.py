@@ -251,16 +251,37 @@ class VADService:
     async def cleanup(self):
         """Clean up VAD resources"""
         try:
-            if self.model is not None:
-                del self.model
-                self.model = None
-                
-            # Clear CUDA cache if available
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
+            logger.info("Cleaning up VAD service...")
+            
+            # Mark service as unavailable first to prevent new operations
             self.is_available = False
+            
+            # Reset state first
+            self.reset_state()
+            
+            # Clean up model with proper error handling
+            if self.model is not None:
+                try:
+                    # Clear CUDA cache before deleting model
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception as cuda_error:
+                    logger.warning(f"Error clearing CUDA cache: {cuda_error}")
+                
+                try:
+                    # Don't explicitly delete - let Python's GC handle it
+                    # This prevents double free errors
+                    pass
+                except Exception as del_error:
+                    logger.warning(f"Error during VAD model cleanup: {del_error}")
+                finally:
+                    # Always set to None to prevent double cleanup
+                    self.model = None
+                    
             logger.info("VAD service cleaned up")
             
         except Exception as e:
-            logger.error(f"VAD cleanup error: {e}") 
+            logger.error(f"VAD cleanup error: {e}")
+            # Ensure model is None even if cleanup fails
+            self.model = None
+            self.is_available = False 

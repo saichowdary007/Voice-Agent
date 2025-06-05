@@ -97,16 +97,7 @@ class WebSocketHandler:
                 self.session_logger.debug(f"Rejecting small/empty audio chunk: {len(audio_data) if audio_data else 0} bytes")
                 return
                 
-            if len(audio_data) < settings.small_chunk_buffer_threshold:
-                self.small_chunk_buffer.extend(audio_data)
-                self.session_logger.debug(f"Audio chunk too small ({len(audio_data)}B), buffered. Total buffer: {len(self.small_chunk_buffer)}B")
-                return
-            
-            if self.small_chunk_buffer:
-                audio_data = bytes(self.small_chunk_buffer) + audio_data
-                self.small_chunk_buffer.clear()
-                self.session_logger.debug(f"Combined with buffered data, new audio data size: {len(audio_data)} bytes")
-            
+            # Skip small chunk buffering - let AudioService handle it with its chunk buffering
             self.last_audio_time = time.time() # Update activity time
 
             pcm_data = await self._convert_audio_via_service(audio_data)
@@ -115,8 +106,7 @@ class WebSocketHandler:
                 # Error already logged by _convert_audio_via_service if it fails consistently
                 # Send error to client only if it's a persistent issue (handled by retry logic in _convert)
                 # If _convert_audio_via_service returns None after retries, it means it's unrecoverable for this stream of chunks
-                self.session_logger.error(f"Audio conversion by AudioService failed definitively for chunk of {len(audio_data)} bytes.")
-                await self._send_error("Audio processing failed: Unrecoverable format error.")
+                self.session_logger.debug(f"Audio conversion by AudioService returned None for chunk of {len(audio_data)} bytes (may be buffering).")
                 return
 
             if len(pcm_data) < (settings.sample_rate * settings.audio_frame_ms // 1000 * 2 * settings.channels / 2) : # Min e.g. 10ms
@@ -147,6 +137,12 @@ class WebSocketHandler:
         self.pipeline_running = True # Indicate that some processing is happening
         try:
             self.session_logger.debug(f"Processing frame: {len(frame)} bytes. Current user speaking state: {self.is_speaking}")
+            
+            # Skip processing if muted
+            if self.is_muted:
+                self.session_logger.debug("Frame processing skipped - session is muted")
+                self.pipeline_running = False
+                return
             
             vad_service = self.services.get('vad')
             stt_service = self.services.get('stt')
@@ -198,7 +194,6 @@ class WebSocketHandler:
             elif not vad_result.is_speech and not self.is_speaking and not self.tts_active:
                  self.pipeline_running = False
 
-
         except Exception as e:
             self.session_logger.error(f"Error in _process_audio_frame: {e}", exc_info=True)
             await self._send_error("Error during voice processing.")
@@ -206,132 +201,126 @@ class WebSocketHandler:
         # Note: pipeline_running is primarily set to False by AI/TTS completion or specific idle conditions.
 
     async def _handle_barge_in(self):
-        """Handle barge-in: user speaks while TTS is active."""
-        self.session_logger.info("Barge-in detected. Attempting to stop TTS.")
-        self.should_interrupt_tts = True # Signal to stop ongoing/pending TTS tasks
-        
-        tts_service = self.services.get('tts')
-        if self.tts_active and tts_service and hasattr(tts_service, 'stop'):
-            await tts_service.stop() # Tell TTS service to halt generation
-        self.tts_active = False # Mark TTS as no longer active
-            
-        await self._send_message({"type": "control", "action": "stop_audio"}) # Tell client to stop playing audio
-            
-        if self.metrics and hasattr(self.metrics, 'increment_counter'):
-            self.metrics.increment_counter('barge_ins_total')
-        
-    async def _process_with_ai(self, text: str):
-        """Process user text with LLM and stream TTS response."""
-        if not text or not text.strip():
-            self.session_logger.info("Empty text received for AI processing, skipping.")
-            self.pipeline_running = False # Nothing to process
-            return
-
-        self.pipeline_running = True # AI processing is part of the pipeline
-        self.processing_start_time = time.time()
-        self.session_logger.info(f"AI processing started for text: '{text[:70]}...'")
-
-        llm_service = self.services.get('llm')
-        if not llm_service:
-            self.session_logger.error("LLM service not available for AI processing.")
-            await self._send_error("AI service is currently unavailable.")
-            self.pipeline_running = False
-            return
-
-        self.context_manager.add_user_message(text)
-        self.should_interrupt_tts = False # Reset for new AI response
-
-        full_ai_response_text = ""
+        """Handle user interrupting AI speech (barge-in)"""
         try:
-            async for token in llm_service.generate_streaming(text): # Assuming generate_streaming takes plain text
-                if self.should_interrupt_tts: # Check if barge-in occurred during LLM streaming
-                    self.session_logger.info("LLM streaming interrupted by barge-in.")
-                    break
-                full_ai_response_text += token
-                await self._send_message({"type": "ai_response", "token": token})
+            self.should_interrupt_tts = True
             
-            if not self.should_interrupt_tts and full_ai_response_text.strip():
-                await self._send_message({"type": "ai_response", "complete": True})
-                self.context_manager.add_ai_message(full_ai_response_text)
+            # Stop TTS service if it has a stop method
+            tts_service = self.services.get('tts')
+            if tts_service and hasattr(tts_service, 'stop'):
+                await tts_service.stop()
                 
-                # Start TTS for the complete response
-                # _start_tts_streaming will handle the tts_active and pipeline_running flags internally
-                tts_task = asyncio.create_task(self._start_tts_streaming(full_ai_response_text))
-                self.processing_tasks.add(tts_task)
-                tts_task.add_done_callback(self.processing_tasks.discard)
-            elif full_ai_response_text.strip() and self.should_interrupt_tts:
-                 # If interrupted, we still add the partial AI response to context for consistency.
-                 self.context_manager.add_ai_message(full_ai_response_text)
-                 self.pipeline_running = False # Interrupted, so main pipeline flow stops here.
-            else: # No text from LLM or interrupted before any text
-                self.session_logger.info("No significant AI response generated or stream was empty/interrupted early.")
-                self.pipeline_running = False # No TTS to play, pipeline idle.
-
-            if self.speech_start_time and self.metrics and hasattr(self.metrics, 'record_latency'):
-                latency = time.time() - self.speech_start_time
-                self.metrics.record_latency('end_to_end_latency_ms', latency * 1000)
-                self.session_logger.info(f"End-to-end latency: {latency*1000:.0f} ms")
-
+            # Notify client to stop audio playback
+            await self._send_message({"type": "stop_audio"})
+            
+            self.tts_active = False
+            self.session_logger.info("Barge-in handling completed")
+            
         except Exception as e:
-            self.session_logger.error(f"AI processing or TTS initiation error: {e}", exc_info=True)
-            await self._send_error(f"AI conversation failed: {str(e)}")
-            self.pipeline_running = False # Error, so pipeline stops
-        # finally:
-            # pipeline_running is set to False within _start_tts_streaming or if no TTS happens
-            # self.session_logger.debug(f"AI processing block finished. Pipeline: {self.pipeline_running}, TTS Active: {self.tts_active}")
+            self.session_logger.error(f"Error in barge-in handling: {e}")
 
+    async def _process_with_ai(self, text: str):
+        """Process user input with AI and initiate TTS response"""
+        self.pipeline_running = True # Mark pipeline as active
+        try:
+            self.processing_start_time = time.time()
+            
+            # Add to context
+            self.context_manager.add_user_message(text)
+            
+            # Get conversation context
+            messages = self.context_manager.get_conversation_context()
+            
+            # Get AI service
+            llm_service = self.services.get('llm')
+            if not llm_service:
+                await self._send_error("AI service is currently unavailable")
+                self.pipeline_running = False
+                return
+                
+            # Generate AI response
+            await self._send_message({"type": "ai_response", "token": "", "complete": False})
+            
+            full_response = ""
+            async for chunk in llm_service.generate_response_stream(messages):
+                if chunk.choices and chunk.choices[0].delta.content:
+                    token = chunk.choices[0].delta.content
+                    full_response += token
+                    await self._send_message({
+                        "type": "ai_response", 
+                        "token": token, 
+                        "complete": False
+                    })
+                    
+                # Check for interruption
+                if self.should_interrupt_tts:
+                    self.session_logger.info("AI response generation interrupted")
+                    self.pipeline_running = False
+                    return
+                    
+            # Response complete
+            await self._send_message({"type": "ai_response", "token": "", "complete": True})
+            
+            if full_response.strip():
+                # Add AI response to context
+                self.context_manager.add_ai_message(full_response.strip())
+                
+                # Start TTS
+                await self._start_tts_streaming(full_response.strip())
+            else:
+                self.session_logger.warning("AI generated empty response")
+                self.pipeline_running = False
+                
+        except Exception as e:
+            self.session_logger.error(f"Error in AI processing: {e}", exc_info=True)
+            await self._send_error("Error generating AI response")
+            self.pipeline_running = False
 
     async def _start_tts_streaming(self, text: str):
-        """Stream TTS audio for the given text. Manages tts_active and pipeline_running flags."""
-        if not text or not text.strip():
-            self.session_logger.info("Empty text for TTS, skipping TTS generation.")
-            # If AI produced no text, the overall pipeline for this interaction might be considered done.
-            self.pipeline_running = False 
-            return
-
-        tts_service = self.services.get('tts')
-        if not tts_service or not tts_service.is_available:
-            self.session_logger.error("TTS service not available, cannot play AI response.")
-            await self._send_error("Text-to-speech service is unavailable.")
-            self.pipeline_running = False
-            return
-
-        if self.should_interrupt_tts:
-            self.session_logger.info("TTS streaming initiation skipped due to prior interruption signal.")
-            self.pipeline_running = False # No TTS will run
-            return
-            
-        self.tts_active = True
-        # self.pipeline_running should already be true from _process_with_ai
-        self.session_logger.info(f"TTS streaming started for: '{text[:70]}...'")
-        await self._send_message({"type": "tts_start"})
-
+        """Start text-to-speech generation and streaming"""
         try:
-            # generate_speech_stream from TTSService now yields a single, complete audio buffer
-            async for complete_audio_chunk in tts_service.generate_speech_stream(text):
-                if self.should_interrupt_tts: # Check if barge-in occurred during synthesis
-                    self.session_logger.info("TTS synthesis interrupted by barge-in signal.")
-                    # TTSService.stop() should have been called by _handle_barge_in
-                    break 
+            self.tts_active = True
+            await self._send_message({"type": "tts_start"})
+            
+            tts_service = self.services.get('tts')
+            if not tts_service:
+                await self._send_error("TTS service is currently unavailable")
+                self.tts_active = False
+                self.pipeline_running = False
+                return
                 
-                if complete_audio_chunk:
-                    self.session_logger.debug(f"Sending complete TTS audio buffer of {len(complete_audio_chunk)} bytes.")
-                    await self.websocket.send_bytes(complete_audio_chunk)
-                else:
-                    self.session_logger.warning("TTS service yielded no audio data for a non-empty text.")
-
-            # Signal TTS completion only if not interrupted
-            if not self.should_interrupt_tts:
-                 await self._send_message({"type": "tts_complete"})
+            # Generate and stream TTS audio
+            async for audio_chunk in tts_service.generate_speech_stream(text):
+                if self.should_interrupt_tts:
+                    self.session_logger.info("TTS streaming interrupted")
+                    break
+                    
+                # Send audio chunk to client
+                await self._send_message({
+                    "type": "audio_chunk",
+                    "audio_data": audio_chunk
+                })
+                
+            # TTS complete
+            await self._send_message({"type": "tts_complete"})
+            self.tts_active = False
+            
+            # Reset interruption flag
+            self.should_interrupt_tts = False
+            
+            # Record metrics if available
+            if self.metrics and self.processing_start_time:
+                total_time = time.time() - self.processing_start_time
+                self.metrics.record_latency('total_processing', total_time)
+                
+            self.pipeline_running = False # Pipeline complete
             
         except Exception as e:
-            self.session_logger.error(f"Error during TTS streaming: {e}", exc_info=True)
-            await self._send_error(f"Text-to-speech playback failed: {str(e)}")
-        finally:
+            self.session_logger.error(f"Error in TTS streaming: {e}", exc_info=True)
+            await self._send_error("Error generating speech response")
             self.tts_active = False
-            self.pipeline_running = False # TTS part of pipeline (and thus the whole user turn) is now complete or errored
-            self.session_logger.info(f"TTS streaming finished or errored. Pipeline reset. TTS Active: {self.tts_active}")
-            
+            self.pipeline_running = False
+
     async def handle_control_message(self, data: Dict[str, Any]):
         """Handle control messages from frontend (mute, unmute, end_session, ping, eos)."""
         message_type = data.get("type")
@@ -352,6 +341,17 @@ class WebSocketHandler:
                     if self.websocket.client_state == WebSocketState.CONNECTED:
                          await self.websocket.close(code=1000, reason="Session ended by user")
                     # The handle_connection loop will break upon WebSocketDisconnect
+
+            elif message_type == "mute":
+                # Direct mute message format
+                muted = data.get("muted", True)
+                self.is_muted = muted
+                self.session_logger.info(f"Received direct mute message: muted={muted}")
+                await self._send_message({"type": "mute_status", "muted": muted})
+                
+                # If muting, pause watchdog timer by updating last activity
+                if muted:
+                    self.last_audio_time = time.time()
 
             elif message_type == "ping":
                 self.last_audio_time = time.time() # Treat ping as activity
@@ -448,6 +448,15 @@ class WebSocketHandler:
             try: vad_service.reset_state()
             except Exception as e: self.session_logger.error(f"Error resetting VAD state: {e}", exc_info=True)
 
+        # Reset audio service session state
+        audio_service = self.services.get('audio')
+        if audio_service and hasattr(audio_service, 'reset_session'):
+            try: 
+                audio_service.reset_session()
+                self.session_logger.info("Audio service session state reset")
+            except Exception as e: 
+                self.session_logger.error(f"Error resetting audio service session: {e}", exc_info=True)
+
         self.pipeline_running = False
         self.is_speaking = False
         self.audio_buffer.clear()
@@ -458,69 +467,26 @@ class WebSocketHandler:
         self.session_logger.info(f"WebSocketHandler session cleanup completed.")
 
     async def _convert_audio_via_service(self, audio_data: bytes) -> Optional[bytes]:
-        """Centralized audio conversion using AudioService with retry logic for failed chunks."""
+        """Centralized audio conversion using AudioService with async processing."""
         try:
             audio_service = self.services.get('audio')
-            if not audio_service or not hasattr(audio_service, 'extract_pcm_smart'):
+            if not audio_service or not hasattr(audio_service, 'extract_pcm_smart_async'):
                 self.session_logger.error("AudioService is not available or misconfigured.")
                 return None
 
-            pcm_array = audio_service.extract_pcm_smart(audio_data)
+            # Use the async version with chunk buffering
+            pcm_array = await audio_service.extract_pcm_smart_async(audio_data)
             
             if pcm_array is not None:
-                if self.failed_chunk_buffer: # If there was a previously failed buffer, it's now cleared by this success
-                    self.session_logger.info(f"Successfully processed audio after prior failures, clearing {len(self.failed_chunk_buffer)}B failed buffer.")
-                    self.failed_chunk_buffer.clear()
-                self.failed_chunk_retry_count = 0
+                # Convert to 16-bit PCM bytes
                 pcm_int16 = (pcm_array * 32768.0).astype(np.int16)
                 return pcm_int16.tobytes()
-
-            # If initial conversion failed, accumulate and retry
-            self.session_logger.warning(f"AudioService initial conversion failed for {len(audio_data)}B chunk. Buffering.")
-            
-            max_buffer_size = settings.failed_chunk_buffer_max_size
-            if len(self.failed_chunk_buffer) + len(audio_data) > max_buffer_size:
-                # Trim buffer from the beginning to make space
-                amount_to_trim = (len(self.failed_chunk_buffer) + len(audio_data)) - max_buffer_size
-                self.failed_chunk_buffer = self.failed_chunk_buffer[amount_to_trim:]
-                self.session_logger.warning(f"Failed chunk buffer trimmed by {amount_to_trim}B to prevent overflow. New size: {len(self.failed_chunk_buffer)}B.")
-            
-            self.failed_chunk_buffer.extend(audio_data)
-            
-            if self.failed_chunk_retry_count >= self.max_failed_chunk_retries:
-                self.session_logger.error(f"Max retry attempts ({self.max_failed_chunk_retries}) for accumulated audio ({len(self.failed_chunk_buffer)}B) reached. Clearing buffer.")
-                self.failed_chunk_buffer.clear()
-                self.failed_chunk_retry_count = 0
-                return None 
-
-            # Attempt to process accumulated buffer if it's large enough
-            # A larger buffer might provide more context for FFmpeg.
-            # Use a multiple of expected small chunk sizes, e.g., 5KB
-            retry_buffer_threshold = max(settings.small_chunk_buffer_threshold * 10, 5000) 
-            if len(self.failed_chunk_buffer) >= retry_buffer_threshold:
-                self.session_logger.info(f"Attempting to process accumulated failed buffer: {len(self.failed_chunk_buffer)}B (Retry {self.failed_chunk_retry_count + 1}/{self.max_failed_chunk_retries})")
-                self.failed_chunk_retry_count += 1
-                
-                accumulated_pcm_array = audio_service.extract_pcm_smart(bytes(self.failed_chunk_buffer))
-                
-                if accumulated_pcm_array is not None:
-                    self.session_logger.info(f"Successfully processed accumulated failed buffer. Cleared {len(self.failed_chunk_buffer)}B.")
-                    self.failed_chunk_buffer.clear()
-                    self.failed_chunk_retry_count = 0 # Reset on success
-                    pcm_int16 = (accumulated_pcm_array * 32768.0).astype(np.int16)
-                    return pcm_int16.tobytes()
-                else:
-                    self.session_logger.warning(f"Processing accumulated buffer also failed (Retry {self.failed_chunk_retry_count}). Buffer size: {len(self.failed_chunk_buffer)}B.")
             else:
-                self.session_logger.debug(f"Accumulated failed buffer ({len(self.failed_chunk_buffer)}B) not yet large enough for retry ({retry_buffer_threshold}B).")
-
-            return None # No PCM data successfully converted in this attempt
+                # None return is normal for buffering - don't log as error
+                return None
             
         except Exception as e:
             self.session_logger.error(f"Critical error in _convert_audio_via_service: {e}", exc_info=True)
-            # Reset buffer and count on unexpected errors to prevent bad state
-            self.failed_chunk_buffer.clear()
-            self.failed_chunk_retry_count = 0
             return None
 
     async def _watchdog_timer(self):
@@ -540,12 +506,13 @@ class WebSocketHandler:
                 # 2. Backend pipeline is NOT running (i.e., not in STT, AI, or TTS processing).
                 # 3. User is NOT currently speaking (client-side VAD is not active).
                 # 4. TTS is NOT currently active from backend.
+                # 5. Session is NOT muted (muted sessions should not timeout due to inactivity)
                 is_inactive = (current_time - self.last_audio_time > settings.watchdog_inactivity_timeout)
                 
-                if is_inactive and not self.pipeline_running and not self.is_speaking and not self.tts_active:
+                if is_inactive and not self.pipeline_running and not self.is_speaking and not self.tts_active and not self.is_muted:
                     self.session_logger.warning(
                         f"Watchdog: Inactivity timeout. Last audio: {self.last_audio_time:.2f} ({(current_time - self.last_audio_time):.2f}s ago). "
-                        f"Pipeline: {self.pipeline_running}, UserSpeaking(VAD): {self.is_speaking}, TTSActive: {self.tts_active}. Closing WebSocket."
+                        f"Pipeline: {self.pipeline_running}, UserSpeaking(VAD): {self.is_speaking}, TTSActive: {self.tts_active}, Muted: {self.is_muted}. Closing WebSocket."
                     )
                     if self.websocket.client_state == WebSocketState.CONNECTED:
                         # Close with a specific code if desired, e.g., 4008 for Policy Violation if inactivity is against policy
@@ -556,8 +523,8 @@ class WebSocketHandler:
                     break # Exit watchdog loop
                 elif is_inactive:
                     self.session_logger.debug(
-                        f"Watchdog: Inactivity detected ({ (current_time - self.last_audio_time):.1f}s), but pipeline/speech active. "
-                        f"Pipeline: {self.pipeline_running}, UserSpeaking(VAD): {self.is_speaking}, TTSActive: {self.tts_active}."
+                        f"Watchdog: Inactivity detected ({ (current_time - self.last_audio_time):.1f}s), but activity/mute active. "
+                        f"Pipeline: {self.pipeline_running}, UserSpeaking(VAD): {self.is_speaking}, TTSActive: {self.tts_active}, Muted: {self.is_muted}."
                     )
                 else:
                     self.session_logger.debug(f"Watchdog: Activity within timeout. Last audio { (current_time - self.last_audio_time):.1f}s ago.")

@@ -29,7 +29,11 @@ class AudioService:
         self.is_available: bool = False # Overall service availability
         self.ffmpeg_available: bool = False
         
-        self.audio_buffer: bytearray = bytearray()
+        # Chunk buffering for handling incomplete WebM/audio fragments
+        self.chunk_buffer: bytearray = bytearray()
+        self.buffer_size_threshold: int = 25000  # 25KB - buffer until we have substantial data
+        self.stream_mode_active: bool = False  # True after first successful decode
+        
         # Frame size in samples per channel for Opus codec
         self.opus_frame_duration_ms: int = settings.audio_frame_ms # Use configured frame duration for Opus
         self.opus_frame_size_samples: int = int(self.sample_rate * self.opus_frame_duration_ms / 1000)
@@ -226,68 +230,140 @@ class AudioService:
                 except ProcessLookupError: pass
             return None
 
-    def extract_pcm_smart(self, audio_bytes: bytes) -> Optional[np.ndarray]:
-        """
-        Smart PCM extraction with multiple fallbacks. This is a SYNC wrapper for the async ffmpeg.
-        For use in non-async contexts or if AudioService is refactored to be primarily synchronous.
-        Ideally, the caller (WebSocketHandler) should use the async version.
-        This version is kept for structural completeness based on previous state.
-        It's better for extract_pcm_smart to be async if it uses async helpers.
-        """
-        # This synchronous wrapper is problematic if _run_ffmpeg_conversion_internal_async is truly async.
-        # For now, let's assume it's called from an async context that can await.
-        # If AudioService methods are called from synchronous code, this needs rethinking
-        # or using asyncio.run() here (which is generally bad practice in libraries).
-        # Let's make extract_pcm_smart async to match its helper.
-        logger.error("extract_pcm_smart synchronous wrapper called; this method should be async. Functionality might be limited.")
-        # This is a placeholder, the actual implementation should be async as below.
-        return None
-
+    def _has_valid_header(self, audio_bytes: bytes) -> bool:
+        """Check if audio data has a valid container header."""
+        if len(audio_bytes) < 20:
+            return False
+            
+        # Check for WebM/Matroska (EBML header)
+        if audio_bytes.startswith(b'\x1a\x45\xdf\xa3'):
+            # Check for enough data after EBML header
+            return len(audio_bytes) > 100
+            
+        # Check for WAV header
+        if audio_bytes.startswith(b'RIFF') and b'WAVE' in audio_bytes[:20]:
+            return len(audio_bytes) > 44  # WAV header is 44 bytes minimum
+            
+        # Check for Ogg header
+        if audio_bytes.startswith(b'OggS'):
+            return len(audio_bytes) > 28  # Ogg page header minimum
+            
+        return False
 
     async def extract_pcm_smart_async(self, audio_bytes: bytes) -> Optional[np.ndarray]:
-        """Asynchronous Smart PCM extraction with multiple fallbacks."""
-        if not audio_bytes: return None
+        """Asynchronous smart PCM extraction with chunk buffering for WebM fragments."""
+        if not audio_bytes: 
+            return None
+            
+        # Add incoming data to buffer
+        self.chunk_buffer.extend(audio_bytes)
+        logger.debug(f"Chunk buffer size: {len(self.chunk_buffer)} bytes")
+        
+        # If we're in stream mode (after first successful decode), try immediate processing
+        if self.stream_mode_active:
+            # In stream mode, try to process chunks more aggressively
+            if len(self.chunk_buffer) >= 1000:  # Minimum 1KB for stream processing
+                buffer_copy = bytes(self.chunk_buffer)
+                self.chunk_buffer.clear()
+                
+                # Try stream processing with raw PCM format
+                pcm_array = await self._run_ffmpeg_conversion_internal_async(buffer_copy, ['-f', 's16le'])
+                if pcm_array is not None:
+                    logger.debug(f"Stream mode processing successful: {len(buffer_copy)} bytes -> {len(pcm_array)} samples")
+                    return pcm_array
+                    
+                # If stream processing fails, fall back to container format processing
+                self.chunk_buffer = bytearray(buffer_copy)  # Restore buffer
+        
+        # Check if we have a valid header or enough data
+        buffer_data = bytes(self.chunk_buffer)
+        has_header = self._has_valid_header(buffer_data)
+        has_enough_data = len(self.chunk_buffer) >= self.buffer_size_threshold
+        
+        if not has_header and not has_enough_data:
+            logger.debug(f"Buffering: no header and insufficient data ({len(self.chunk_buffer)}/{self.buffer_size_threshold} bytes)")
+            return None
+            
+        # Process the accumulated buffer
+        logger.info(f"Processing accumulated buffer: {len(self.chunk_buffer)} bytes (header: {has_header})")
+        
+        # Make a copy and clear the buffer
+        process_data = bytes(self.chunk_buffer)
+        self.chunk_buffer.clear()
+        
+        # Try different format approaches
+        pcm_array = None
+        
+        # 1. Try based on detected format
+        if has_header:
+            is_webm = process_data.startswith(b'\x1a\x45\xdf\xa3')
+            is_wav = process_data.startswith(b'RIFF') and b'WAVE' in process_data[:20]
+            is_ogg = process_data.startswith(b'OggS')
+            
+            if is_webm:
+                logger.debug("Processing WebM/Matroska container")
+                pcm_array = await self._run_ffmpeg_conversion_internal_async(process_data, ['-f', 'matroska'])
+            elif is_wav:
+                logger.debug("Processing WAV container")
+                pcm_array = await self._run_ffmpeg_conversion_internal_async(process_data, ['-f', 'wav'])
+            elif is_ogg:
+                logger.debug("Processing Ogg container")
+                pcm_array = await self._run_ffmpeg_conversion_internal_async(process_data, ['-f', 'ogg'])
+                
+        # 2. If no header or header processing failed, try WebM/Matroska (most common from browsers)
+        if pcm_array is None:
+            logger.debug("Trying WebM/Matroska format fallback")
+            pcm_array = await self._run_ffmpeg_conversion_internal_async(process_data, ['-f', 'matroska'])
+            
+        # 3. Try auto-detection as last resort
+        if pcm_array is None and self.ffmpeg_available:
+            logger.debug("Trying FFmpeg auto-detection")
+            pcm_array = await self._run_ffmpeg_conversion_internal_async(process_data, [])
+            
+        # 4. Final fallback: raw PCM interpretation
+        if pcm_array is None:
+            logger.debug("Trying raw PCM interpretation")
+            pcm_array = self.extract_pcm_from_raw(process_data)
+            
+        if pcm_array is not None:
+            logger.info(f"Successfully processed {len(process_data)} bytes -> {len(pcm_array)} samples")
+            if not self.stream_mode_active:
+                logger.info("Activating stream mode for subsequent chunks")
+                self.stream_mode_active = True
+            return pcm_array
+        else:
+            logger.warning(f"All processing methods failed for {len(process_data)} bytes")
+            return None
+
+    def extract_pcm_smart(self, audio_bytes: bytes) -> Optional[np.ndarray]:
+        """
+        Synchronous wrapper that just processes immediately without buffering.
+        This method should be avoided in favor of extract_pcm_smart_async.
+        """
+        logger.warning("Using synchronous extract_pcm_smart - consider using async version for better buffering")
+        
+        # Basic format detection and processing without buffering
+        if not audio_bytes: 
+            return None
             
         is_webm = audio_bytes.startswith(b'\x1a\x45\xdf\xa3')
         is_wav = audio_bytes.startswith(b'RIFF') and b'WAVE' in audio_bytes[:20]
         is_ogg = audio_bytes.startswith(b'OggS')
-
-        pcm_array: Optional[np.ndarray] = None
-
-        if is_webm:
-            logger.debug("Smart extract (async): WebM magic bytes detected.")
-            pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_bytes, ['-f', 'matroska'])
-            if pcm_array is not None: return pcm_array
-
-        if is_wav:
-            logger.debug("Smart extract (async): WAV magic bytes detected.")
-            pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_bytes, ['-f', 'wav'])
-            if pcm_array is not None: return pcm_array
         
-        if is_ogg:
-            logger.debug("Smart extract (async): Ogg magic bytes detected.")
-            pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_bytes, ['-f', 'ogg'])
-            if pcm_array is not None: return pcm_array
-        
-        # Fallback 1: Try with WebM/Matroska format flag if substantial data
-        if len(audio_bytes) > 300: 
-            logger.debug("Smart extract (async): Fallback with WebM/Matroska format flag.")
-            pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_bytes, ['-f', 'matroska'])
-            if pcm_array is not None: return pcm_array
-                
-        # Fallback 2: Try interpreting as raw PCM (synchronous, quick check)
-        logger.debug("Smart extract (async): Fallback with raw PCM interpretation.")
-        pcm_array_raw = self.extract_pcm_from_raw(audio_bytes) # This is sync
-        if pcm_array_raw is not None: return pcm_array_raw
-
-        # Fallback 3: FFmpeg auto-detection if FFmpeg is available and enough data
-        if self.ffmpeg_available and len(audio_bytes) > 500:
-            logger.debug("Smart extract (async): Final fallback with FFmpeg auto-detection.")
-            pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_bytes, []) # No input format
-            if pcm_array is not None: return pcm_array
-
-        logger.warning(f"All async PCM extraction methods failed for audio chunk of {len(audio_bytes)} bytes.")
+        # Try raw PCM first (fastest)
+        pcm_array = self.extract_pcm_from_raw(audio_bytes)
+        if pcm_array is not None:
+            return pcm_array
+            
+        # Note: Cannot use async FFmpeg methods in sync context
+        logger.warning("Synchronous processing limited - FFmpeg conversion requires async context")
         return None
+
+    def reset_session(self):
+        """Reset the audio service state for a new session."""
+        self.chunk_buffer.clear()
+        self.stream_mode_active = False
+        logger.info("AudioService session state reset")
 
     def get_status(self) -> Dict[str, Any]:
         """Get audio service status."""
@@ -299,7 +375,9 @@ class AudioService:
             "configured_sample_rate": self.sample_rate,
             "configured_channels": self.channels,
             "opus_frame_duration_ms": self.opus_frame_duration_ms,
-            "opus_frame_size_samples": self.opus_frame_size_samples
+            "opus_frame_size_samples": self.opus_frame_size_samples,
+            "chunk_buffer_size": len(self.chunk_buffer),
+            "stream_mode_active": self.stream_mode_active
         }
 
     async def cleanup(self):
@@ -308,6 +386,7 @@ class AudioService:
         # Opuslib objects are C extensions, Python's GC should handle them when no longer referenced.
         self.opus_decoder = None
         self.opus_encoder = None
-        self.audio_buffer.clear()
+        self.chunk_buffer.clear()
+        self.stream_mode_active = False
         self.is_available = False # Mark service as unavailable after cleanup
         logger.info("AudioService cleaned up.")

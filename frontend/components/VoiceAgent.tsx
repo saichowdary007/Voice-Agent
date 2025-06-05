@@ -63,22 +63,132 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
   const [latency, setLatency] = useState<number>(0);
   const [isUserSpeaking, setIsUserSpeaking] = useState(false); // For client-side VAD indication
 
-  const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/ws';
+  const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8003/ws';
 
-  const connectWebSocket = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN || isCleaningUpRef.current) {
-      console.log('ConnectWebSocket: Already connected or cleaning up, skipping.');
+  // Add a ref to track sessionEnded state without causing re-renders
+  const sessionEndedRef = useRef(false);
+
+  // Update the ref whenever session.sessionEnded changes
+  useEffect(() => {
+    sessionEndedRef.current = session.sessionEnded;
+  }, [session.sessionEnded]);
+
+  /**
+   * Ends the current voice session and performs a full cleanup.
+   * A regular (hoisted) function prevents "used before declaration" errors.
+   */
+  function handleEndSession(backendInitiated = false) {
+    if (isCleaningUpRef.current) {
+      console.log('handleEndSession: Cleanup already in progress, skipping.');
       return;
     }
-    console.log('ConnectWebSocket: Attempting to connect...');
+    isCleaningUpRef.current = true;
+    console.log(`Cleaning up session... Backend initiated: ${backendInitiated}`);
+
+    if (keepAliveIntervalRef.current) {
+      clearInterval(keepAliveIntervalRef.current);
+      keepAliveIntervalRef.current = null;
+    }
+
+    if (vadRef.current && typeof (vadRef.current as any).destroy === 'function') {
+      try { (vadRef.current as any).destroy(); } catch (e) { console.warn('Error destroying VAD:', e); }
+    }
+    vadRef.current = null;
+
+    const mr = mediaRecorderRef.current;
+    if (mr && mr.state !== 'inactive') {
+      try { mr.stop(); } catch (e) { console.warn('Error stopping MediaRecorder during cleanup:', e); }
+    }
+    mediaRecorderRef.current = null;
+
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+
+    if (sourceRef.current) {
+      sourceRef.current.disconnect();
+      sourceRef.current = null;
+    }
+
+    if (pcmPlayerNodeRef.current) {
+      pcmPlayerNodeRef.current.disconnect();
+      pcmPlayerNodeRef.current = null;
+    }
+
+    const ctx = audioContextRef.current;
+    if (ctx && ctx.state !== 'closed') {
+      ctx.close().catch(e => console.warn('Error closing AudioContext:', e));
+    }
+    audioContextRef.current = null;
+
+    if (ttsAudioPlayerRef.current) {
+      ttsAudioPlayerRef.current.dispose();
+      ttsAudioPlayerRef.current = null;
+    }
+
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      console.log('Closing WebSocket connection from handleEndSession…');
+      wsRef.current.close(1000, 'Session ended by client/cleanup');
+    }
+    wsRef.current = null;
+
+    setSession(prev => ({
+      ...prev,
+      isConnected: false,
+      isRecording: false,
+      isMuted: false,
+      isProcessing: false,
+      isSpeaking: false,
+      sessionEnded: true,
+      isReconnecting: false,
+      sessionId: undefined,
+    }));
+    setTranscript({ partial: '', final: [], aiResponse: '', isAiResponding: false });
+    setAudioLevel(0);
+    setLatency(0);
+    setIsUserSpeaking(false);
+
+    console.log('Session state reset.');
+
+    setTimeout(() => {
+      isCleaningUpRef.current = false;
+      console.log('Cleanup flag reset, ready for new session.');
+    }, 500);
+  }
+
+  const connectWebSocket = useCallback(() => {
+    // Check if we should skip connection attempt
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      console.log('ConnectWebSocket: Already connected, skipping.');
+      return;
+    }
+    if (isCleaningUpRef.current) {
+      console.log('ConnectWebSocket: Cleanup in progress, skipping.');
+      return;
+    }
+    if (wsRef.current?.readyState === WebSocket.CONNECTING) {
+      console.log('ConnectWebSocket: Connection already in progress, skipping.');
+      return;
+    }
+
+    console.log(`ConnectWebSocket: Attempting to connect to ${wsUrl}...`);
 
     try {
+      // Close any existing connection first
+      if (wsRef.current) {
+        console.log('ConnectWebSocket: Closing existing connection before creating new one');
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
       lastServerMessageTimeRef.current = Date.now();
 
       ws.onopen = () => {
-        console.log('WebSocket connected');
+        console.log('✅ WebSocket connected successfully');
+        console.log('Setting session state: isConnected=true, sessionEnded=false');
         setSession(prev => ({ ...prev, isConnected: true, sessionEnded: false, isReconnecting: false }));
         lastServerMessageTimeRef.current = Date.now();
         
@@ -125,7 +235,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       };
 
       ws.onclose = (event: CloseEvent) => {
-        console.log(`WebSocket disconnected. Code: ${event.code}, Reason: ${event.reason}`);
+        console.log(`❌ WebSocket disconnected. Code: ${event.code}, Reason: ${event.reason}`);
         setSession(prev => ({ 
           ...prev, 
           isConnected: false, 
@@ -134,7 +244,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
           isSpeaking: false, // AI speaking
           // sessionEnded: event.code === 1000 ? prev.sessionEnded : true // Keep sessionEnded if closed gracefully by user
         }));
-        if (event.code !== 1000 && !session.sessionEnded) { // Avoid error if session was ended by user
+        if (event.code !== 1000 && !sessionEndedRef.current) { // Use ref to avoid dependency issues
           console.warn(`WebSocket closed unexpectedly. Code: ${event.code}. Reason: ${event.reason}`);
           onError?.(`Connection lost (Code: ${event.code}). Please try again.`);
         }
@@ -146,22 +256,35 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
 
       ws.onerror = (errorEvent) => {
         const error = errorEvent instanceof ErrorEvent ? errorEvent.message : 'Unknown WebSocket error';
-        console.error('WebSocket error:', error, errorEvent);
-        onError?.('WebSocket connection failed. Please check your connection and the server.');
+        console.error(`❌ WebSocket error connecting to ${wsUrl}:`, error, errorEvent);
+        
+        // Delay error reporting to prevent immediate re-renders that might cause unmounting
+        setTimeout(() => {
+          onError?.('WebSocket connection failed. Please check your connection and the server.');
+        }, 100);
+        
         // Ensure state reflects disconnection
         setSession(prev => ({ ...prev, isConnected: false, isReconnecting: false }));
       };
 
     } catch (error) {
-      console.error('Failed to initiate WebSocket connection:', error);
+      console.error(`❌ Failed to initiate WebSocket connection to ${wsUrl}:`, error);
       onError?.('Failed to connect to the voice service.');
     }
-  }, [wsUrl, onError, session.sessionEnded]);
+  }, [wsUrl, onError]); // Removed sessionEndedRef.current since refs don't need to be in dependencies
 
 async function handleWebSocketMessage(data: any) {
+  console.log('📨 Received WebSocket message:', data.type, data);
+  
   switch (data.type) {
     case 'status':
-      setSession(prev => ({ ...prev, sessionId: data.session_id, isProcessing: data.status === 'processing' }));
+      setSession(prev => ({ 
+        ...prev, 
+        sessionId: data.session_id, 
+        isProcessing: data.status === 'processing',
+        // Set connected if we receive a status message with ready: true (initial connection)
+        isConnected: data.ready === true ? true : prev.isConnected
+      }));
       if (data.config) console.log('Received backend config:', data.config);
       if (data.status === 'processing') setTranscript(prev => ({ ...prev, partial: '', aiResponse: '' }));
       break;
@@ -191,7 +314,9 @@ async function handleWebSocketMessage(data: any) {
       break;
     case 'stop_audio':
       console.log('Received stop_audio from backend');
-      ttsAudioPlayerRef.current?.stop();
+      if (ttsAudioPlayerRef.current) {
+        ttsAudioPlayerRef.current.stop();
+      }
       setSession(prev => ({ ...prev, isSpeaking: false }));
       break;
     case 'mute_status':
@@ -410,7 +535,7 @@ async function handleWebSocketMessage(data: any) {
         minSpeechFrames: 3,
         positiveSpeechThreshold: 0.7,
         negativeSpeechThreshold: 0.35,
-        minSilenceFrames: 8,
+        min_silence_frames: 8,
         redemptionFrames: 25,
         preSpeechPadFrames: 1,
         onVADMisfire: () => console.warn('VAD: Misfire detected'),
@@ -493,7 +618,7 @@ async function handleWebSocketMessage(data: any) {
   const toggleMute = useCallback(() => {
     const newMutedState = !session.isMuted;
     setSession(prev => ({...prev, isMuted: newMutedState})); // Optimistic update
-    sendWebSocketMessage({ type: 'control', action: newMutedState ? 'mute' : 'unmute' });
+    sendWebSocketMessage({ type: 'mute', muted: newMutedState });
     // VAD and MediaRecorder are managed by speech events, not directly by mute.
     // Mute mainly affects TTS playback and can be a signal to backend.
   }, [session.isMuted, sendWebSocketMessage]);
@@ -506,84 +631,6 @@ async function handleWebSocketMessage(data: any) {
     setTimeout(() => handleEndSession(false), 100); // Pass false: user initiated
   }, [sendWebSocketMessage]);
 
-
-  /**
-   * Ends the current voice session and performs a full cleanup.
-   * A regular (hoisted) function prevents "used before declaration" errors.
-   */
-  function handleEndSession(backendInitiated = false) {
-    if (isCleaningUpRef.current) {
-      console.log('handleEndSession: Cleanup already in progress, skipping.');
-      return;
-    }
-    isCleaningUpRef.current = true;
-    console.log(`Cleaning up session... Backend initiated: ${backendInitiated}`);
-
-    if (keepAliveIntervalRef.current) {
-      clearInterval(keepAliveIntervalRef.current);
-      keepAliveIntervalRef.current = null;
-    }
-
-    if (vadRef.current && typeof (vadRef.current as any).destroy === 'function') {
-      try { (vadRef.current as any).destroy(); } catch (e) { console.warn('Error destroying VAD:', e); }
-    }
-    vadRef.current = null;
-
-    const mr = mediaRecorderRef.current;
-    if (mr && mr.state !== 'inactive') {
-      try { mr.stop(); } catch (e) { console.warn('Error stopping MediaRecorder during cleanup:', e); }
-    }
-    mediaRecorderRef.current = null;
-
-    streamRef.current?.getTracks().forEach(track => track.stop());
-    streamRef.current = null;
-
-    sourceRef.current?.disconnect();
-    sourceRef.current = null;
-
-    pcmPlayerNodeRef.current?.disconnect();
-    pcmPlayerNodeRef.current = null;
-
-    const ctx = audioContextRef.current;
-    if (ctx && ctx.state !== 'closed') {
-      ctx.close().catch(e => console.warn('Error closing AudioContext:', e));
-    }
-    audioContextRef.current = null;
-
-    ttsAudioPlayerRef.current?.dispose();
-    ttsAudioPlayerRef.current = null;
-
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      console.log('Closing WebSocket connection from handleEndSession…');
-      wsRef.current.close(1000, 'Session ended by client/cleanup');
-    }
-    wsRef.current = null;
-
-    setSession(prev => ({
-      ...prev,
-      isConnected: false,
-      isRecording: false,
-      isMuted: false,
-      isProcessing: false,
-      isSpeaking: false,
-      sessionEnded: true,
-      isReconnecting: false,
-      sessionId: undefined,
-    }));
-    setTranscript({ partial: '', final: [], aiResponse: '', isAiResponding: false });
-    setAudioLevel(0);
-    setLatency(0);
-    setIsUserSpeaking(false);
-
-    console.log('Session state reset.');
-
-    setTimeout(() => {
-      isCleaningUpRef.current = false;
-      console.log('Cleanup flag reset, ready for new session.');
-    }, 500);
-  }
-
-
   const startNewSession = useCallback(async () => {
     console.log('🚀 Starting new session attempt...');
     if (isCleaningUpRef.current) {
@@ -592,45 +639,62 @@ async function handleWebSocketMessage(data: any) {
       return;
     }
     
-    // Ensure previous session is fully ended if any refs still exist
-    if(session.isConnected || wsRef.current || streamRef.current) {
-        console.log("StartNewSession: Previous session seems active, ensuring full cleanup first.");
-        await handleEndSession(false); // Force cleanup
+    // Check if we need to clean up existing connections
+    const hasActiveWebSocket = wsRef.current && wsRef.current.readyState === WebSocket.OPEN;
+    const hasActiveStream = streamRef.current && streamRef.current.active;
+    
+    if (hasActiveWebSocket || hasActiveStream) {
+        console.log("StartNewSession: Active connections detected, cleaning up first.");
+        handleEndSession(false); // Force cleanup
         // Wait a moment for cleanup to complete if it was just triggered
         await new Promise(resolve => setTimeout(resolve, 600));
          if (isCleaningUpRef.current) {
             console.log('StartNewSession: Waiting for final cleanup flag reset.');
             await new Promise(resolve => setTimeout(resolve, 550));
         }
+    } else {
+        console.log("StartNewSession: No active connections, proceeding with new session.");
     }
     
+    // Reset session state for new session
     setSession(prev => ({ 
       ...prev, 
-      sessionEnded: false, isConnected: false, isReconnecting: false,
-      isProcessing: false, isSpeaking: false, isRecording: false
+      sessionEnded: false, 
+      isConnected: false, 
+      isReconnecting: false,
+      isProcessing: false, 
+      isSpeaking: false, 
+      isRecording: false 
     }));
     setTranscript({ partial: '', final: [], aiResponse: '', isAiResponding: false });
     setIsUserSpeaking(false);
     
+    console.log('StartNewSession: Initiating WebSocket connection...');
     connectWebSocket(); // This will attempt to establish a new WebSocket connection
     // initializeAudio will be called via useEffect when session.isConnected becomes true
-  }, [connectWebSocket, session.isConnected]);
+  }, [connectWebSocket]); // Removed session.isConnected to prevent circular dependency
 
   useEffect(() => {
-    // Initial connection attempt
-    if(!session.isConnected && !session.sessionEnded && !wsRef.current) {
+    // Initial connection attempt - only run once on mount
+    // Use a timeout to allow the component to fully mount before connecting
+    const connectionTimer = setTimeout(() => {
+      if (!session.isConnected && !session.sessionEnded && !wsRef.current && !isCleaningUpRef.current) {
+        console.log("🔗 Initial WebSocket connection attempt after component mount");
         connectWebSocket();
-    }
+      }
+    }, 100); // Small delay to ensure component is fully mounted
+
     // Cleanup on component unmount
     return () => {
       console.log("VoiceAgent component unmounting. Performing cleanup.");
+      clearTimeout(connectionTimer); // Cancel pending connection attempt
       handleEndSession(false); // User (component unmount) initiated
       if (keepAliveIntervalRef.current) {
         clearInterval(keepAliveIntervalRef.current);
         keepAliveIntervalRef.current = null;
       }
     };
-  }, [connectWebSocket, session.isConnected, session.sessionEnded]);
+  }, []); // Empty dependency array - only run on mount/unmount
 
   useEffect(() => {
     // Attempt to initialize audio once connected and if not already initialized/cleaning up
@@ -640,7 +704,7 @@ async function handleWebSocketMessage(data: any) {
         console.log(`🎯 Audio initialization ${success ? 'succeeded' : 'failed'}`);
       });
     }
-  }, [session.isConnected, initializeAudio]);
+  }, [session.isConnected]); // Only depend on isConnected, remove initializeAudio to prevent re-creation
 
 
   // Get activity indicator based on multiple states
