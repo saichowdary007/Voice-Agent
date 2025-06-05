@@ -227,8 +227,27 @@ async def health_check_endpoint(): # Renamed to avoid conflict
 
         current_memory_mb = metrics.get_memory_usage() if metrics else 0.0
         
+        # Check all services and determine if they're ready
+        essential_services = ['vad', 'stt', 'audio']
+        essential_services_ready = True
+        
+        for name in essential_services:
+            if name == 'audio':
+                # Special case for audio service which uses 'overall_available'
+                if not service_status_details.get(name, {}).get('overall_available', False):
+                    essential_services_ready = False
+                    break
+            else:
+                # Standard check for other services
+                if not service_status_details.get(name, {}).get('available', False):
+                    essential_services_ready = False
+                    break
+        
+        # If all essential services are ready, report healthy
+        status = "healthy" if essential_services_ready else "degraded"
+        
         response_content = {
-            "status": "healthy" if all_services_operational else "degraded",
+            "status": status,
             "timestamp": time.time(),
             "app_version": settings.app_version,
             "active_sessions": session_manager.get_active_sessions_count(),
@@ -244,7 +263,12 @@ async def health_check_endpoint(): # Renamed to avoid conflict
                 "preload_models": settings.preload_models
             }
         }
-        return JSONResponse(status_code=200 if all_services_operational else 503, content=response_content)
+        
+        # Only return 503 if truly unhealthy
+        return JSONResponse(
+            status_code=200 if status == "healthy" else 503, 
+            content=response_content
+        )
     except Exception as e:
         logger.error(f"Health check endpoint failed critically: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"status": "unhealthy", "error": f"Internal server error: {str(e)}"})
@@ -267,26 +291,29 @@ async def websocket_endpoint(websocket: WebSocket):
     app_logger = logger if logger else structlog.get_logger("app.websocket_fallback")
 
     try:
+        app_logger.info(f"WebSocket connection request from {websocket.client.host}:{websocket.client.port}")
         await websocket.accept() # Accept connection first
+        app_logger.info(f"WebSocket connection accepted from {websocket.client.host}:{websocket.client.port}")
     except Exception as e:
-        app_logger.error(f"Failed to accept WebSocket connection: {e}", exc_info=True)
+        app_logger.error(f"Failed to accept WebSocket connection from {websocket.client.host}:{websocket.client.port}: {e}", exc_info=True)
         return
     
     try:
+        app_logger.info(f"Creating session for {websocket.client.host}:{websocket.client.port}")
         if not await session_manager.create_session(websocket):
-            app_logger.warning("Session creation failed (e.g., max sessions). Closing WebSocket.")
+            app_logger.warning(f"Session creation failed for {websocket.client.host}:{websocket.client.port} (max sessions limit)")
             await websocket.close(code=1013, reason="Server overloaded or unable to create session.")
             return
         
         session_id = session_manager.get_session_id(websocket)
         if not session_id: # Should not happen if create_session succeeded
-            app_logger.error("Critical: Session ID not found after successful session creation. Closing WebSocket.")
+            app_logger.error(f"Critical: Session ID not found after successful session creation for {websocket.client.host}:{websocket.client.port}")
             await websocket.close(code=1011, reason="Internal server error: Session ID missing.")
             return
             
         # Create a logger instance bound with session-specific context
         session_logger = app_logger.bind(session_id=session_id, client_host=websocket.client.host)
-        session_logger.info(f"WebSocket connection accepted.")
+        session_logger.info(f"WebSocket connection accepted and session created.")
 
         handler = WebSocketHandler(
             websocket=websocket,
@@ -298,6 +325,7 @@ async def websocket_endpoint(websocket: WebSocket):
         # Send initial status/config to client in a try-except block
         try:
             if websocket.client_state == WebSocketState.CONNECTED:
+                session_logger.info(f"Sending initial status message to client")
                 await handler._send_message({
                     "type": "status",
                     "session_id": session_id, # Send the generated session_id to client
@@ -308,6 +336,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "channels": settings.channels
                     }
                 })
+                session_logger.info(f"Initial status message sent successfully")
             else: # Should not happen immediately after accept, but good check
                 session_logger.warning("WebSocket disconnected before initial status message could be sent.")
                 # Cleanup will be handled in finally block
@@ -322,7 +351,9 @@ async def websocket_endpoint(websocket: WebSocket):
         
         while retry_count < max_retries and websocket.client_state == WebSocketState.CONNECTED:
             try:
+                session_logger.info(f"Starting main WebSocket handler loop")
                 await handler.handle_connection() # Main message handling loop
+                session_logger.info(f"WebSocket handler loop exited normally")
                 break  # If handle_connection returns normally, exit loop
             except WebSocketDisconnect:
                 session_logger.info(f"Client disconnected WebSocket gracefully.")
@@ -361,6 +392,7 @@ async def websocket_endpoint(websocket: WebSocket):
         if websocket.client_state != WebSocketState.DISCONNECTED:
             try:
                 # If not already closed by handler or client, attempt a graceful close
+                session_logger.info(f"WebSocket still connected. Attempting graceful close.")
                 await websocket.close(code=1000)
                 session_logger.info("WebSocket closed from main finally block.")
             except Exception as close_exc:

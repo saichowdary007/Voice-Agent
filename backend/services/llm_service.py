@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 import time
-from typing import Dict, Any, AsyncGenerator, Optional
+from typing import Dict, Any, AsyncGenerator, Optional, List, Union
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
@@ -21,6 +21,12 @@ class LLMService:
         # Conversation history
         self.conversation_history = []
         self.max_history_length = 10  # Keep last 10 exchanges
+        
+        # Retry configuration
+        self.max_retries = 3
+        self.retry_delay = 1.0  # Initial retry delay in seconds
+        
+        logger.info("LLM Service initialized with model: %s", self.model_name)
         
     async def initialize(self):
         """Initialize the Gemini model"""
@@ -112,26 +118,46 @@ class LLMService:
             # Create prompt with conversation context
             prompt = self._build_prompt(user_input)
             
-            # Generate response
-            def generate():
-                return self.model.generate_content(prompt)
+            # Generate response with retry logic
+            retry_count = 0
+            while retry_count <= self.max_retries:
+                try:
+                    def generate():
+                        return self.model.generate_content(prompt)
+                    
+                    response = await asyncio.wait_for(
+                        asyncio.to_thread(generate),
+                        timeout=60.0  # 60 seconds timeout
+                    )
+                    
+                    if response and response.text:
+                        response_text = response.text.strip()
+                        
+                        # Add response to history
+                        self.conversation_history.append({"role": "assistant", "content": response_text})
+                        
+                        # Trim history if too long
+                        self._trim_history()
+                        
+                        logger.info(f"LLM generated response: '{response_text[:100]}...'")
+                        return response_text
+                    else:
+                        logger.error("No response text from Gemini")
+                        retry_count += 1
+                        if retry_count <= self.max_retries:
+                            await asyncio.sleep(self.retry_delay * retry_count)  # Exponential backoff
+                        
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.warning(f"LLM generation attempt {retry_count+1} failed: {e}")
+                    retry_count += 1
+                    if retry_count <= self.max_retries:
+                        await asyncio.sleep(self.retry_delay * retry_count)  # Exponential backoff
+                    else:
+                        logger.error(f"All {self.max_retries} LLM generation attempts failed")
+                        break
             
-            response = await asyncio.to_thread(generate)
-            
-            if response and response.text:
-                response_text = response.text.strip()
-                
-                # Add response to history
-                self.conversation_history.append({"role": "assistant", "content": response_text})
-                
-                # Trim history if too long
-                self._trim_history()
-                
-                logger.info(f"LLM generated response: '{response_text[:100]}...'")
-                return response_text
-            else:
-                logger.error("No response text from Gemini")
-                return self._get_mock_response()
+            # If we've exhausted all retries, return a mock response
+            return self._get_mock_response()
                 
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
@@ -163,25 +189,54 @@ class LLMService:
             # Create prompt with conversation context
             prompt = self._build_prompt(user_input)
             
-            # Generate streaming response
-            response_text = ""
-            
-            def generate_stream():
-                return self.model.generate_content(prompt, stream=True)
-            
-            response = await asyncio.to_thread(generate_stream)
-            
-            for chunk in response:
-                if chunk.text:
-                    chunk_text = chunk.text
-                    response_text += chunk_text
-                    yield chunk_text
+            # Generate streaming response with retry logic
+            retry_count = 0
+            while retry_count <= self.max_retries:
+                try:
+                    # Generate streaming response
+                    response_text = ""
                     
-            # Add complete response to history
-            if response_text:
-                self.conversation_history.append({"role": "assistant", "content": response_text.strip()})
-                self._trim_history()
-                logger.info(f"LLM streamed response: '{response_text[:100]}...'")
+                    def generate_stream():
+                        return self.model.generate_content(prompt, stream=True)
+                    
+                    response = await asyncio.wait_for(
+                        asyncio.to_thread(generate_stream),
+                        timeout=30.0  # 30 seconds timeout for stream initialization
+                    )
+                    
+                    for chunk in response:
+                        if chunk.text:
+                            chunk_text = chunk.text
+                            response_text += chunk_text
+                            yield chunk_text
+                            
+                    # Add complete response to history
+                    if response_text:
+                        self.conversation_history.append({"role": "assistant", "content": response_text.strip()})
+                        self._trim_history()
+                        logger.info(f"LLM streamed response: '{response_text[:100]}...'")
+                        return
+                    else:
+                        logger.warning("No text generated in streaming response")
+                        retry_count += 1
+                        if retry_count <= self.max_retries:
+                            await asyncio.sleep(self.retry_delay * retry_count)  # Exponential backoff
+                        
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.warning(f"LLM streaming attempt {retry_count+1} failed: {e}")
+                    retry_count += 1
+                    if retry_count <= self.max_retries:
+                        await asyncio.sleep(self.retry_delay * retry_count)  # Exponential backoff
+                    else:
+                        logger.error(f"All {self.max_retries} LLM streaming attempts failed")
+                        break
+            
+            # If we've exhausted all retries, return a mock response
+            mock_response = self._get_mock_response()
+            words = mock_response.split()
+            for word in words:
+                yield word + " "
+                await asyncio.sleep(0.05)
                 
         except Exception as e:
             logger.error(f"LLM streaming failed: {e}")
@@ -202,7 +257,10 @@ class LLMService:
         Yields:
             Response tokens as they are generated
         """
+        logger.info("LLM generate_response_stream called with %d messages", len(messages))
+        
         if not self.is_available:
+            logger.warning("LLM not available, using mock streaming response")
             # Mock streaming response
             mock_response = self._get_mock_response()
             words = mock_response.split()
@@ -212,11 +270,32 @@ class LLMService:
             return
         
         try:
+            # Process incoming messages and update conversation history
+            processed_messages = []
+            
+            for message in messages:
+                # Check if message is a dict or has attributes
+                if isinstance(message, dict):
+                    role = message.get("role")
+                    content = message.get("content")
+                else:
+                    # Assume it's an object with attributes
+                    role = getattr(message, "role", None)
+                    content = getattr(message, "content", None)
+                
+                if role and content:
+                    processed_messages.append({"role": role, "content": content})
+                    logger.debug("Processed message - Role: %s, Content: %s", role, content[:30] + "..." if len(content) > 30 else content)
+            
+            # Update conversation history with all valid messages
+            self.conversation_history.extend(processed_messages)
+            self._trim_history()
+            
             # Extract the latest user message
             user_message = None
-            for message in reversed(messages):
-                if message.role == "user" and message.content:
-                    user_message = message.content
+            for message in reversed(processed_messages):
+                if message["role"] == "user" and message["content"]:
+                    user_message = message["content"]
                     break
             
             if not user_message:
@@ -227,18 +306,92 @@ class LLMService:
                     await asyncio.sleep(0.05)
                 return
                 
-            # Use the existing generate_streaming method with the extracted user message
-            async for chunk in self.generate_streaming(user_message):
-                yield chunk
+            # Generate response with retry logic
+            retry_count = 0
+            while retry_count <= self.max_retries:
+                try:
+                    # Generate response using Gemini model
+                    prompt = self._build_prompt(user_message)
+                    logger.debug("Built prompt for LLM: %s", prompt[:100] + "..." if len(prompt) > 100 else prompt)
+                    
+                    def generate_stream():
+                        logger.info("Starting generate_content with stream=True")
+                        return self.model.generate_content(prompt, stream=True)
+                    
+                    logger.info("Waiting for stream initialization (timeout: 30s)")
+                    response = await asyncio.wait_for(
+                        asyncio.to_thread(generate_stream),
+                        timeout=30.0  # 30 seconds timeout for stream initialization
+                    )
+                    
+                    # Stream the response
+                    logger.info("Stream initialized successfully, beginning token streaming")
+                    response_text = ""
+                    token_count = 0
+                    for chunk in response:
+                        if chunk.text:
+                            chunk_text = chunk.text
+                            response_text += chunk_text
+                            token_count += 1
+                            if token_count % 10 == 0:
+                                logger.debug("Streamed %d tokens so far", token_count)
+                            yield chunk_text
+                            
+                    # Add complete response to history
+                    if response_text:
+                        self.conversation_history.append({"role": "assistant", "content": response_text.strip()})
+                        self._trim_history()
+                        logger.info(f"LLM streamed complete response: {token_count} tokens, '{response_text[:100]}...'")
+                        return
+                    else:
+                        logger.warning("No text generated in streaming response")
+                        retry_count += 1
+                        if retry_count <= self.max_retries:
+                            logger.info("Retrying stream generation (attempt %d/%d) after delay: %ds", 
+                                      retry_count, self.max_retries, self.retry_delay * retry_count)
+                            await asyncio.sleep(self.retry_delay * retry_count)  # Exponential backoff
+                    
+                except asyncio.TimeoutError as te:
+                    logger.warning(f"LLM streaming timeout (attempt {retry_count+1}/{self.max_retries+1}): {te}")
+                    retry_count += 1
+                    if retry_count <= self.max_retries:
+                        logger.info("Retrying after timeout (attempt %d/%d) with delay: %ds", 
+                                  retry_count, self.max_retries, self.retry_delay * retry_count)
+                        await asyncio.sleep(self.retry_delay * retry_count)  # Exponential backoff
+                    else:
+                        logger.error(f"All {self.max_retries} LLM streaming attempts timed out")
+                        break
+                except Exception as e:
+                    logger.warning(f"LLM streaming attempt {retry_count+1} failed: {e}")
+                    retry_count += 1
+                    if retry_count <= self.max_retries:
+                        logger.info("Retrying after error (attempt %d/%d) with delay: %ds", 
+                                  retry_count, self.max_retries, self.retry_delay * retry_count)
+                        await asyncio.sleep(self.retry_delay * retry_count)  # Exponential backoff
+                    else:
+                        logger.error(f"All {self.max_retries} LLM streaming attempts failed")
+                        break
                 
-        except Exception as e:
-            logger.error(f"LLM response stream failed: {e}")
-            # Fallback to mock response
+            # If we've exhausted all retries, return a mock response
+            logger.warning("Falling back to mock response after failed retries")
             mock_response = self._get_mock_response()
             words = mock_response.split()
             for word in words:
                 yield word + " "
                 await asyncio.sleep(0.05)
+                
+        except Exception as e:
+            logger.error(f"LLM response stream failed with critical error: {e}")
+            # Fallback to mock response
+            logger.info("Using mock response after critical error")
+            mock_response = self._get_mock_response()
+            words = mock_response.split()
+            for word in words:
+                yield word + " "
+                await asyncio.sleep(0.05)
+                
+        finally:
+            logger.info("LLM generate_response_stream completed")
     
     def _build_prompt(self, user_input: str) -> str:
         """Build prompt with conversation context"""
@@ -315,7 +468,8 @@ class LLMService:
             "service": f"Gemini {self.model_name}" if self.is_available else "Mock LLM",
             "api_key_configured": bool(self.api_key and self.api_key != "test_key_for_demo"),
             "conversation_exchanges": len(self.conversation_history) // 2,
-            "max_history_length": self.max_history_length
+            "max_history_length": self.max_history_length,
+            "max_retries": self.max_retries
         }
     
     async def cleanup(self):

@@ -65,28 +65,36 @@ class VADService:
                 audio_data = audio_frame
                 
             # DEBUG: Log the actual audio data size
-            logger.debug(f"VAD processing: received {len(audio_frame)} bytes = {len(audio_data)} samples")
+            logger.debug(f"VAD processing: received {len(audio_frame) if isinstance(audio_frame, bytes) else 'N/A'} bytes = {len(audio_data)} samples, shape: {audio_data.shape}")
                 
             # Process audio frame
             def process_vad():
-                # Ensure audio is the right format
+                # Ensure audio is the right format and is 1D
                 if len(audio_data.shape) > 1:
-                    processed_audio = audio_data.mean(axis=1)  # Convert to mono
+                    logger.debug(f"VAD: Converting {audio_data.shape} audio to mono")
+                    if audio_data.shape[1] > 1:  # Multi-channel audio
+                        processed_audio = audio_data.mean(axis=1)  # Convert to mono
+                    else:  # Already mono but has extra dimension
+                        processed_audio = audio_data.reshape(-1)  # Flatten to 1D
                 else:
                     processed_audio = audio_data
                     
-                # Normalize audio
+                # Normalize audio to float32 in [-1,1] range
                 if processed_audio.dtype != np.float32:
                     processed_audio = processed_audio.astype(np.float32)
+                
                 if np.max(np.abs(processed_audio)) > 1.0:
                     processed_audio = processed_audio / np.max(np.abs(processed_audio))
                 
-                # DEBUG: Log the processed audio size before sending to VAD model
-                logger.debug(f"VAD model input: {len(processed_audio)} samples")
-                    
-                # Convert to tensor
+                # Final check to make sure we have a 1D tensor
                 audio_tensor = torch.from_numpy(processed_audio)
+                if audio_tensor.dim() > 1:
+                    logger.warning(f"VAD: Audio tensor still has {audio_tensor.dim()} dimensions after processing. Flattening.")
+                    audio_tensor = audio_tensor.reshape(-1)  # Ensure 1D tensor
                 
+                # DEBUG: Log the processed audio size before sending to VAD model
+                logger.debug(f"VAD model input: shape={audio_tensor.shape}, dim={audio_tensor.dim()}")
+                    
                 # Get VAD prediction
                 speech_prob = self.model(audio_tensor, self.sample_rate).item()
                 return speech_prob

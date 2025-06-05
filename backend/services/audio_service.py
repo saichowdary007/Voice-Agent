@@ -33,6 +33,7 @@ class AudioService:
         self.chunk_buffer: bytearray = bytearray()
         self.buffer_size_threshold: int = 25000  # 25KB - buffer until we have substantial data
         self.stream_mode_active: bool = False  # True after first successful decode
+        self.last_processed_chunk_size: int = 0  # Track size of last successfully processed chunk
         
         # Frame size in samples per channel for Opus codec
         self.opus_frame_duration_ms: int = settings.audio_frame_ms # Use configured frame duration for Opus
@@ -250,118 +251,59 @@ class AudioService:
             
         return False
 
-    async def extract_pcm_smart_async(self, audio_bytes: bytes) -> Optional[np.ndarray]:
-        """Asynchronous smart PCM extraction with chunk buffering for WebM fragments."""
-        if not audio_bytes: 
-            return None
+    async def extract_pcm_smart_async(self, audio_data: bytes) -> Optional[np.ndarray]:
+        """
+        Extract PCM data from various audio formats with smart buffering for streaming audio.
+        
+        Args:
+            audio_data: Binary audio data
             
-        try:    
-            # Add incoming data to buffer
-            self.chunk_buffer.extend(audio_bytes)
-            logger.debug(f"Chunk buffer size: {len(self.chunk_buffer)} bytes")
-            
-            # If we're in stream mode (after first successful decode), try immediate processing
+        Returns:
+            PCM data as numpy array or None if more data is needed
+        """
+        try:
+            # Add to buffer
             if self.stream_mode_active:
-                # In stream mode, try to process chunks more aggressively
-                if len(self.chunk_buffer) >= 1000:  # Minimum 1KB for stream processing
-                    buffer_copy = bytes(self.chunk_buffer)
-                    self.chunk_buffer.clear()
+                self.chunk_buffer.extend(audio_data)
+                logger.debug(f"Added {len(audio_data)} bytes to chunk buffer. Total buffer size: {len(self.chunk_buffer)}")
+                
+                # Check if we have enough data to try decoding
+                if len(self.chunk_buffer) < 1000 and len(self.chunk_buffer) < self.last_processed_chunk_size * 2:
+                    logger.debug(f"Buffer size {len(self.chunk_buffer)} bytes not enough to try decoding yet.")
+                    return None
                     
-                    # Try stream processing with raw PCM format
-                    try:
-                        pcm_array = await self._run_ffmpeg_conversion_internal_async(buffer_copy, ['-f', 's16le'])
-                        if pcm_array is not None:
-                            logger.debug(f"Stream mode processing successful: {len(buffer_copy)} bytes -> {len(pcm_array)} samples")
-                            return pcm_array
-                    except Exception as e:
-                        logger.warning(f"Stream mode processing failed: {e}")
-                        # Fall through to container format processing
+                # Try to extract PCM data from the buffered chunk
+                try:
+                    # Use the internal buffer
+                    logger.debug(f"Attempting to extract PCM from buffer of size {len(self.chunk_buffer)} bytes")
+                    pcm_array = await self._extract_pcm_from_format(bytes(self.chunk_buffer))
                     
-                    # If stream processing fails, fall back to container format processing
-                    self.chunk_buffer = bytearray(buffer_copy)  # Restore buffer
-            
-            # Check if we have a valid header or enough data
-            buffer_data = bytes(self.chunk_buffer)
-            has_header = self._has_valid_header(buffer_data)
-            has_enough_data = len(self.chunk_buffer) >= self.buffer_size_threshold
-            
-            if not has_header and not has_enough_data:
-                logger.debug(f"Buffering: no header and insufficient data ({len(self.chunk_buffer)}/{self.buffer_size_threshold} bytes)")
-                return None
-                
-            # Process the accumulated buffer
-            logger.info(f"Processing accumulated buffer: {len(self.chunk_buffer)} bytes (header: {has_header})")
-            
-            # Make a copy and clear the buffer
-            process_data = bytes(self.chunk_buffer)
-            self.chunk_buffer.clear()
-            
-            # Try different format approaches
-            pcm_array = None
-            
-            # 1. Try based on detected format
-            if has_header:
-                is_webm = process_data.startswith(b'\x1a\x45\xdf\xa3')
-                is_wav = process_data.startswith(b'RIFF') and b'WAVE' in process_data[:20]
-                is_ogg = process_data.startswith(b'OggS')
-                
-                try:
-                    if is_webm:
-                        logger.debug("Processing WebM/Matroska container")
-                        pcm_array = await self._run_ffmpeg_conversion_internal_async(process_data, ['-f', 'matroska'])
-                    elif is_wav:
-                        logger.debug("Processing WAV container")
-                        pcm_array = await self._run_ffmpeg_conversion_internal_async(process_data, ['-f', 'wav'])
-                    elif is_ogg:
-                        logger.debug("Processing Ogg container")
-                        pcm_array = await self._run_ffmpeg_conversion_internal_async(process_data, ['-f', 'ogg'])
+                    if pcm_array is not None:
+                        # Success! Clear the buffer
+                        logger.info(f"Successfully extracted {len(pcm_array)} PCM samples from buffered data of {len(self.chunk_buffer)} bytes")
+                        self.last_processed_chunk_size = len(self.chunk_buffer)
+                        self.chunk_buffer.clear()
+                        return pcm_array
+                    else:
+                        # Need more data, keep in buffer
+                        logger.debug(f"Extraction returned None, keeping data in buffer")
+                        return None
                 except Exception as e:
-                    logger.warning(f"Format-specific processing failed: {e}")
-                    # Continue to next method
+                    logger.warning(f"Error extracting PCM from buffer: {str(e)}. Buffer size: {len(self.chunk_buffer)}")
                     
-            # 2. If no header or header processing failed, try WebM/Matroska (most common from browsers)
-            if pcm_array is None:
-                try:
-                    logger.debug("Trying WebM/Matroska format fallback")
-                    pcm_array = await self._run_ffmpeg_conversion_internal_async(process_data, ['-f', 'webm'])
-                    if pcm_array is None:
-                        # Try alternate format
-                        pcm_array = await self._run_ffmpeg_conversion_internal_async(process_data, ['-f', 'matroska'])
-                except Exception as e:
-                    logger.warning(f"WebM/Matroska fallback failed: {e}")
-                    # Continue to next method
-                
-            # 3. Try auto-detection as last resort
-            if pcm_array is None and self.ffmpeg_available:
-                try:
-                    logger.debug("Trying FFmpeg auto-detection")
-                    pcm_array = await self._run_ffmpeg_conversion_internal_async(process_data, [])
-                except Exception as e:
-                    logger.warning(f"FFmpeg auto-detection failed: {e}")
-                    # Continue to final fallback
-                
-            # 4. Final fallback: raw PCM interpretation
-            if pcm_array is None:
-                try:
-                    logger.debug("Trying raw PCM interpretation")
-                    pcm_array = self.extract_pcm_from_raw(process_data)
-                except Exception as e:
-                    logger.warning(f"Raw PCM interpretation failed: {e}")
-                    # All methods failed
-                
-            if pcm_array is not None:
-                logger.info(f"Successfully processed {len(process_data)} bytes -> {len(pcm_array)} samples")
-                if not self.stream_mode_active:
-                    logger.info("Activating stream mode for subsequent chunks")
-                    self.stream_mode_active = True
-                return pcm_array
+                    # If buffer is getting very large, it might be corrupted, so clear it
+                    if len(self.chunk_buffer) > 1024 * 1024: # 1MB limit
+                        logger.warning(f"Clearing large buffer of size {len(self.chunk_buffer)} bytes due to processing error")
+                        self.chunk_buffer.clear()
+                        self.last_processed_chunk_size = 0
+                    return None
             else:
-                logger.warning(f"All processing methods failed for {len(process_data)} bytes")
-                return None
+                # Direct processing mode (no buffering)
+                logger.debug(f"Direct PCM extraction from {len(audio_data)} bytes (no buffering)")
+                return await self._extract_pcm_from_format(audio_data)
                 
         except Exception as e:
-            logger.error(f"Critical error in extract_pcm_smart_async: {e}", exc_info=True)
-            # Return None but don't crash - this prevents WebSocket disconnect
+            logger.error(f"Critical error in extract_pcm_smart_async: {str(e)}", exc_info=True)
             return None
 
     def extract_pcm_smart(self, audio_bytes: bytes) -> Optional[np.ndarray]:
@@ -419,3 +361,83 @@ class AudioService:
         self.stream_mode_active = False
         self.is_available = False # Mark service as unavailable after cleanup
         logger.info("AudioService cleaned up.")
+
+    async def _extract_pcm_from_format(self, audio_data: bytes) -> Optional[np.ndarray]:
+        """
+        Extract PCM data from various audio formats, trying different approaches
+        
+        Args:
+            audio_data: Binary audio data
+            
+        Returns:
+            PCM data as numpy array or None if extraction fails
+        """
+        if not audio_data:
+            return None
+            
+        # Try different format approaches
+        pcm_array = None
+        
+        # 1. Check if we have a valid header
+        has_header = self._has_valid_header(audio_data)
+        
+        # Process based on detected format
+        if has_header:
+            is_webm = audio_data.startswith(b'\x1a\x45\xdf\xa3')
+            is_wav = audio_data.startswith(b'RIFF') and b'WAVE' in audio_data[:20]
+            is_ogg = audio_data.startswith(b'OggS')
+            
+            try:
+                logger.debug(f"Detected format: webm={is_webm}, wav={is_wav}, ogg={is_ogg}")
+                if is_webm:
+                    logger.debug("Processing WebM/Matroska container")
+                    pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_data, ['-f', 'matroska'])
+                elif is_wav:
+                    logger.debug("Processing WAV container")
+                    pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_data, ['-f', 'wav'])
+                elif is_ogg:
+                    logger.debug("Processing Ogg container")
+                    pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_data, ['-f', 'ogg'])
+            except Exception as e:
+                logger.warning(f"Format-specific processing failed: {e}")
+                # Continue to next method
+                
+        # 2. If no header or header processing failed, try WebM/Matroska (most common from browsers)
+        if pcm_array is None:
+            try:
+                logger.debug("Trying WebM/Matroska format fallback")
+                pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_data, ['-f', 'webm'])
+                if pcm_array is None:
+                    # Try alternate format
+                    pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_data, ['-f', 'matroska'])
+            except Exception as e:
+                logger.warning(f"WebM/Matroska fallback failed: {e}")
+                # Continue to next method
+            
+        # 3. Try auto-detection as last resort
+        if pcm_array is None and self.ffmpeg_available:
+            try:
+                logger.debug("Trying FFmpeg auto-detection")
+                pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_data, [])
+            except Exception as e:
+                logger.warning(f"FFmpeg auto-detection failed: {e}")
+                # Continue to final fallback
+            
+        # 4. Final fallback: raw PCM interpretation
+        if pcm_array is None:
+            try:
+                logger.debug("Trying raw PCM interpretation")
+                pcm_array = self.extract_pcm_from_raw(audio_data)
+            except Exception as e:
+                logger.warning(f"Raw PCM interpretation failed: {e}")
+                # All methods failed
+            
+        if pcm_array is not None:
+            logger.info(f"Successfully processed {len(audio_data)} bytes -> {len(pcm_array)} samples")
+            if not self.stream_mode_active:
+                logger.info("Activating stream mode for subsequent chunks")
+                self.stream_mode_active = True
+            return pcm_array
+            
+        logger.warning(f"All processing methods failed for {len(audio_data)} bytes")
+        return None

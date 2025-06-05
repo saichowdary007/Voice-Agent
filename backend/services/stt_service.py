@@ -67,30 +67,28 @@ class STTService:
 
     async def process_frame(self, audio_frame: bytes) -> STTResult:
         """Process audio frame and return streaming STT result"""
+        if not self.is_available:
+            return STTResult(
+                partial_text="",
+                final_text="",
+                is_final=False,
+                confidence=0.0,
+                timestamp=0.0
+            )
+        
         try:
-            if not self.is_available:
-                return STTResult(
-                    partial_text="",
-                    final_text="",
-                    is_final=False,
-                    confidence=0.0,
-                    timestamp=self.total_audio_duration
-                )
-            
-            # Convert bytes to float32 audio
+            # Convert bytes to numpy array (mono 16-bit PCM)
             if isinstance(audio_frame, bytes):
-                audio_data = np.frombuffer(audio_frame, dtype=np.int16)
+                audio_samples = np.frombuffer(audio_frame, dtype=np.int16).astype(np.float32) / 32768.0
             else:
-                audio_data = audio_frame
+                audio_samples = audio_frame
                 
-            # Normalize to float32 [-1, 1]
-            audio_float = audio_data.astype(np.float32) / 32768.0
+            # Add to audio buffer
+            self.audio_buffer.extend(audio_samples.tolist())
             
-            # Add to buffer
-            self.audio_buffer.extend(audio_float)
+            # Wait for enough audio before processing
+            min_samples = int(self.sample_rate * 0.03)  # 30ms
             
-            # Process if we have enough samples (30ms minimum)
-            min_samples = self.sample_rate * 30 // 1000
             if len(self.audio_buffer) >= min_samples:
                 # Extract audio chunk
                 audio_chunk = np.array(self.audio_buffer)
@@ -99,7 +97,15 @@ class STTService:
                 # Feed audio to recognizer (sherpa-ncnn 2.1.11 API)
                 def process_audio():
                     logger.debug(f"STT:process_audio: About to call accept_waveform. Audio chunk shape: {audio_chunk.shape}, dtype: {audio_chunk.dtype}")
-                    self.recognizer.accept_waveform(self.sample_rate, audio_chunk)
+                    
+                    # Ensure audio data is 1D before sending to recognizer
+                    if len(audio_chunk.shape) > 1:
+                        logger.warning(f"Audio chunk has {len(audio_chunk.shape)} dimensions, flattening to 1D")
+                        audio_chunk_1d = audio_chunk.flatten()
+                    else:
+                        audio_chunk_1d = audio_chunk
+                        
+                    self.recognizer.accept_waveform(self.sample_rate, audio_chunk_1d)
                     logger.debug("STT:process_audio: accept_waveform completed. About to get text.")
                     text_result = self.recognizer.text.strip()
                     logger.debug(f"STT:process_audio: Got text: '{text_result}'")
@@ -129,7 +135,7 @@ class STTService:
                 )
                 
         except Exception as e:
-            logger.error(f"STT processing error: {e}")
+            logger.error(f"STT processing error: {e}", exc_info=True)
             return STTResult(
                 partial_text="",
                 final_text="",

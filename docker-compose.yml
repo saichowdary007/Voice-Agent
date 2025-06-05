@@ -10,6 +10,13 @@ services:
       - MODEL_PATH=/app/models
       - HOST=0.0.0.0
       - PORT=8003
+      # WebSocket timeout configuration
+      - APP_WATCHDOG_INACTIVITY_TIMEOUT=120
+      - APP_WATCHDOG_CHECK_INTERVAL=5
+      - APP_AUDIO_CONVERSION_TIMEOUT=20
+      - APP_AUDIO_PROCESSING_TIMEOUT=15
+      - APP_AI_RESPONSE_TIMEOUT=60
+      - APP_MESSAGE_SEND_TIMEOUT=10
     env_file:
       - ./backend/.env
     volumes:
@@ -18,6 +25,12 @@ services:
     restart: unless-stopped
     networks:
       - voice-agent-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   frontend:
     build:
@@ -26,11 +39,19 @@ services:
       args:
         - NEXT_PUBLIC_WS_URL=ws://localhost:8003/ws
         - NEXT_PUBLIC_API_URL=http://localhost:8003
+        - NEXT_PUBLIC_WS_RECONNECT_MAX_ATTEMPTS=5
+        - NEXT_PUBLIC_WS_RECONNECT_BASE_DELAY=1000
+        - NEXT_PUBLIC_WS_PING_INTERVAL=15000
+        - NEXT_PUBLIC_WS_SERVER_TIMEOUT=60000
     ports:
       - "3000:3000"
     environment:
       - NEXT_PUBLIC_WS_URL=ws://localhost:8003/ws
       - NEXT_PUBLIC_API_URL=http://localhost:8003
+      - NEXT_PUBLIC_WS_RECONNECT_MAX_ATTEMPTS=5
+      - NEXT_PUBLIC_WS_RECONNECT_BASE_DELAY=1000
+      - NEXT_PUBLIC_WS_PING_INTERVAL=15000
+      - NEXT_PUBLIC_WS_SERVER_TIMEOUT=60000
     restart: unless-stopped
     networks:
       - voice-agent-network

@@ -19,10 +19,18 @@ COPY . .
 # Accept build arguments for environment variables
 ARG NEXT_PUBLIC_WS_URL
 ARG NEXT_PUBLIC_API_URL
+ARG NEXT_PUBLIC_WS_RECONNECT_MAX_ATTEMPTS=5
+ARG NEXT_PUBLIC_WS_RECONNECT_BASE_DELAY=1000
+ARG NEXT_PUBLIC_WS_PING_INTERVAL=15000
+ARG NEXT_PUBLIC_WS_SERVER_TIMEOUT=60000
 
 # Set environment variables for build
 ENV NEXT_PUBLIC_WS_URL=$NEXT_PUBLIC_WS_URL
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_WS_RECONNECT_MAX_ATTEMPTS=$NEXT_PUBLIC_WS_RECONNECT_MAX_ATTEMPTS
+ENV NEXT_PUBLIC_WS_RECONNECT_BASE_DELAY=$NEXT_PUBLIC_WS_RECONNECT_BASE_DELAY
+ENV NEXT_PUBLIC_WS_PING_INTERVAL=$NEXT_PUBLIC_WS_PING_INTERVAL
+ENV NEXT_PUBLIC_WS_SERVER_TIMEOUT=$NEXT_PUBLIC_WS_SERVER_TIMEOUT
 
 # Next.js collects completely anonymous telemetry data about general usage.
 # Learn more here: https://nextjs.org/telemetry
@@ -39,10 +47,19 @@ ENV NODE_ENV production
 # Uncomment the following line in case you want to disable telemetry during runtime.
 ENV NEXT_TELEMETRY_DISABLED 1
 
+# Include WebSocket configuration at runtime as well
+ENV NEXT_PUBLIC_WS_RECONNECT_MAX_ATTEMPTS=5
+ENV NEXT_PUBLIC_WS_RECONNECT_BASE_DELAY=1000
+ENV NEXT_PUBLIC_WS_PING_INTERVAL=15000
+ENV NEXT_PUBLIC_WS_SERVER_TIMEOUT=60000
+
 RUN addgroup --system --gid 1001 nodejs
 RUN adduser --system --uid 1001 nextjs
 
 COPY --from=builder /app/public ./public
+
+# Create the public directory if it doesn't exist
+RUN mkdir -p ./public
 
 # Set the correct permission for prerender cache
 RUN mkdir .next

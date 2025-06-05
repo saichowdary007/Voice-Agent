@@ -380,7 +380,27 @@ async function handleWebSocketMessage(data: any) {
       setSession(prev => ({ ...prev, isSpeaking: true }));
       break;
     case 'audio_chunk':
-      if (data.audio_data) await playTTSAudio(data.audio_data);
+      if (data.audio_data) {
+        let audioBuffer;
+        if (data.encoding === 'base64') {
+          // Decode base64 audio data
+          try {
+            const binaryString = atob(data.audio_data);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+              bytes[i] = binaryString.charCodeAt(i);
+            }
+            audioBuffer = bytes.buffer;
+          } catch (error) {
+            console.error('Error decoding base64 audio data:', error);
+            break;
+          }
+        } else {
+          // Assume it's already binary data (old format)
+          audioBuffer = data.audio_data;
+        }
+        await playTTSAudio(audioBuffer);
+      }
       break;
     case 'tts_complete':
       setSession(prev => ({ ...prev, isSpeaking: false }));

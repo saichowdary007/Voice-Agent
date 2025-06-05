@@ -103,10 +103,12 @@ class WebSocketHandler:
 
             # Add timeout and better error handling for audio conversion
             try:
+                self.session_logger.info(f"Converting audio chunk of {len(audio_data)} bytes using AudioService")
                 pcm_data = await asyncio.wait_for(
                     self._convert_audio_via_service(audio_data), 
                     timeout=settings.audio_conversion_timeout  # Use configured timeout
                 )
+                self.session_logger.info(f"Audio conversion completed, received {len(pcm_data) if pcm_data else 0} bytes of PCM data")
             except asyncio.TimeoutError:
                 self.session_logger.warning(f"Audio conversion timed out for chunk of {len(audio_data)} bytes")
                 # Don't send error to client for individual chunk failures
@@ -127,6 +129,7 @@ class WebSocketHandler:
 
             # Add to buffer with error handling
             try:
+                self.session_logger.debug(f"Extending audio buffer with {len(pcm_data)} bytes of PCM data")
                 self.audio_buffer.extend(pcm_data)
             except Exception as e:
                 self.session_logger.error(f"Error extending audio buffer: {e}", exc_info=True)
@@ -134,7 +137,9 @@ class WebSocketHandler:
 
             # Process audio with timeout and error recovery
             try:
+                self.session_logger.debug(f"Processing audio buffer of size {len(self.audio_buffer)} bytes")
                 await asyncio.wait_for(self._process_audio_buffer(), timeout=settings.audio_processing_timeout)
+                self.session_logger.debug(f"Audio buffer processing completed successfully")
             except asyncio.TimeoutError:
                 self.session_logger.warning("Audio buffer processing timed out")
                 # Clear buffer to prevent backlog
@@ -354,10 +359,13 @@ class WebSocketHandler:
                     self.session_logger.info("TTS streaming interrupted")
                     break
                     
-                # Send audio chunk to client
+                # Send audio chunk to client - use base64 encoding for binary data
+                import base64
+                audio_base64 = base64.b64encode(audio_chunk).decode('utf-8')
                 await self._send_message({
                     "type": "audio_chunk",
-                    "audio_data": audio_chunk
+                    "audio_data": audio_base64,
+                    "encoding": "base64"
                 })
                 
             # TTS complete
@@ -630,6 +638,9 @@ class WebSocketHandler:
             self.tts_active = True
             await self._send_message({"type": "tts_start"})
             
+            # Import base64 for encoding audio data
+            import base64
+            
             # Generate TTS audio
             async for audio_chunk in tts_service.generate_audio_stream(text):
                 if self.should_interrupt_tts:
@@ -637,9 +648,12 @@ class WebSocketHandler:
                     break
                     
                 if audio_chunk:
+                    # Encode binary audio data as base64 string
+                    audio_base64 = base64.b64encode(audio_chunk).decode('utf-8')
                     await self._send_message({
                         "type": "audio_chunk",
-                        "audio_data": audio_chunk
+                        "audio_data": audio_base64,
+                        "encoding": "base64"
                     })
             
             if not self.should_interrupt_tts:
