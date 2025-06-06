@@ -33,6 +33,13 @@ class LLMService:
         try:
             # Check for valid API key (exclude common placeholders)
             invalid_keys = ["test_key_for_demo", "your-google-api-key-here", "", None]
+            
+            # Check if we should use mock service
+            if (not self.api_key or self.api_key in invalid_keys) and os.getenv("ENABLE_MOCK_SERVICES", "false").lower() == "true":
+                logger.info("Using mock LLM responses (GOOGLE_API_KEY not set or invalid, but ENABLE_MOCK_SERVICES=true)")
+                self.is_available = True
+                return
+                
             if not self.api_key or self.api_key in invalid_keys:
                 logger.warning("No valid Gemini API key provided, using mock responses")
                 logger.info("To enable Gemini LLM: Get API key from https://aistudio.google.com/apikey")
@@ -48,13 +55,15 @@ class LLMService:
             
             await asyncio.to_thread(configure_genai)
             
-            # Create model with optimized settings for speed
+            # Create model with optimized settings for ultra-low latency
             generation_config = genai.types.GenerationConfig(
                 temperature=0.7,
-                top_p=0.8,
-                top_k=40,
-                max_output_tokens=1024,
+                top_p=0.9,  # Slightly higher for more diverse but still fast responses
+                top_k=20,   # Reduced for faster token selection
+                max_output_tokens=512,  # Reduced for faster generation
                 candidate_count=1,
+                # Enable streaming optimizations if available
+                stop_sequences=None,
             )
             
             safety_settings = {
@@ -70,7 +79,7 @@ class LLMService:
                     model_name=self.model_name,
                     generation_config=generation_config,
                     safety_settings=safety_settings,
-                    system_instruction="You are a helpful voice assistant. Respond naturally and conversationally. Keep responses concise and engaging for voice interaction. Avoid using markdown formatting or special characters that don't work well in speech."
+                    system_instruction="You are a helpful voice assistant. Respond naturally and conversationally. Keep responses concise and engaging for voice interaction. Avoid using markdown formatting or special characters that don't work well in speech. Prioritize speed and clarity."
                 )
             except TypeError:
                 # Fallback for older versions without system_instruction
@@ -481,4 +490,21 @@ class LLMService:
             logger.info("LLM service cleaned up")
             
         except Exception as e:
-            logger.error(f"LLM cleanup error: {e}") 
+            logger.error(f"LLM cleanup error: {e}")
+    
+    async def process_text(self, text: str) -> Optional[str]:
+        """
+        Process text input and return AI response
+        
+        Args:
+            text: Input text to process
+            
+        Returns:
+            AI response text or None if failed
+        """
+        try:
+            response = await self.generate_response(text)
+            return response if response else None
+        except Exception as e:
+            logger.error(f"Error processing text: {e}")
+            return None 

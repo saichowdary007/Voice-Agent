@@ -34,8 +34,20 @@ export class AudioPlayer {
       // Stop any currently playing audio
       this.stop();
 
+      // Check if audio data is valid
+      if (!audioData || audioData.byteLength === 0) {
+        console.warn('Empty audio data received, skipping playback');
+        return;
+      }
+
       // Decode audio data
-      const audioBuffer = await this.audioContext.decodeAudioData(audioData);
+      let audioBuffer;
+      try {
+        audioBuffer = await this.audioContext.decodeAudioData(audioData);
+      } catch (decodeError) {
+        console.error('Failed to decode audio data:', decodeError);
+        return;
+      }
       
       // Create source node
       this.currentSource = this.audioContext.createBufferSource();
@@ -53,7 +65,8 @@ export class AudioPlayer {
       this.isPlaying = true;
 
     } catch (error) {
-      console.error('Failed to play audio:', error);
+      const errorMessage = error && (error as any).message ? (error as any).message : 'Unknown error';
+      console.error('Failed to play audio:', errorMessage);
       this.isPlaying = false;
     }
   }

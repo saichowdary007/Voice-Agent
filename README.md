@@ -1,114 +1,146 @@
-# Voice Agent Testing and Monitoring Tools
+# Voice Agent
 
-This repository contains tools for testing, debugging, and monitoring the Voice Agent application. These tools are designed to help diagnose issues with WebSocket connections, WebM audio handling, and the various AI services.
+A real-time voice agent application with speech recognition, natural language processing, and speech synthesis capabilities.
 
-## Overview of Tools
+## Features
 
-### Testing Tools
+- **Real-time Voice Activity Detection (VAD)**: Silero VAD model for accurate speech detection
+- **Speech-to-Text (STT)**: Azure Speech Services for accurate transcription
+- **Natural Language Processing**: Google Gemini for intelligent responses
+- **Text-to-Speech (TTS)**: Fast and natural-sounding voice synthesis
+- **Real-time WebSocket Communication**: Bidirectional real-time communication
 
-1. **test_services.py**: Tests basic functionality of all services.
-   - Checks VAD, STT, LLM, TTS, and Audio services
-   - Provides summary of which services are working
+## Setup
 
-2. **test_individual_services.py**: Detailed test of each individual service.
-   - Tests each service with more specific diagnostics
-   - Provides detailed output about service behavior
+### Prerequisites
 
-3. **test_audio_processing.py**: Specific tests for audio processing.
-   - Tests WebM/Opus encoding/decoding
-   - Tests audio conversion functions
-
-### Debug Tools
-
-1. **debug_ffmpeg_conversion.py**: Debug FFmpeg conversion issues.
-   - Generate valid WebM/Opus files
-   - Extract and analyze WebM headers
-   - Test different conversion methods
-
-2. **fix_webm_header.py**: Utility to fix WebM header issues.
-   - Scan backend code for invalid WebM headers
-   - Suggest fixes with proper header formats
-   - Generate valid WebM headers in different code formats
-
-3. **generate_test_files.py**: Create test audio files.
-   - Generate various test files (tone, noise, etc.)
-   - Create corrupted files for testing error handling
-
-### Monitoring Tools
-
-1. **monitor_services.py**: Continuous monitoring of service health.
-   - Periodically checks all services
-   - Logs issues and maintains health history
-   - Provides service status dashboard
-
-## Setup and Usage
+- Python 3.8+
+- Node.js and npm
+- API keys for:
+  - Azure Speech Services
+  - Google Gemini API
 
 ### Environment Setup
 
-```bash
-# Set up a virtual environment
-python3 -m venv test_env
-source test_env/bin/activate  # On Windows: test_env\Scripts\activate
+1. Clone the repository:
+   ```
+   git clone <repository-url>
+   cd Voice\ Agent
+   ```
 
-# Install dependencies
-pip install websockets asyncio
+2. Set up Python virtual environment:
+   ```
+   python -m venv env
+   source env/bin/activate  # On Windows: env\Scripts\activate
+   ```
+
+3. Install Python dependencies:
+   ```
+   pip install -r requirements.txt
+   ```
+
+4. Install frontend dependencies:
+   ```
+   cd frontend
+   npm install
+   cd ..
+   ```
+
+5. Create `.env` file in the project root with your API keys:
+   ```
+   # Core settings
+   DEBUG=false
+   LOG_LEVEL=INFO
+
+   # Azure Speech-to-Text
+   AZURE_SPEECH_KEY=your_azure_speech_key
+   AZURE_SPEECH_REGION=eastus
+   AZURE_SPEECH_ENDPOINT=https://eastus.api.cognitive.microsoft.com/
+   AZURE_SPEECH_LANGUAGE=en-US
+
+   # Google Gemini LLM
+   GOOGLE_API_KEY=your_google_api_key
+   LLM_MODEL=gemini-1.0-pro
+
+   # Optional: Use mock services for testing
+   ENABLE_MOCK_SERVICES=false
+   ```
+
+## Running the Application
+
+### All-in-One Launcher
+
+The easiest way to run the application is using the provided launcher scripts:
+
+#### Local Development
+
+```bash
+# Use our local development script (recommended)
+./start_local.sh
+
+# Or use the original script
+./run_app.py
 ```
 
-### Basic Usage
+#### Docker Deployment
 
 ```bash
-# Run basic service tests
-python test_services.py
-
-# Run detailed service tests
-python test_individual_services.py --service all
-
-# Generate test audio files
-./generate_test_files.py
-
-# Run the monitoring service
-./monitor_services.py --interval 60  # Check every 60 seconds
+# Start with Docker Compose
+./start_docker.sh
 ```
 
-## Issues Identified and Fixes
+### Running Components Separately
 
-### WebM Header Issues
+If you prefer to run the components separately:
 
-The application was experiencing issues with WebM header processing:
+1. Start the backend server:
+   ```bash
+   # Using our helper script (recommended)
+   ./start_backend.sh
+   
+   # Or manually
+   PYTHONPATH=. python3 -m backend.app.main
+   ```
 
-1. **Problem**: Invalid EBML numbers in WebM header causing FFmpeg conversion errors
-   - **Fix**: Updated the WebM header generation code with valid header format extracted from a properly generated WebM file
+2. In a separate terminal, start the frontend:
+   ```bash
+   # Using our helper script (recommended)
+   ./start_frontend.sh
+   
+   # Or manually
+   cd frontend
+   npm run dev
+   ```
 
-2. **Problem**: Raw audio data length not being a multiple of the sample size
-   - **Fix**: Ensured proper padding of audio data and correct header structures
+3. Access the application at http://localhost:3000
 
-### VAD Service Issues
+## Verification
 
-Issues with Voice Activity Detection and EOS (End of Speech) handling:
+To verify that all services are working correctly, you can run the verification script:
 
-1. **Problem**: Inconsistent behavior with EOS signals
-   - **Fix**: Improved the VAD test with retries and fallback to audio testing
-   - **Fix**: Added force_finalize flag to EOS messages
+```
+cd backend
+PYTHONPATH=.. python verify_services.py
+```
 
-### STT Service Issues
+This will test each component (VAD, STT, LLM, TTS) individually and as an integrated system.
 
-Issues with Speech-to-Text service:
+## Architecture
 
-1. **Problem**: Partial transcript support not confirmed
-   - **Fix**: Enhanced testing with longer audio sequences
-   - **Fix**: Added specific checks for partial transcript detection
+The Voice Agent consists of several key components:
 
-## Monitoring
+- **Voice Activity Detection (VAD)**: Detects when speech is present in an audio stream
+- **Speech-to-Text (STT)**: Converts spoken words to text
+- **Language Model (LLM)**: Processes text input and generates intelligent responses
+- **Text-to-Speech (TTS)**: Converts text responses to spoken words
+- **WebSocket Manager**: Handles real-time communication between frontend and backend
 
-The monitoring system periodically checks all services and maintains a health history in `health_report.json`. Services are classified as:
+## Troubleshooting
 
-- ✅ **Working**: Service is responding correctly
-- ❌ **Failing**: Service is not responding or giving errors
-- ⚠️ **Error**: Error occurred during testing
+- **Missing API Keys**: If you don't provide valid API keys, the system will use mock services by setting `ENABLE_MOCK_SERVICES=true` in your `.env` file.
+- **Port Conflicts**: If port 8000 is already in use, modify the port in `backend/app/main.py`.
+- **Audio Issues**: Make sure your microphone is properly connected and permissions are granted in your browser.
 
-## Future Improvements
+## License
 
-1. Add email/Slack notifications for service issues
-2. Implement automatic recovery attempts for failing services
-3. Add more detailed performance metrics
-4. Create a web dashboard for service status visualization 
+This project is licensed under the MIT License - see the LICENSE file for details. 

@@ -1,4 +1,7 @@
 import os
+import json
+import tempfile
+import subprocess
 import asyncio
 from typing import Optional, AsyncGenerator
 import numpy as np
@@ -7,7 +10,7 @@ import ffmpeg
 import structlog
 
 # Import standardized configuration
-from app.config import settings
+from backend.app.config import settings
 
 logger = structlog.get_logger()
 

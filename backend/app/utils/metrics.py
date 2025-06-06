@@ -2,12 +2,22 @@ import os
 import time
 import psutil
 import threading
+import asyncio
 from typing import Dict, List, Any, Optional
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 import structlog
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
+
+
+@dataclass
+class MetricData:
+    """Individual metric data point"""
+    name: str
+    value: float
+    timestamp: float
+    tags: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -29,285 +39,177 @@ class CounterMetric:
 
 
 class MetricsCollector:
-    """Collects and manages performance metrics"""
+    """Simple metrics collector for performance monitoring"""
     
-    def __init__(self, max_history: int = 1000):
-        self.max_history = max_history
-        self.enabled = os.getenv('ENABLE_METRICS', 'true').lower() == 'true'
+    def __init__(self):
+        self.metrics: Dict[str, List[MetricData]] = {}
+        self.counters: Dict[str, int] = {}
+        self.gauges: Dict[str, float] = {}
+        self.start_time = time.time()
         
-        # Metric storage
-        self.latency_metrics: Dict[str, deque] = defaultdict(lambda: deque(maxlen=max_history))
-        self.counter_metrics: Dict[str, int] = defaultdict(int)
-        self.gauge_metrics: Dict[str, float] = defaultdict(float)
+        # Initialize basic metrics
+        self.counters.update({
+            "websocket_connections": 0,
+            "audio_frames_processed": 0,
+            "speech_sessions": 0,
+            "ai_requests": 0,
+            "tts_requests": 0,
+            "errors": 0
+        })
         
-        # Performance tracking
-        self.request_times: deque = deque(maxlen=max_history)
-        self.error_counts: Dict[str, int] = defaultdict(int)
+        self.gauges.update({
+            "active_sessions": 0,
+            "average_processing_time": 0.0,
+            "memory_usage_mb": 0.0
+        })
+    
+    def increment_counter(self, name: str, value: int = 1, tags: Dict[str, str] = None):
+        """Increment a counter metric"""
+        self.counters[name] = self.counters.get(name, 0) + value
         
-        # System metrics
-        self.system_metrics_interval = 30  # seconds
-        self.last_system_check = 0
-        self.system_stats = {}
+        # Store detailed metric
+        metric = MetricData(
+            name=name,
+            value=value,
+            timestamp=time.time(),
+            tags=tags or {}
+        )
         
-        # Thread safety
-        self.lock = threading.Lock()
+        if name not in self.metrics:
+            self.metrics[name] = []
         
-    def record_latency(self, operation: str, latency: float, metadata: Dict[str, Any] = None):
-        """Record latency measurement"""
-        if not self.enabled:
-            return
-            
-        with self.lock:
-            metric = LatencyMetric(
-                operation=operation,
-                value=latency,
-                timestamp=time.time(),
-                metadata=metadata or {}
-            )
-            
-            self.latency_metrics[operation].append(metric)
-            
-        logger.debug(f"Recorded latency: {operation} = {latency:.3f}ms")
+        self.metrics[name].append(metric)
         
-    def increment_counter(self, name: str, labels: Dict[str, str] = None):
-        """Increment counter metric"""
-        if not self.enabled:
-            return
-            
-        with self.lock:
-            key = self._make_counter_key(name, labels)
-            self.counter_metrics[key] += 1
-            
-    def set_gauge(self, name: str, value: float, labels: Dict[str, str] = None):
-        """Set gauge metric value"""
-        if not self.enabled:
-            return
-            
-        with self.lock:
-            key = self._make_counter_key(name, labels)
-            self.gauge_metrics[key] = value
-            
-    def record_request_time(self, duration: float):
-        """Record HTTP request duration"""
-        if not self.enabled:
-            return
-            
-        with self.lock:
-            self.request_times.append({
-                'duration': duration,
-                'timestamp': time.time()
-            })
-            
-    def record_error(self, error_type: str):
-        """Record error occurrence"""
-        if not self.enabled:
-            return
-            
-        with self.lock:
-            self.error_counts[error_type] += 1
-            
-    def get_latency_stats(self, operation: str) -> Dict[str, float]:
-        """Get latency statistics for operation"""
-        if not self.enabled or operation not in self.latency_metrics:
-            return {}
-            
-        with self.lock:
-            metrics = list(self.latency_metrics[operation])
-            
-        if not metrics:
-            return {}
-            
-        values = [m.value for m in metrics]
+        # Keep only last 1000 entries per metric
+        if len(self.metrics[name]) > 1000:
+            self.metrics[name] = self.metrics[name][-1000:]
+    
+    def set_gauge(self, name: str, value: float, tags: Dict[str, str] = None):
+        """Set a gauge metric value"""
+        self.gauges[name] = value
+        
+        # Store detailed metric
+        metric = MetricData(
+            name=name,
+            value=value,
+            timestamp=time.time(),
+            tags=tags or {}
+        )
+        
+        if name not in self.metrics:
+            self.metrics[name] = []
+        
+        self.metrics[name].append(metric)
+        
+        # Keep only last 100 entries for gauges
+        if len(self.metrics[name]) > 100:
+            self.metrics[name] = self.metrics[name][-100:]
+    
+    def record_latency(self, name: str, duration: float, tags: Dict[str, str] = None):
+        """Record a latency measurement"""
+        metric_name = f"{name}_latency"
+        
+        metric = MetricData(
+            name=metric_name,
+            value=duration,
+            timestamp=time.time(),
+            tags=tags or {}
+        )
+        
+        if metric_name not in self.metrics:
+            self.metrics[metric_name] = []
+        
+        self.metrics[metric_name].append(metric)
+        
+        # Keep only last 500 latency measurements
+        if len(self.metrics[metric_name]) > 500:
+            self.metrics[metric_name] = self.metrics[metric_name][-500:]
+    
+    def get_counter(self, name: str) -> int:
+        """Get current counter value"""
+        return self.counters.get(name, 0)
+    
+    def get_gauge(self, name: str) -> float:
+        """Get current gauge value"""
+        return self.gauges.get(name, 0.0)
+    
+    def get_average_latency(self, name: str, window_seconds: int = 60) -> float:
+        """Get average latency for a metric over a time window"""
+        metric_name = f"{name}_latency"
+        
+        if metric_name not in self.metrics:
+            return 0.0
+        
+        cutoff_time = time.time() - window_seconds
+        recent_metrics = [
+            m for m in self.metrics[metric_name] 
+            if m.timestamp >= cutoff_time
+        ]
+        
+        if not recent_metrics:
+            return 0.0
+        
+        return sum(m.value for m in recent_metrics) / len(recent_metrics)
+    
+    async def get_metrics(self) -> Dict[str, Any]:
+        """Get all current metrics"""
+        uptime = time.time() - self.start_time
+        
+        # Calculate some derived metrics
+        total_requests = (
+            self.get_counter("ai_requests") + 
+            self.get_counter("tts_requests")
+        )
+        
+        requests_per_second = total_requests / uptime if uptime > 0 else 0
         
         return {
-            'count': len(values),
-            'min': min(values),
-            'max': max(values),
-            'mean': sum(values) / len(values),
-            'p50': self._percentile(values, 50),
-            'p95': self._percentile(values, 95),
-            'p99': self._percentile(values, 99),
-            'latest': values[-1] if values else 0
+            "timestamp": time.time(),
+            "uptime_seconds": uptime,
+            "counters": self.counters.copy(),
+            "gauges": self.gauges.copy(),
+            "derived": {
+                "requests_per_second": round(requests_per_second, 2),
+                "error_rate": (
+                    self.get_counter("errors") / max(total_requests, 1)
+                ) * 100,
+                "average_latencies": {
+                    "audio_processing": self.get_average_latency("audio_processing"),
+                    "ai_response": self.get_average_latency("ai_response"),
+                    "tts_generation": self.get_average_latency("tts_generation")
+                }
+            }
         }
-        
-    def get_system_metrics(self) -> Dict[str, Any]:
-        """Get current system metrics"""
-        current_time = time.time()
-        
-        # Update system metrics if needed
-        if current_time - self.last_system_check > self.system_metrics_interval:
-            self._update_system_metrics()
-            self.last_system_check = current_time
-            
-        return self.system_stats.copy()
-        
+    
     def get_memory_usage(self) -> float:
         """Get current memory usage in MB"""
         try:
             process = psutil.Process()
-            return process.memory_info().rss / 1024 / 1024
-        except Exception:
+            memory_mb = process.memory_info().rss / 1024 / 1024
+            self.set_gauge("memory_usage_mb", memory_mb)
+            return memory_mb
+        except ImportError:
+            logger.warning("psutil not available, cannot measure memory usage")
             return 0.0
-            
-    def get_all_metrics(self) -> Dict[str, Any]:
-        """Get all collected metrics"""
-        if not self.enabled:
-            return {}
-            
-        # Get key latency metrics
-        key_operations = [
-            'end_to_end_latency',
-            'stt_processing',
-            'tts_generation',
-            'ai_response',
-            'websocket_round_trip'
-        ]
-        
-        latency_stats = {}
-        for op in key_operations:
-            stats = self.get_latency_stats(op)
-            if stats:
-                latency_stats[op] = stats
-                
-        # Get counter metrics
-        with self.lock:
-            counters = dict(self.counter_metrics)
-            gauges = dict(self.gauge_metrics)
-            
-        # Get system metrics
-        system_metrics = self.get_system_metrics()
-        
-        # Calculate error rates
-        error_rates = {}
-        total_requests = sum(counters.get(k, 0) for k in counters if 'request' in k)
-        if total_requests > 0:
-            for error_type, count in self.error_counts.items():
-                error_rates[error_type] = (count / total_requests) * 100
-                
-        return {
-            'latency': latency_stats,
-            'counters': counters,
-            'gauges': gauges,
-            'system': system_metrics,
-            'error_rates': error_rates,
-            'timestamp': time.time()
-        }
-        
-    def _update_system_metrics(self):
-        """Update system performance metrics"""
-        try:
-            # CPU usage
-            cpu_percent = psutil.cpu_percent(interval=0.1)
-            
-            # Memory usage
-            memory = psutil.virtual_memory()
-            
-            # Process-specific metrics
-            process = psutil.Process()
-            process_memory = process.memory_info()
-            
-            # Disk usage
-            disk = psutil.disk_usage('/')
-            
-            # Network I/O
-            network = psutil.net_io_counters()
-            
-            self.system_stats = {
-                'cpu_percent': cpu_percent,
-                'memory_total_gb': memory.total / (1024**3),
-                'memory_used_gb': memory.used / (1024**3),
-                'memory_percent': memory.percent,
-                'process_memory_mb': process_memory.rss / (1024**2),
-                'process_cpu_percent': process.cpu_percent(),
-                'disk_used_gb': disk.used / (1024**3),
-                'disk_free_gb': disk.free / (1024**3),
-                'disk_percent': (disk.used / disk.total) * 100,
-                'network_bytes_sent': network.bytes_sent,
-                'network_bytes_recv': network.bytes_recv,
-                'timestamp': time.time()
-            }
-            
         except Exception as e:
-            logger.error(f"Failed to update system metrics: {e}")
-            
-    def _make_counter_key(self, name: str, labels: Dict[str, str] = None) -> str:
-        """Create key for counter with labels"""
-        if not labels:
-            return name
-            
-        label_str = ','.join(f"{k}={v}" for k, v in sorted(labels.items()))
-        return f"{name}[{label_str}]"
-        
-    def _percentile(self, values: List[float], percentile: float) -> float:
-        """Calculate percentile of values"""
-        if not values:
+            logger.error(f"Error measuring memory usage: {e}")
             return 0.0
-            
-        sorted_values = sorted(values)
-        index = int((percentile / 100) * len(sorted_values))
-        index = min(index, len(sorted_values) - 1)
-        return sorted_values[index]
-        
+    
     def reset_metrics(self):
-        """Reset all collected metrics"""
-        with self.lock:
-            self.latency_metrics.clear()
-            self.counter_metrics.clear()
-            self.gauge_metrics.clear()
-            self.request_times.clear()
-            self.error_counts.clear()
-            
+        """Reset all metrics"""
+        self.metrics.clear()
+        self.counters.clear()
+        self.gauges.clear()
+        self.start_time = time.time()
+        
         logger.info("Metrics reset")
-        
-    def export_prometheus_format(self) -> str:
-        """Export metrics in Prometheus format"""
-        if not self.enabled:
-            return ""
-            
-        lines = []
-        timestamp = int(time.time() * 1000)
-        
-        # Export latency metrics
-        for operation, metrics in self.latency_metrics.items():
-            if metrics:
-                stats = self.get_latency_stats(operation)
-                for stat_name, value in stats.items():
-                    metric_name = f"voice_agent_latency_{stat_name}"
-                    lines.append(f'{metric_name}{{operation="{operation}"}} {value} {timestamp}')
-                    
-        # Export counters
-        with self.lock:
-            for name, value in self.counter_metrics.items():
-                metric_name = f"voice_agent_counter_{name.replace('[', '_').replace(']', '').replace('=', '_').replace(',', '_')}"
-                lines.append(f'{metric_name} {value} {timestamp}')
-                
-        # Export gauges
-        with self.lock:
-            for name, value in self.gauge_metrics.items():
-                metric_name = f"voice_agent_gauge_{name.replace('[', '_').replace(']', '').replace('=', '_').replace(',', '_')}"
-                lines.append(f'{metric_name} {value} {timestamp}')
-                
-        # Export system metrics
-        system_metrics = self.get_system_metrics()
-        for name, value in system_metrics.items():
-            if isinstance(value, (int, float)) and name != 'timestamp':
-                metric_name = f"voice_agent_system_{name}"
-                lines.append(f'{metric_name} {value} {timestamp}')
-                
-        return '\n'.join(lines)
-
-    def cleanup(self):
-        """Clean up resources used by the metrics collector"""
-        logger.info("Cleaning up metrics collector...")
-        with self.lock:
-            # Clear all metrics
-            self.latency_metrics.clear()
-            self.counter_metrics.clear()
-            self.gauge_metrics.clear()
-            self.request_times.clear()
-            self.error_counts.clear()
-            self.system_stats.clear()
-        logger.info("Metrics collector cleaned up successfully")
+    
+    async def cleanup(self):
+        """Cleanup metrics collector"""
+        logger.info("Cleaning up metrics collector")
+        self.metrics.clear()
+        self.counters.clear()
+        self.gauges.clear()
 
 
 class PerformanceMonitor:

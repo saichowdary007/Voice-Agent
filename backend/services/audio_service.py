@@ -7,9 +7,13 @@ import opuslib # Ensure this is installed: pip install opuslib
 import soundfile as sf # Ensure this is installed: pip install soundfile
 import subprocess
 import shutil # For shutil.which
+import os
+import time
+import tempfile
+from dataclasses import dataclass
 
 # Import for app config, using absolute path for Docker compatibility
-from app.config import settings, get_sample_rate, get_channels
+from backend.app.config import settings, get_sample_rate, get_channels
 
 # Use standard Python logging for services, or pass structlog logger if standardized
 logger = logging.getLogger(__name__)

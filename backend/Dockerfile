@@ -65,6 +65,10 @@ RUN mkdir -p /app/static
 # Download models during build (if download script exists)
 RUN if [ -f "app/models/download_models.py" ]; then python app/models/download_models.py; fi
 
+# Copy the entrypoint script and make it executable
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app_user && \
     chown -R app_user:app_user /app && \
@@ -83,5 +87,8 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 # Install gunicorn for more stable process management
 RUN pip install --no-cache-dir gunicorn uvicorn
 
+# Set the entrypoint
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+
 # Start the application with improved settings for WebSocket stability
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8003", "--lifespan", "on", "--log-level", "info", "--timeout-keep-alive", "120", "--timeout-graceful-shutdown", "30", "--ws-ping-interval", "15", "--ws-ping-timeout", "60"] 
+CMD ["python", "-m", "uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8003", "--lifespan", "on", "--log-level", "info", "--timeout-keep-alive", "120", "--timeout-graceful-shutdown", "30", "--ws-ping-interval", "15", "--ws-ping-timeout", "60"] 

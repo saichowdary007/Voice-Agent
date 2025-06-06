@@ -69,6 +69,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
   const [latency, setLatency] = useState<number>(0);
   const [isUserSpeaking, setIsUserSpeaking] = useState(false); // For client-side VAD indication
 
+  // Update the WebSocket URL to match the backend port and use environment variable
   const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8003/ws';
 
   // Add a ref to track sessionEnded state without causing re-renders
@@ -96,14 +97,29 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       keepAliveIntervalRef.current = null;
     }
 
+    const cleanupPromises = [];
+
+    // Clean up VAD - make this awaitable
     if (vadRef.current && typeof (vadRef.current as any).destroy === 'function') {
-      try { (vadRef.current as any).destroy(); } catch (e) { console.warn('Error destroying VAD:', e); }
+      try {
+        const vadCleanup = (vadRef.current as any).destroy();
+        if (vadCleanup instanceof Promise) {
+          cleanupPromises.push(vadCleanup.catch(e => {
+            console.warn('Error destroying VAD:', e && (e as any).message ? (e as any).message : 'Unknown error');
+          }));
+        }
+      } catch (e) {
+        console.warn('Error initiating VAD destroy:', e && (e as any).message ? (e as any).message : 'Unknown error');
+      }
     }
     vadRef.current = null;
 
     const mr = mediaRecorderRef.current;
     if (mr && mr.state !== 'inactive') {
-      try { mr.stop(); } catch (e) { console.warn('Error stopping MediaRecorder during cleanup:', e); }
+      try { mr.stop(); } catch (e) { 
+        const errorMessage = e && (e as any).message ? (e as any).message : 'Unknown error';
+        console.warn('Error stopping MediaRecorder during cleanup:', errorMessage); 
+      }
     }
     mediaRecorderRef.current = null;
 
@@ -157,10 +173,13 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
 
     console.log('Session state reset.');
 
-    setTimeout(() => {
-      isCleaningUpRef.current = false;
-      console.log('Cleanup flag reset, ready for new session.');
-    }, 500);
+    // Wait for any cleanup promises to resolve before completing
+    Promise.all(cleanupPromises).finally(() => {
+      setTimeout(() => {
+        isCleaningUpRef.current = false;
+        console.log('Cleanup flag reset, ready for new session.');
+      }, 500);
+    });
   }
 
   const flushAudioQueue = useCallback(() => {
@@ -198,483 +217,381 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       // Close any existing connection first
       if (wsRef.current) {
         console.log('ConnectWebSocket: Closing existing connection before creating new one');
-        try {
-          wsRef.current.close();
-        } catch (e) {
-          console.error('Error closing existing WebSocket:', e);
-        }
+        wsRef.current.close();
         wsRef.current = null;
       }
 
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
-      lastServerMessageTimeRef.current = Date.now();
-
-      // Set a connection timeout
-      const connectionTimeoutId = setTimeout(() => {
-        if (ws.readyState !== WebSocket.OPEN) {
-          console.error('WebSocket connection timeout');
-          ws.close();
-        }
-      }, 10000); // 10 second timeout for initial connection
 
       ws.onopen = () => {
-        clearTimeout(connectionTimeoutId);
-        console.log('✅ WebSocket connected successfully');
-        console.log('Setting session state: isConnected=true, sessionEnded=false');
-        
-        // Reset reconnection state on successful connection
+        console.log('WebSocket connected successfully');
+        setSession(prev => ({ 
+          ...prev, 
+          isConnected: true, 
+          isReconnecting: false 
+        }));
         reconnectAttemptsRef.current = 0;
-        if (reconnectTimeoutRef.current) {
-          clearTimeout(reconnectTimeoutRef.current);
-          reconnectTimeoutRef.current = null;
-        }
-        
-        setSession(prev => ({ ...prev, isConnected: true, sessionEnded: false, isReconnecting: false }));
         lastServerMessageTimeRef.current = Date.now();
         
-        // Flush any queued audio after successful reconnection
-        flushAudioQueue();
+        // Enable diagnostic mode
+        sendDiagnosticMode();
         
-        if (keepAliveIntervalRef.current) clearInterval(keepAliveIntervalRef.current);
+        // Start keep-alive mechanism
+        if (keepAliveIntervalRef.current) {
+          clearInterval(keepAliveIntervalRef.current);
+        }
         keepAliveIntervalRef.current = setInterval(() => {
-          if (wsRef.current?.readyState === WebSocket.OPEN) {
-            const now = Date.now();
-            if (now - lastServerMessageTimeRef.current > 60000) { // Increased from 30s to 60s
-              console.warn('No server message for over 60 seconds. Closing connection due to timeout.');
-              wsRef.current.close(1000, "Keep-alive timeout"); 
-            } else {
-              wsRef.current.send(JSON.stringify({ type: "ping", timestamp: now }));
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
+            
+            // Check if we haven't received a message in too long
+            const timeSinceLastMessage = Date.now() - lastServerMessageTimeRef.current;
+            if (timeSinceLastMessage > 30000) { // 30 seconds
+              console.warn('No server message received in 30 seconds, connection may be stale');
+              // Optionally trigger reconnection here
             }
-          } else {
-            console.log("Keep-alive: WebSocket not open, clearing interval.");
-            if(keepAliveIntervalRef.current) clearInterval(keepAliveIntervalRef.current);
           }
-        }, 15000);
+        }, 10000); // Send ping every 10 seconds
+
+        // Flush any queued audio
+        flushAudioQueue();
       };
 
       ws.onmessage = async (event) => {
         lastServerMessageTimeRef.current = Date.now();
-        setSession(prev => ({ ...prev, isReconnecting: false }));
-        try {
-          let data = JSON.parse(event.data as string);
-
-          // ---- Back‑compat shim: older backend packets lack a `type` field ----
-          if (!('type' in data) && 'status' in data) {
-            // Treat legacy `{status:"processing"}`‑style payloads as modern `status` packets
-            data = { type: 'status', ...data };
+        
+        if (typeof event.data === 'string') {
+          try {
+            const data = JSON.parse(event.data);
+            await handleWebSocketMessage(data);
+          } catch (error) {
+            console.error('Error parsing WebSocket message:', error);
           }
-          if (!data || typeof data !== 'object') {
-            console.error('Invalid message format - not an object:', data);
-            return;
-          }
-          if (!('type' in data)) {
-            console.error('Message missing type field even after shim:', data);
-            return;
-          }
-          await handleWebSocketMessage(data);
-        } catch (e) {
-          console.error('Failed to parse WebSocket message:', e, 'Raw data:', event.data);
         }
       };
 
-      ws.onclose = (event: CloseEvent) => {
-        clearTimeout(connectionTimeoutId);
-        console.log(`❌ WebSocket disconnected. Code: ${event.code}, Reason: ${event.reason}`);
+      ws.onerror = (error) => {
+        // Add defensive error handling for potentially undefined error objects
+        const errorMessage = error && (error as any).message ? (error as any).message : 'Unknown WebSocket error';
+        console.error('WebSocket error:', errorMessage);
+        setSession(prev => ({ ...prev, isConnected: false }));
+        if (onError) {
+          onError(`Connection failed: ${errorMessage}`);
+        }
+      };
+
+      ws.onclose = (event) => {
+        const code = event.code || 0;
+        const reason = event.reason || 'No reason provided';
+        console.log(`WebSocket closed: code=${code}, reason=${reason}`);
         setSession(prev => ({ 
           ...prev, 
           isConnected: false, 
-          isRecording: false, 
-          isProcessing: false, 
-          isSpeaking: false, // AI speaking
-          // Do not set sessionEnded here to allow reconnection
+          isRecording: false,
+          isProcessing: false 
         }));
         
+        // Clear keep-alive
         if (keepAliveIntervalRef.current) {
           clearInterval(keepAliveIntervalRef.current);
           keepAliveIntervalRef.current = null;
         }
 
-        // Handle reconnection for unexpected disconnections
-        if (event.code !== 1000 && !sessionEndedRef.current) { // Use ref to avoid dependency issues
-          console.warn(`WebSocket closed unexpectedly. Code: ${event.code}. Reason: ${event.reason}`);
-          
-          // Check if we should attempt reconnection
-          if (reconnectAttemptsRef.current < maxReconnectAttempts) {
-            const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 10000); // Exponential backoff, max 10s
-            reconnectAttemptsRef.current += 1;
-            
-            console.log(`Attempting reconnection ${reconnectAttemptsRef.current}/${maxReconnectAttempts} in ${delay}ms`);
-            setSession(prev => ({ ...prev, isReconnecting: true }));
-
-            reconnectTimeoutRef.current = setTimeout(() => {
-              console.log(`Reconnection attempt ${reconnectAttemptsRef.current}`);
-              connectWebSocket();
-            }, delay);
-          } else {
-            console.error('Max reconnection attempts reached');
-            setSession(prev => ({ ...prev, isReconnecting: false, sessionEnded: true }));
-            onError?.(`Connection lost (Code: ${event.code}). Max retries reached. Please start a new session.`);
-          }
-        } else if (event.code !== 1000) {
-          // If normal closure, don't show error, just end session
-          onError?.(`Connection lost (Code: ${event.code}). Please try again.`);
-        }
-      };
-
-      ws.onerror = (errorEvent) => {
-        clearTimeout(connectionTimeoutId);
-        const error = errorEvent instanceof ErrorEvent ? errorEvent.message : 'Unknown WebSocket error';
-        console.error(`❌ WebSocket error connecting to ${wsUrl}:`, error, errorEvent);
-        
-        // Only show error if not in reconnection mode
-        if (!session.isReconnecting) {
-          // Delay error reporting to prevent immediate re-renders that might cause unmounting
-          setTimeout(() => {
-            onError?.('WebSocket connection failed. Please check your connection and the server.');
-          }, 100);
+        // Attempt reconnection if not a normal closure and not cleaning up
+        if (code !== 1000 && !isCleaningUpRef.current && !sessionEndedRef.current) {
+          attemptReconnection();
         }
       };
 
     } catch (error) {
-      console.error(`❌ Failed to initiate WebSocket connection to ${wsUrl}:`, error);
-      // Only show error if not in reconnection mode
-      if (!session.isReconnecting) {
-        onError?.('Failed to connect to the voice service.');
+      console.error('Error creating WebSocket connection:', error);
+      setSession(prev => ({ ...prev, isConnected: false }));
+      if (onError) {
+        onError(`Connection failed: ${error}`);
       }
     }
-  }, [wsUrl, onError, flushAudioQueue, session.isReconnecting]);
+  }, [wsUrl, onError, flushAudioQueue]);
 
-async function handleWebSocketMessage(data: any) {
-  console.log('📨 Received WebSocket message:', data.type, data);
-  
-  switch (data.type) {
-    case 'status':
-      setSession(prev => ({ 
-        ...prev, 
-        sessionId: data.session_id, 
-        isProcessing: data.status === 'processing',
-        // Set connected if we receive a status message with ready: true (initial connection)
-        isConnected: data.ready === true ? true : prev.isConnected
-      }));
-      if (data.config) console.log('Received backend config:', data.config);
-      if (data.status === 'processing') setTranscript(prev => ({ ...prev, partial: '', aiResponse: '' }));
-      break;
-    case 'transcript':
-      if (data.partial) setTranscript(prev => ({ ...prev, partial: data.partial }));
-      if (data.final) {
-        setTranscript(prev => ({ ...prev, final: [...prev.final, data.final], partial: '' }));
-        setSession(prev => ({ ...prev, isProcessing: true }));
-      }
-      break;
-    case 'ai_response':
-      if (data.complete) {
-        setTranscript(prev => ({ ...prev, isAiResponding: false }));
-        setSession(prev => ({ ...prev, isProcessing: false }));
-      } else if (data.token) {
-        setTranscript(prev => ({ ...prev, aiResponse: prev.aiResponse + data.token, isAiResponding: true }));
-      }
-      break;
-    case 'tts_start':
-      setSession(prev => ({ ...prev, isSpeaking: true }));
-      break;
-    case 'audio_chunk':
-      if (data.audio_data) {
-        let audioBuffer;
-        if (data.encoding === 'base64') {
-          // Decode base64 audio data
-          try {
-            const binaryString = atob(data.audio_data);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-              bytes[i] = binaryString.charCodeAt(i);
-            }
-            audioBuffer = bytes.buffer;
-          } catch (error) {
-            console.error('Error decoding base64 audio data:', error);
-            break;
-          }
-        } else {
-          // Assume it's already binary data (old format)
-          audioBuffer = data.audio_data;
+  const attemptReconnection = useCallback(() => {
+    if (reconnectAttemptsRef.current >= maxReconnectAttempts || isCleaningUpRef.current || sessionEndedRef.current) {
+      console.log('Max reconnection attempts reached or cleanup in progress');
+      return;
+    }
+
+    reconnectAttemptsRef.current++;
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current - 1), 10000); // Exponential backoff, max 10s
+    
+    console.log(`Attempting reconnection ${reconnectAttemptsRef.current}/${maxReconnectAttempts} in ${delay}ms`);
+    setSession(prev => ({ ...prev, isReconnecting: true }));
+
+    reconnectTimeoutRef.current = setTimeout(() => {
+      connectWebSocket();
+    }, delay);
+  }, [connectWebSocket]);
+
+  async function handleWebSocketMessage(data: any) {
+    switch (data.type) {
+      case 'transcript':
+        if (data.partial) {
+          setTranscript(prev => ({ ...prev, partial: data.text || '' }));
+        } else if (data.final) {
+          setTranscript(prev => ({
+            ...prev,
+            final: [...prev.final, data.text || data.final],
+            partial: ''
+          }));
         }
-        await playTTSAudio(audioBuffer);
-      }
-      break;
-    case 'tts_complete':
-      setSession(prev => ({ ...prev, isSpeaking: false }));
-      break;
-    case 'stop_audio':
-      console.log('Received stop_audio from backend');
-      if (ttsAudioPlayerRef.current) {
-        ttsAudioPlayerRef.current.stop();
-      }
-      setSession(prev => ({ ...prev, isSpeaking: false }));
-      break;
-    case 'mute_status':
-      setSession(prev => ({ ...prev, isMuted: data.muted }));
-      break;
-    case 'session_ended':
-      console.log('Received session_ended from backend.');
-      if (!isCleaningUpRef.current) handleEndSession(true);
-      break;
-    case 'pong':
-      lastServerMessageTimeRef.current = Date.now();
-      if (data.timestamp) {
-        const rtt = Date.now() - data.timestamp;
-        setLatency(rtt);
-        console.log(`Pong received with ${rtt}ms latency`);
-      } else {
-        console.log('Pong received from server (no timestamp).');
-      }
-      break;
-    case 'error':
-      console.error('Server error message:', data.message);
-      if (data.message?.includes('Audio processing failed')) {
-        console.warn('Backend audio processing error. Potential client‑side audio format issue or server‑side decoding problem.');
-      }
-      onError?.(data.message);
-      break;
-    default:
-      console.log('Unknown message type from server:', data.type, data);
-  }
-}
+        break;
 
-  const initializeAudio = useCallback(async () => {
-    if (isCleaningUpRef.current) {
-      console.log('InitializeAudio: Cleanup in progress, cannot initialize audio yet.');
-      return false; // Indicate failure or inability to init
+      case 'ai_response':
+        if (data.final) {
+          setTranscript(prev => ({ 
+            ...prev, 
+            aiResponse: data.text || '', 
+            isAiResponding: false 
+          }));
+          setSession(prev => ({ ...prev, isProcessing: false }));
+        } else {
+          // Streaming AI response
+          setTranscript(prev => ({ 
+            ...prev, 
+            aiResponse: prev.aiResponse + (data.text || ''), 
+            isAiResponding: true 
+          }));
+        }
+        break;
+
+      case 'audio_chunk':
+        if (data.audio_data && ttsAudioPlayerRef.current) {
+          try {
+            // Validate base64 format before processing
+            if (!isValidBase64(data.audio_data)) {
+              console.warn('Received invalid base64 audio data, skipping playback');
+              break;
+            }
+            
+            // Decode base64 audio data
+            const audioData = atob(data.audio_data);
+            const audioArray = new Uint8Array(audioData.length);
+            for (let i = 0; i < audioData.length; i++) {
+              audioArray[i] = audioData.charCodeAt(i);
+            }
+            
+            // Play the audio chunk
+            await ttsAudioPlayerRef.current.playAudioData(audioArray.buffer);
+          } catch (error) {
+            console.error('Error playing audio chunk:', error);
+          }
+        }
+        break;
+
+      case 'tts_start':
+        setSession(prev => ({ ...prev, isSpeaking: true }));
+        break;
+
+      case 'tts_complete':
+        setSession(prev => ({ ...prev, isSpeaking: false }));
+        break;
+
+      case 'error':
+        const errorMessage = data.message || 'Unknown server error';
+        console.error('Server error:', errorMessage);
+        if (onError) {
+          onError(errorMessage);
+        }
+        setSession(prev => ({ ...prev, isProcessing: false }));
+        break;
+
+      case 'mute_status':
+        setSession(prev => ({ ...prev, isMuted: data.muted }));
+        break;
+
+      case 'pong':
+        // Keep-alive response received
+        break;
+
+      case 'status':
+        // Session status update from server
+        console.log('Session status:', data);
+        if (data.ready) {
+          console.log('Server confirmed session is ready');
+        }
+        break;
+
+      case 'control':
+        if (data.action === 'session_ended') {
+          console.log('Server confirmed session end');
+          handleEndSession(true);
+        }
+        break;
+
+      case 'vad_status':
+        // Handle VAD status updates
+        if (data.status === 'speech_started') {
+          setIsUserSpeaking(true);
+        } else if (data.status === 'speech_ended') {
+          setIsUserSpeaking(false);
+        }
+        break;
+
+      case 'config_response':
+        // Handle config response
+        console.log('Server configuration received:', data);
+        break;
+
+      case 'eos_ack':
+        // Handle end-of-stream acknowledgment
+        console.log('End of stream acknowledged by server');
+        break;
+
+      default:
+        console.log('Unknown message type:', data.type, data);
     }
-    if (streamRef.current || vadRef.current) {
-      console.log("InitializeAudio: Audio already initialized.");
-      return true; // Already initialized
+  }
+
+  const startRecording = useCallback(async () => {
+    if (!session.isConnected || session.isRecording || isCleaningUpRef.current) {
+      console.log('Cannot start recording: not connected, already recording, or cleaning up');
+      return;
     }
 
     try {
-      console.log('🎤 Starting microphone access request...');
+      console.log('Starting audio recording...');
       
-      // Check if getUserMedia is available
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error('getUserMedia not supported in this browser');
-      }
+      // Log audio format support to help diagnose issues
+      logAudioFormatSupport();
       
-      console.log('🔍 Checking available audio devices...');
-      try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const audioInputs = devices.filter(device => device.kind === 'audioinput');
-        console.log(`Found ${audioInputs.length} audio input devices:`, audioInputs.map(d => d.label || 'Unnamed device'));
-      } catch (e) {
-        console.warn('Could not enumerate devices:', e);
-      }
-
-      console.log('📋 Requesting microphone access with constraints...');
-      const constraints: MediaStreamConstraints = {
+      // Request microphone access
+      const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           sampleRate: 16000,
           channelCount: 1,
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true
-        },
-        video: false
-      };
-      console.log('Constraints:', constraints);
-      
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      streamRef.current = stream;
-      
-      const track = stream.getAudioTracks()[0];
-      if (!track) {
-        throw new Error('No audio track found in the stream');
-      }
-      
-      console.log('✅ Microphone access granted!');
-      console.log('Track settings:', track.getSettings());
-      console.log('Track capabilities:', track.getCapabilities());
-      console.log('Track state:', track.readyState);
-      console.log('Track enabled:', track.enabled);
-      console.log('Track muted:', track.muted);
-
-      const logFormatSupport = () => {
-        const testFormats = ['audio/webm;codecs=opus', 'audio/webm', 'audio/wav', 'audio/ogg;codecs=opus', 'audio/mp4', 'audio/mpeg'];
-        console.log('=== MediaRecorder Format Support ===');
-        testFormats.forEach(format => console.log(`${format}: ${MediaRecorder.isTypeSupported(format) ? '✅' : '❌'}`));
-        console.log('=====================================');
-      };
-      logFormatSupport();
-      
-      let mediaRecorder: MediaRecorder;
-      let preferredMimeType = '';
-      const formatTests = [
-        { mimeType: 'audio/webm;codecs=opus', description: 'WebM/Opus' },
-        { mimeType: 'audio/webm', description: 'WebM (generic)' },
-        { mimeType: 'audio/wav', description: 'WAV (less preferred for streaming)' },
-      ];
-      
-      let selectedFormatInfo = null;
-      for (const format of formatTests) {
-        if (MediaRecorder.isTypeSupported(format.mimeType)) {
-          selectedFormatInfo = format;
-          break;
+          autoGainControl: true,
         }
-      }
+      });
+
+      streamRef.current = stream;
+
+      // Create AudioContext for raw PCM processing
+      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({
+        sampleRate: 16000
+      });
+      audioContextRef.current = audioContext;
+
+      // Create audio source
+      const source = audioContext.createMediaStreamSource(stream);
+      sourceRef.current = source;
+
+      // Create ScriptProcessorNode for raw PCM extraction
+      const bufferSize = 4096; // Larger buffer for efficiency
+      const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
       
-      if (selectedFormatInfo) {
-        mediaRecorder = new MediaRecorder(stream, { mimeType: selectedFormatInfo.mimeType, audioBitsPerSecond: selectedFormatInfo.mimeType.includes('wav') ? 128000 : 32000 });
-        preferredMimeType = selectedFormatInfo.mimeType;
-        console.log(`MediaRecorder initialized with ${selectedFormatInfo.description}`);
-      } else {
-        mediaRecorder = new MediaRecorder(stream); // Fallback to browser default
-        preferredMimeType = mediaRecorder.mimeType || 'default/unknown';
-        console.warn(`No preferred format supported. MediaRecorder initialized with browser default: ${preferredMimeType}`);
-      }
-      mediaRecorderRef.current = mediaRecorder;
-
-      let audioChunks: Blob[] = [];
-      let bufferTimer: NodeJS.Timeout | null = null;
-      const BUFFER_TIMEOUT = 128; // 128ms (4 * 32ms backend frame)
-
-      const flushBuffer = () => {
-        if (isCleaningUpRef.current || wsRef.current?.readyState !== WebSocket.OPEN || audioChunks.length === 0) {
-          if(audioChunks.length > 0) console.log('FlushBuffer: Skipping send due to cleanup or WebSocket not open.');
-          audioChunks = []; // Clear chunks if not sending
+      processor.onaudioprocess = (event) => {
+        if (!session.isConnected || session.isMuted || isCleaningUpRef.current) {
           return;
         }
-        
-        const audioBlob = new Blob(audioChunks, { type: preferredMimeType });
-        audioChunks = []; // Clear chunks after creating blob
 
-        let minSize = 100; // Default minimum
-        if (preferredMimeType.includes('wav')) minSize = 200; 
-        if (preferredMimeType.includes('webm')) minSize = 150; 
+        const inputBuffer = event.inputBuffer;
+        const inputData = inputBuffer.getChannelData(0); // Get mono channel
         
-        if (audioBlob.size > minSize) {
-          audioBlob.arrayBuffer().then(buffer => {
-            console.log(`Sent audio chunk: ${buffer.byteLength} bytes, MIME: ${preferredMimeType}`);
-            if (wsRef.current?.readyState === WebSocket.OPEN) {
-              wsRef.current.send(buffer);
-            } else {
-              // Queue audio if not connected
-              console.log('WebSocket not open, queuing audio chunk');
-              audioQueueRef.current.push(audioBlob);
-              
-              // Limit queue size to prevent memory issues
-              if (audioQueueRef.current.length > 50) {
-                console.warn('Audio queue size limit reached, dropping oldest chunk');
-                audioQueueRef.current.shift();
-              }
-            }
-          }).catch(e => console.error('Error sending audio chunk:', e));
+        // Convert Float32Array to Int16Array (16-bit PCM)
+        const pcmData = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          // Convert from [-1, 1] to [-32768, 32767]
+          const sample = Math.max(-1, Math.min(1, inputData[i]));
+          pcmData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+        }
+
+        // Send raw PCM data directly
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          // Validate data before sending
+          if (pcmData.length > 0 && !isAllZeros(pcmData)) {
+            // Debug log on first few packets
+            if (audioSentCounterRef.current < 5) {
+              console.log(`Sending audio chunk #${audioSentCounterRef.current+1}: ${pcmData.length} samples, 16-bit PCM`);
+              audioSentCounterRef.current++;
+            } 
+            wsRef.current.send(pcmData.buffer);
+          } else {
+            console.warn('Skipping empty audio buffer');
+          }
         } else {
-          console.log(`Skipping small/empty audio chunk: ${audioBlob.size} bytes (min: ${minSize}), MIME: ${preferredMimeType}`);
-        }
-      };
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (isCleaningUpRef.current || event.data.size === 0) return;
-        console.log(`Audio chunk received: ${event.data.size} bytes`);
-        audioChunks.push(event.data);
-        if (bufferTimer) clearTimeout(bufferTimer);
-        bufferTimer = setTimeout(flushBuffer, BUFFER_TIMEOUT);
-      };
-
-      mediaRecorder.onstart = () => {
-        console.log('MediaRecorder started');
-        setSession(prev => ({ ...prev, isRecording: true }));
-      };
-
-      mediaRecorder.onstop = () => {
-        console.log('MediaRecorder stopped.');
-        if (bufferTimer) clearTimeout(bufferTimer);
-        flushBuffer(); // Send any remaining data
-        setSession(prev => ({ ...prev, isRecording: false }));
-        if (wsRef.current?.readyState === WebSocket.OPEN && !isCleaningUpRef.current) {
-            console.log('Sending EOS to backend.');
-            wsRef.current.send(JSON.stringify({ type: "eos" }));
-        }
-      };
-      
-      mediaRecorder.onerror = (event) => {
-        console.error('MediaRecorder error:', event);
-        onError?.(`MediaRecorder error: ${(event as any)?.error?.name || 'Unknown'}. Please check microphone and permissions.`);
-      };
-
-      if (vadRef.current) {
-        console.log('Destroying existing VAD instance before creating new one...');
-        if (typeof (vadRef.current as any).destroy === 'function') {
-          try { (vadRef.current as any).destroy(); } catch (e) { console.warn('Error destroying old VAD:', e); }
-        }
-        vadRef.current = null;
-      }
-      console.log('Initializing VAD...');
-      const newVad = await MicVAD.new({
-        stream: streamRef.current,
-        onSpeechStart: () => {
-          if (isCleaningUpRef.current) return;
-          console.log("VAD: User speech started");
-          setIsUserSpeaking(true);
-          const mr = mediaRecorderRef.current;
-          if (mr && mr.state === 'inactive') {
-            mr.start(); // Let ondataavailable handle chunking interval
+          if (audioQueueRef.current.length < 20) { // Limit queue size
+            const blob = new Blob([pcmData.buffer], { type: 'audio/raw' });
+            audioQueueRef.current.push(blob);
           }
-        },
-        onSpeechEnd: (audio: Float32Array) => { // audio is Float32Array from VAD
-          if (isCleaningUpRef.current) return;
-          console.log('VAD: User speech ended, VAD audio length:', audio?.length || 0);
-          setIsUserSpeaking(false);
-          const mr = mediaRecorderRef.current;
-          if (mr && mr.state === 'recording') {
-            console.log('VAD EOS: Stopping MediaRecorder');
-            mr.stop(); // This will trigger onstop and send EOS
-          }
-        },
-        minSpeechFrames: 3,
-        positiveSpeechThreshold: 0.7,
-        negativeSpeechThreshold: 0.35,
-        min_silence_frames: 8,
-        redemptionFrames: 25,
-        preSpeechPadFrames: 1,
-        onVADMisfire: () => console.warn('VAD: Misfire detected'),
-      } as any);
-      vadRef.current = newVad;
-      vadRef.current.start();
-      console.log('VAD initialized and started successfully');
-
-      const existingCtx = audioContextRef.current;
-      if (existingCtx && existingCtx.state !== 'closed') {
-        await existingCtx.close();
-      }
-      const newAudioContext = new AudioContext({ sampleRate: 16000 });
-      audioContextRef.current = newAudioContext;
-      const newSource = newAudioContext.createMediaStreamSource(stream);
-      sourceRef.current = newSource;
-      const analyser = newAudioContext.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.8;
-      newSource.connect(analyser);
-      const dataArray = new Uint8Array(analyser.frequencyBinCount);
-      const updateAudioLevel = () => {
-        const ctx = audioContextRef.current;
-        if (ctx && ctx.state !== 'closed' && analyser) {
-          analyser.getByteFrequencyData(dataArray);
-          const average = dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length;
-          setAudioLevel(Math.min(average / 255, 1.0));
-          requestAnimationFrame(updateAudioLevel);
         }
+
+        // Update audio level for UI
+        let sum = 0;
+        for (let i = 0; i < inputData.length; i++) {
+          sum += inputData[i] * inputData[i];
+        }
+        const rms = Math.sqrt(sum / inputData.length);
+        setAudioLevel(rms * 100);
       };
-      updateAudioLevel();
-      console.log('Audio initialization completed successfully');
-      return true;
+
+      // Connect the audio processing chain
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+
+      // Initialize VAD for client-side speech detection
+      try {
+        const vad = await MicVAD.new({
+          stream,
+          positiveSpeechThreshold: 0.8, // Increase threshold to reduce false positives (default is 0.5)
+          negativeSpeechThreshold: 0.3, // Set slightly lower negative threshold
+          minSpeechFrames: 8, // Require more frames to consider valid speech (default is 3)
+          redemptionFrames: 25, // Increase redemption frames to prevent quick cutoffs
+          onSpeechStart: () => {
+            console.log('VAD: Speech started');
+            setIsUserSpeaking(true);
+          },
+          onSpeechEnd: () => {
+            console.log('VAD: Speech ended');
+            setIsUserSpeaking(false);
+            // Send end-of-speech signal to backend
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({ type: 'eos' }));
+            }
+          },
+          onVADMisfire: () => {
+            console.log('VAD: Misfire detected');
+            setIsUserSpeaking(false);
+          },
+        });
+        vadRef.current = vad;
+        vad.start();
+      } catch (vadError) {
+        console.warn('VAD initialization failed:', vadError);
+        // Continue without VAD
+      }
+
+      // Initialize TTS audio player
+      if (!ttsAudioPlayerRef.current) {
+        ttsAudioPlayerRef.current = new AudioPlayer();
+      }
+
+      setSession(prev => ({ ...prev, isRecording: true }));
+      console.log('Recording started successfully');
+
     } catch (error) {
-      console.error('Failed to initialize audio:', error);
-      const err = error as Error;
-      if (err.name === 'NotAllowedError') onError?.('Microphone access denied. Please allow microphone access and refresh.');
-      else if (err.name === 'NotFoundError') onError?.('No microphone found. Please connect a microphone.');
-      else if (err.name ==='NotSupportedError') onError?.('Audio recording not supported by this browser.');
-      else onError?.(`Audio initialization failed: ${err.message}`);
-      return false;
+      console.error('Error starting recording:', error);
+      if (onError) {
+        onError(`Failed to start recording: ${error}`);
+      }
     }
-  }, [onError]); // Removed isCleaningUpRef from deps, it's a ref
+  }, [session.isConnected, session.isRecording, session.isMuted, onError]);
+
+  const initializeAudio = useCallback(async () => {
+    // This function is no longer needed as audio initialization
+    // is now handled directly in startRecording with raw PCM processing
+    console.log('initializeAudio called - now handled in startRecording');
+    return true;
+  }, []);
 
   const sendWebSocketMessage = useCallback((message: any) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -684,39 +601,10 @@ async function handleWebSocketMessage(data: any) {
     }
   }, []);
 
-  const playTTSAudio = useCallback(async (base64Audio: string) => {
-    if (isCleaningUpRef.current || !session.isConnected || session.isMuted) {
-      console.log("playTTSAudio: Skipped due to cleanup, disconnect, or mute.");
-      return;
-    }
-    try {
-      if (!ttsAudioPlayerRef.current) {
-        ttsAudioPlayerRef.current = new AudioPlayer();
-      }
-      const binaryString = atob(base64Audio);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
-      await ttsAudioPlayerRef.current.playAudioData(bytes.buffer);
-      console.log('TTS audio chunk finished playing via AudioPlayer.');
-    } catch (error) {
-      console.error('Failed to play TTS audio via AudioPlayer:', error);
-      try { // Fallback to HTML5 Audio for robustness
-        const audio = new Audio(`data:audio/wav;base64,${base64Audio}`);
-        await audio.play();
-        console.log('TTS audio played via HTML5 Audio fallback.');
-      } catch (fallbackError) {
-        console.error('Fallback HTML5 audio play failed:', fallbackError);
-        onError?.("Failed to play AI response audio.");
-      }
-    }
-  }, [session.isConnected, session.isMuted, onError]); // isCleaningUpRef is a ref
-
   const toggleMute = useCallback(() => {
     const newMutedState = !session.isMuted;
     setSession(prev => ({...prev, isMuted: newMutedState})); // Optimistic update
     sendWebSocketMessage({ type: 'mute', muted: newMutedState });
-    // VAD and MediaRecorder are managed by speech events, not directly by mute.
-    // Mute mainly affects TTS playback and can be a signal to backend.
   }, [session.isMuted, sendWebSocketMessage]);
 
   const endSession = useCallback(() => {
@@ -803,15 +691,16 @@ async function handleWebSocketMessage(data: any) {
   }, []); // Empty dependency array - only run on mount/unmount
 
   useEffect(() => {
-    // Attempt to initialize audio once connected and if not already initialized/cleaning up
-    if (session.isConnected && !streamRef.current && !vadRef.current && !isCleaningUpRef.current) {
-      console.log("🔊 useEffect: Connection active, attempting to initialize audio.");
-      initializeAudio().then(success => {
-        console.log(`🎯 Audio initialization ${success ? 'succeeded' : 'failed'}`);
+    // Attempt to start recording once connected and if not already recording/cleaning up
+    if (session.isConnected && !session.isRecording && !streamRef.current && !vadRef.current && !isCleaningUpRef.current) {
+      console.log("🔊 useEffect: Connection active, attempting to start recording.");
+      startRecording().then(() => {
+        console.log(`🎯 Recording started successfully`);
+      }).catch(error => {
+        console.error('Failed to start recording:', error);
       });
     }
-  }, [session.isConnected]); // Only depend on isConnected, remove initializeAudio to prevent re-creation
-
+  }, [session.isConnected, session.isRecording, startRecording]); // Depend on isConnected and isRecording
 
   // Get activity indicator based on multiple states
   const getActivityState = () => {
@@ -822,6 +711,75 @@ async function handleWebSocketMessage(data: any) {
     return 'idle';
   };
   const activityState = getActivityState();
+
+  // Helper function to validate base64 string
+  const isValidBase64 = (str: string): boolean => {
+    try {
+      return btoa(atob(str)) === str;
+    } catch (err) {
+      return false;
+    }
+  };
+
+  // Track number of audio packets sent for logging
+  const audioSentCounterRef = useRef(0);
+  
+  // Helper function to log audio format support
+  const logAudioFormatSupport = () => {
+    const formats = [
+      'audio/webm', 
+      'audio/webm;codecs=opus', 
+      'audio/ogg',
+      'audio/ogg;codecs=opus',
+      'audio/wav',
+      'audio/mp4',
+      'audio/mpeg'
+    ];
+    
+    console.log('=== Audio Format Support ===');
+    formats.forEach(format => {
+      let supported = false;
+      try {
+        supported = MediaRecorder.isTypeSupported(format);
+      } catch (e) {
+        console.error(`Error checking support for ${format}:`, e);
+      }
+      console.log(`${format}: ${supported ? '✅' : '❌'}`);
+    });
+    
+    // Log AudioContext information
+    try {
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      console.log(`AudioContext: sampleRate=${ctx.sampleRate}, state=${ctx.state}`);
+      ctx.close();
+    } catch (e) {
+      console.error('Error creating AudioContext:', e);
+    }
+  };
+  
+  // Helper function to check if array is all zeros
+  const isAllZeros = (arr: Int16Array): boolean => {
+    for (let i = 0; i < Math.min(arr.length, 100); i++) {
+      if (arr[i] !== 0) return false;
+    }
+    return true;
+  };
+
+  const sendDiagnosticMode = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      console.log('Enabling diagnostic mode...');
+      wsRef.current.send(JSON.stringify({ 
+        type: 'config', 
+        diagnostics: true,
+        verbose_logging: true,
+        client_info: {
+          userAgent: navigator.userAgent,
+          platform: navigator.platform,
+          sampleRate: audioContextRef.current?.sampleRate || 'unknown'
+        }
+      }));
+    }
+  }, []);
 
   return (
     <div className="h-screen w-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 flex flex-col">

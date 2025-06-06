@@ -24,9 +24,9 @@ class VADEngine:
     
     def __init__(self):
         self.sample_rate = int(os.getenv('SAMPLE_RATE', '16000'))
-        self.threshold = float(os.getenv('VAD_THRESHOLD', '0.6'))
-        self.min_speech_duration = 0.1  # 100ms minimum speech
-        self.min_silence_duration = 0.5  # 500ms minimum silence for end-of-speech
+        self.threshold = float(os.getenv('VAD_THRESHOLD', '0.75'))  # Increased from 0.6 to reduce false positives
+        self.min_speech_duration = 0.25  # Increased from 0.1s to 250ms minimum speech duration
+        self.min_silence_duration = 0.8  # Increased from 0.5s to 800ms for more stable speech end detection
         
         # Model and state
         self.model: Optional[torch.nn.Module] = None
@@ -42,7 +42,7 @@ class VADEngine:
         self.audio_buffer = []
         # Use 512 samples (32ms at 16kHz) to match the expected frame size
         self.buffer_size = 512  # Process in 512 sample chunks for 16kHz
-        logger.info(f"VAD Engine initialized with buffer size: {self.buffer_size}, sample rate: {self.sample_rate}")
+        logger.info(f"VAD Engine initialized with buffer size: {self.buffer_size}, sample rate: {self.sample_rate}, threshold: {self.threshold}")
         
     async def initialize(self):
         """Initialize Silero VAD model"""
