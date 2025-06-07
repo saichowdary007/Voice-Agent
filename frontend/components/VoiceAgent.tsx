@@ -66,7 +66,8 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
   const [audioLevel, setAudioLevel] = useState(0);
   const [latency, setLatency] = useState<number>(0);
   const [isUserSpeaking, setIsUserSpeaking] = useState(false); // For client-side VAD indication
-  const [selectedMimeType, setSelectedMimeType] = useState<string | null>(null);
+  const [selectedMimeType, setSelectedMimeType] = useState<string>('');
+  const [debugInfo, setDebugInfo] = useState<Record<string, any>>({});
 
   // Get WebSocket URL from environment variable
   const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8080/ws';
@@ -78,6 +79,42 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
   useEffect(() => {
     sessionEndedRef.current = session.sessionEnded;
   }, [session.sessionEnded]);
+
+  /**
+   * Log support for various audio formats and select the best one.
+   */
+  const logAudioFormatSupport = useCallback(() => {
+    const mimeTypes = [
+      'audio/webm; codecs=opus',
+      'audio/ogg; codecs=opus',
+      'audio/webm',
+      'audio/wav',
+    ];
+
+    const supportedMimeTypes = mimeTypes.filter(type => MediaRecorder.isTypeSupported(type));
+    
+    console.log('Audio Format Support:', supportedMimeTypes);
+
+    if (supportedMimeTypes.length > 0) {
+      // Prioritize WebM/Opus, then Ogg/Opus, then WebM, then WAV
+      const preferredOrder = ['audio/webm; codecs=opus', 'audio/ogg; codecs=opus', 'audio/webm', 'audio/wav'];
+      for (const type of preferredOrder) {
+        if (supportedMimeTypes.includes(type)) {
+          setSelectedMimeType(type);
+          console.log(`Selected MIME type: ${type}`);
+          return;
+        }
+      }
+    } else {
+      console.error('No supported audio formats found. Recording will not work.');
+      if(onError) onError('Your browser does not support the required audio formats for recording.');
+    }
+  }, [onError]);
+
+  // Log audio format support on component mount
+  useEffect(() => {
+    logAudioFormatSupport();
+  }, [logAudioFormatSupport]);
 
   /**
    * Centralized resource cleanup function that handles all cleanup tasks
@@ -605,43 +642,50 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       });
       streamRef.current = stream;
 
+      if (!selectedMimeType) {
+        console.error("Cannot start recording: no supported MIME type selected.");
+        if (onError) onError("Could not find a supported audio format for recording.");
+        return;
+      }
+
       const mediaRecorder = new MediaRecorder(stream, { mimeType: selectedMimeType });
       mediaRecorderRef.current = mediaRecorder;
 
-      mediaRecorder.ondataavailable = (event) => {
-        if (wsRef.current?.readyState !== WebSocket.OPEN) {
-            if(event.data.size > 0) audioQueueRef.current.push(event.data);
-            return;
-        }
-
-        // Perform format-specific validation
+      mediaRecorder.ondataavailable = async (event) => {
         if (event.data.size > 0) {
-            let minSize = 100; // General minimum size
-            if (selectedMimeType.includes('webm') && audioQueueRef.current.length === 0) {
-                minSize = 20; // WebM header can be small
-            } else if (selectedMimeType.includes('wav')) {
-                minSize = 44; // WAV header is at least 44 bytes
-            }
+          // Dynamic minimum size validation based on format
+          const minByteSize = selectedMimeType.includes('wav') ? 1000 : 100;
 
-            if (event.data.size < minSize) {
-                console.warn(`Skipping very small audio chunk (size: ${event.data.size}, format: ${selectedMimeType}).`);
-                return;
-            }
-            console.log(`Sending audio chunk: ${event.data.size} bytes, type: ${selectedMimeType}`);
+          if (event.data.size < minByteSize) {
+            console.warn(`Skipping small audio chunk (${event.data.size} bytes), likely silence or noise.`);
+            return;
+          }
+          
+          // Validate that the buffer is not all zeros
+          const buffer = await event.data.arrayBuffer();
+          const isAllZeros = new Uint8Array(buffer).every(byte => byte === 0);
+          if (isAllZeros) {
+            console.warn('Skipping audio chunk containing only zeros.');
+            return;
+          }
+
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             wsRef.current.send(event.data);
+          } else {
+            audioQueueRef.current.push(event.data);
+          }
         }
       };
       
       mediaRecorder.onstart = () => {
-          setSession(prev => ({ ...prev, isRecording: true }));
-          console.log('Recording started successfully');
+        console.log(`MediaRecorder started with ${selectedMimeType}`);
+        setSession(prev => ({ ...prev, isRecording: true }));
       };
 
       mediaRecorder.onerror = (event) => {
-          console.error('MediaRecorder error:', event);
-          const error = (event as any).error;
-          onError?.(`Recording error: ${error.name} - ${error.message}`);
-          handleEndSession(false);
+        console.error('MediaRecorder error:', event);
+        if (onError) onError(`MediaRecorder error: ${(event as any).error.message}`);
+        handleEndSession();
       };
       
       mediaRecorder.start(1000); // Send data every 1000ms
@@ -833,37 +877,6 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       return btoa(atob(str)) === str;
     } catch (err) {
       return false;
-    }
-  };
-  
-  const logAudioFormatSupport = () => {
-    const formats = [
-      'audio/webm', 
-      'audio/webm;codecs=opus', 
-      'audio/ogg',
-      'audio/ogg;codecs=opus',
-      'audio/wav',
-      'audio/mp4',
-      'audio/mpeg'
-    ];
-    
-    console.log('=== Browser Audio Format Support ===');
-    formats.forEach(format => {
-      let supported = false;
-      try {
-        supported = MediaRecorder.isTypeSupported(format);
-      } catch (e) {
-        console.error(`Error checking support for ${format}:`, e);
-      }
-      console.log(`${format}: ${supported ? '✅ Supported' : '❌ Not Supported'}`);
-    });
-    
-    try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      console.log(`AudioContext: sampleRate=${ctx.sampleRate}, state=${ctx.state}`);
-      ctx.close();
-    } catch (e) {
-      console.error('Error creating AudioContext:', e);
     }
   };
   

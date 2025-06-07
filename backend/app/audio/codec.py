@@ -4,6 +4,7 @@ import tempfile
 import subprocess
 import asyncio
 from typing import Optional, AsyncGenerator
+from enum import Enum
 import numpy as np
 import opuslib
 import ffmpeg
@@ -13,6 +14,47 @@ import structlog
 from backend.app.config import settings
 
 logger = structlog.get_logger()
+
+
+class AudioFormat(Enum):
+    """Enumeration for supported audio formats."""
+    WAV = "wav"
+    WEBM = "webm"
+    OGG = "ogg"
+    OPUS = "opus"
+    UNKNOWN = "unknown"
+
+def identify_format(data: bytes) -> AudioFormat:
+    """
+    Identifies the audio format based on magic bytes.
+    
+    Args:
+        data: The audio data in bytes.
+        
+    Returns:
+        The identified AudioFormat.
+    """
+    if len(data) < 12:
+        return AudioFormat.UNKNOWN
+        
+    # Check for WAV (RIFF header)
+    if data.startswith(b'RIFF') and data[8:12] == b'WAVE':
+        logger.debug("Identified audio format: WAV")
+        return AudioFormat.WAV
+        
+    # Check for WebM (EBML header)
+    if data.startswith(b'\x1aE\xdf\xa3'):
+        logger.debug("Identified audio format: WebM")
+        return AudioFormat.WEBM
+        
+    # Check for Ogg
+    if data.startswith(b'OggS'):
+        logger.debug("Identified audio format: Ogg")
+        return AudioFormat.OGG
+        
+    # Default to unknown
+    logger.debug("Could not identify audio format from magic bytes.")
+    return AudioFormat.UNKNOWN
 
 
 class OpusCodec:
@@ -123,25 +165,58 @@ class AudioConverter:
     """Audio format conversion utilities using FFmpeg"""
     
     @staticmethod
-    async def convert_to_wav(input_data: bytes, input_format: str = "opus") -> bytes:
-        """Convert audio data to WAV format"""
+    async def convert_to_wav(input_data: bytes, input_format: Optional[str] = None) -> bytes:
+        """
+        Convert audio data to WAV format with automatic format detection.
+        If input_format is not provided, it will be auto-detected.
+        """
+        detected_format = identify_format(input_data)
+        
+        # Use provided format if valid, otherwise use detected format
+        final_format = input_format if input_format and input_format != "auto" else detected_format.value
+
+        if final_format == AudioFormat.UNKNOWN.value:
+            raise ValueError("Could not determine input audio format for conversion.")
+            
+        logger.info(f"Converting audio from '{final_format}' to WAV.")
+
         try:
+            # For WebM/Ogg, ffmpeg needs a format hint.
+            # Opus is a raw codec, not a container, so we handle it separately.
+            if final_format in [AudioFormat.WEBM.value, AudioFormat.OGG.value]:
+                # These are container formats that ffmpeg can handle directly
+                ffmpeg_input_format = final_format
+            elif final_format == AudioFormat.OPUS.value:
+                # opus is a raw codec, not a container, 'libopus' is a decoder name
+                ffmpeg_input_format = 'opus'
+            else:
+                 # For WAV, no specific format hint is needed, but being explicit is good
+                ffmpeg_input_format = 'wav'
+
             process = (
                 ffmpeg
-                .input('pipe:', format=input_format)
-                .output('pipe:', format='wav', acodec='pcm_s16le', ar=16000, ac=1)
+                .input('pipe:', format=ffmpeg_input_format)
+                .output('pipe:', format='wav', acodec='pcm_s16le', ar=settings.sample_rate, ac=settings.channels)
                 .run_async(pipe_stdin=True, pipe_stdout=True, pipe_stderr=True)
             )
             
-            stdout, stderr = await asyncio.to_thread(process.communicate, input_data)
+            stdout, stderr = await asyncio.to_thread(process.communicate, input=input_data)
             
             if process.returncode != 0:
-                raise RuntimeError(f"FFmpeg error: {stderr.decode()}")
+                error_message = stderr.decode()
+                logger.error(f"FFmpeg error during {final_format} to WAV conversion: {error_message}")
+                # Provide more specific error messages
+                if "EBML header parsing failed" in error_message:
+                    raise RuntimeError("FFmpeg error: Invalid WebM header. The file may be corrupt or not a valid WebM file.")
+                if "Error opening input: End of file" in error_message:
+                    raise RuntimeError("FFmpeg error: End of file reached unexpectedly. The input data may be incomplete.")
+                raise RuntimeError(f"FFmpeg conversion failed with exit code {process.returncode}")
                 
+            logger.info(f"Successfully converted {len(input_data)} bytes of {final_format} to {len(stdout)} bytes of WAV.")
             return stdout
             
         except Exception as e:
-            logger.error(f"Audio conversion error: {e}")
+            logger.error(f"Audio conversion failed for format '{final_format}': {e}")
             raise
             
     @staticmethod
