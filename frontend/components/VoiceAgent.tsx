@@ -81,25 +81,33 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
   }, [session.sessionEnded]);
 
   /**
-   * Ends the current voice session and performs a full cleanup.
-   * A regular (hoisted) function prevents "used before declaration" errors.
+   * Centralized resource cleanup function that handles all cleanup tasks
+   * Returns a promise that resolves when all cleanup is complete
    */
-  function handleEndSession(backendInitiated = false) {
+  async function cleanupResources() {
     if (isCleaningUpRef.current) {
-      console.log('handleEndSession: Cleanup already in progress, skipping.');
+      console.log('Resource cleanup already in progress, skipping duplicate call.');
+      // Return existing cleanup promise if one exists
       return;
     }
+    
     isCleaningUpRef.current = true;
-    console.log(`Cleaning up session... Backend initiated: ${backendInitiated}`);
+    console.log('Starting comprehensive resource cleanup...');
+    
+    const cleanupPromises = [];
 
+    // Clear all timeouts and intervals first to prevent race conditions
     if (keepAliveIntervalRef.current) {
       clearInterval(keepAliveIntervalRef.current);
       keepAliveIntervalRef.current = null;
     }
+    
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
 
-    const cleanupPromises = [];
-
-    // Clean up VAD - make this awaitable
+    // Clean up VAD with proper promise handling
     if (vadRef.current && typeof (vadRef.current as any).destroy === 'function') {
       try {
         const vadCleanup = (vadRef.current as any).destroy();
@@ -114,221 +122,356 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
     }
     vadRef.current = null;
 
+    // MediaRecorder cleanup with error handling
     const mr = mediaRecorderRef.current;
     if (mr && mr.state !== 'inactive') {
-      try { mr.stop(); } catch (e) { 
+      try { 
+        mr.stop(); 
+      } catch (e) { 
         const errorMessage = e && (e as any).message ? (e as any).message : 'Unknown error';
         console.warn('Error stopping MediaRecorder during cleanup:', errorMessage); 
       }
     }
     mediaRecorderRef.current = null;
 
+    // Media stream cleanup
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
+      try {
+        streamRef.current.getTracks().forEach(track => {
+          try {
+            track.stop();
+          } catch (e) {
+            console.warn('Error stopping media track:', e);
+          }
+        });
+      } catch (e) {
+        console.warn('Error cleaning up media stream:', e);
+      }
       streamRef.current = null;
     }
 
+    // Audio source cleanup
     if (sourceRef.current) {
-      sourceRef.current.disconnect();
+      try {
+        sourceRef.current.disconnect();
+      } catch (e) {
+        console.warn('Error disconnecting audio source:', e);
+      }
       sourceRef.current = null;
     }
 
+    // Audio worklet node cleanup
     if (pcmPlayerNodeRef.current) {
-      pcmPlayerNodeRef.current.disconnect();
+      try {
+        pcmPlayerNodeRef.current.disconnect();
+      } catch (e) {
+        console.warn('Error disconnecting audio worklet node:', e);
+      }
       pcmPlayerNodeRef.current = null;
     }
 
+    // AudioContext cleanup with proper promise handling
     const ctx = audioContextRef.current;
     if (ctx && ctx.state !== 'closed') {
-      ctx.close().catch(e => console.warn('Error closing AudioContext:', e));
+      try {
+        const ctxCleanup = ctx.close();
+        cleanupPromises.push(ctxCleanup.catch(e => {
+          console.warn('Error closing AudioContext:', e);
+        }));
+      } catch (e) {
+        console.warn('Error initiating AudioContext close:', e);
+      }
     }
     audioContextRef.current = null;
 
+    // TTS audio player cleanup
     if (ttsAudioPlayerRef.current) {
-      ttsAudioPlayerRef.current.dispose();
+      try {
+        ttsAudioPlayerRef.current.dispose();
+      } catch (e) {
+        console.warn('Error disposing TTS audio player:', e);
+      }
       ttsAudioPlayerRef.current = null;
     }
 
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      console.log('Closing WebSocket connection from handleEndSession…');
-      wsRef.current.close(1000, 'Session ended by client/cleanup');
+    // WebSocket cleanup last (after other resources)
+    if (wsRef.current) {
+      try {
+        if (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING) {
+          console.log('Closing WebSocket connection...');
+          wsRef.current.close(1000, 'Session ended by client/cleanup');
+        }
+      } catch (e) {
+        console.warn('Error closing WebSocket:', e);
+      }
+      wsRef.current = null;
     }
-    wsRef.current = null;
 
-    setSession(prev => ({
-      ...prev,
-      isConnected: false,
-      isRecording: false,
-      isMuted: false,
-      isProcessing: false,
-      isSpeaking: false,
-      sessionEnded: true,
-      isReconnecting: false,
-      sessionId: undefined,
-    }));
-    setTranscript({ partial: '', final: [], aiResponse: '', isAiResponding: false });
-    setAudioLevel(0);
-    setLatency(0);
-    setIsUserSpeaking(false);
+    // Reset all state
+    try {
+      setSession(prev => ({
+        ...prev,
+        isConnected: false,
+        isRecording: false,
+        isMuted: false,
+        isProcessing: false,
+        isSpeaking: false,
+        sessionEnded: true,
+        isReconnecting: false,
+        sessionId: undefined,
+      }));
+      setTranscript({ partial: '', final: [], aiResponse: '', isAiResponding: false });
+      setAudioLevel(0);
+      setLatency(0);
+      setIsUserSpeaking(false);
+      audioQueueRef.current = [];
+    } catch (e) {
+      console.warn('Error resetting state during cleanup:', e);
+    }
 
-    console.log('Session state reset.');
+    // Wait for all cleanup promises to resolve
+    try {
+      await Promise.all(cleanupPromises);
+      console.log('All async cleanup tasks completed successfully');
+    } catch (e) {
+      console.warn('Some async cleanup tasks failed:', e);
+    }
 
-    // Wait for any cleanup promises to resolve before completing
-    Promise.all(cleanupPromises).finally(() => {
-      setTimeout(() => {
-        isCleaningUpRef.current = false;
-        console.log('Cleanup flag reset, ready for new session.');
-      }, 500);
+    console.log('Resource cleanup completed');
+    
+    // Reset cleanup flag with a slight delay to prevent race conditions
+    setTimeout(() => {
+      isCleaningUpRef.current = false;
+      console.log('Cleanup flag reset, ready for new session');
+    }, 500);
+  }
+
+  /**
+   * Ends the current voice session and performs a full cleanup.
+   */
+  function handleEndSession(backendInitiated = false) {
+    console.log(`Ending session... Backend initiated: ${backendInitiated}`);
+    cleanupResources().catch(e => {
+      console.error('Error during session cleanup:', e);
+      // Reset cleanup flag in case of error
+      isCleaningUpRef.current = false;
     });
   }
 
+  // Improved flush audio queue with error handling
   const flushAudioQueue = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN && audioQueueRef.current.length > 0) {
       console.log(`Flushing ${audioQueueRef.current.length} queued audio chunks`);
       
-      audioQueueRef.current.forEach(audioBlob => {
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(audioBlob);
+      // Take a snapshot of the current queue and then clear it
+      const queueToSend = [...audioQueueRef.current];
+      audioQueueRef.current = [];
+      
+      // Send all chunks
+      queueToSend.forEach(audioBlob => {
+        try {
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(audioBlob);
+          }
+        } catch (e) {
+          console.warn('Error sending queued audio chunk:', e);
+          // Re-queue failed sends if WebSocket is still open
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            audioQueueRef.current.push(audioBlob);
+          }
         }
       });
-      
-      audioQueueRef.current = [];
     }
   }, []);
 
+  // Improved WebSocket connection with robust checks
   const connectWebSocket = useCallback(() => {
-    // Check if we should skip connection attempt
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      console.log('ConnectWebSocket: Already connected, skipping.');
-      return;
-    }
+    // Enhanced connection checks
     if (isCleaningUpRef.current) {
-      console.log('ConnectWebSocket: Cleanup in progress, skipping.');
-      return;
+      console.log('ConnectWebSocket: Cleanup in progress, skipping connection attempt');
+      return Promise.resolve(false);
     }
+    
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      console.log('ConnectWebSocket: Already connected, skipping');
+      return Promise.resolve(true);
+    }
+    
     if (wsRef.current?.readyState === WebSocket.CONNECTING) {
-      console.log('ConnectWebSocket: Connection already in progress, skipping.');
-      return;
+      console.log('ConnectWebSocket: Connection already in progress, skipping');
+      return Promise.resolve(false);
     }
 
     console.log(`ConnectWebSocket: Attempting to connect to ${wsUrl}...`);
 
-    try {
-      // Close any existing connection first
-      if (wsRef.current) {
-        console.log('ConnectWebSocket: Closing existing connection before creating new one');
-        wsRef.current.close();
-        wsRef.current = null;
-      }
-
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        console.log('WebSocket connected successfully');
-        setSession(prev => ({ 
-          ...prev, 
-          isConnected: true, 
-          isReconnecting: false 
-        }));
-        reconnectAttemptsRef.current = 0;
-        lastServerMessageTimeRef.current = Date.now();
-        
-        // Enable diagnostic mode
-        sendDiagnosticMode();
-        
-        // Start keep-alive mechanism
-        if (keepAliveIntervalRef.current) {
-          clearInterval(keepAliveIntervalRef.current);
+    return new Promise((resolve) => {
+      try {
+        // Close any existing connection first
+        if (wsRef.current) {
+          try {
+            console.log('ConnectWebSocket: Closing existing connection before creating new one');
+            wsRef.current.close();
+          } catch (e) {
+            console.warn('Error closing existing WebSocket:', e);
+          }
+          wsRef.current = null;
         }
-        keepAliveIntervalRef.current = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
+
+        const ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
+
+        // Set connection timeout
+        const connectionTimeout = setTimeout(() => {
+          if (ws.readyState !== WebSocket.OPEN) {
+            console.warn('WebSocket connection timeout');
+            try {
+              ws.close();
+            } catch (e) {
+              console.warn('Error closing timed-out WebSocket:', e);
+            }
+            resolve(false);
+          }
+        }, 10000); // 10 second connection timeout
+
+        ws.onopen = () => {
+          clearTimeout(connectionTimeout);
+          console.log('WebSocket connected successfully');
+          setSession(prev => ({ 
+            ...prev, 
+            isConnected: true, 
+            isReconnecting: false 
+          }));
+          reconnectAttemptsRef.current = 0;
+          lastServerMessageTimeRef.current = Date.now();
+          
+          // Enable diagnostic mode
+          sendDiagnosticMode();
+          
+          // Start keep-alive mechanism with watchdog capability
+          if (keepAliveIntervalRef.current) {
+            clearInterval(keepAliveIntervalRef.current);
+          }
+          
+          keepAliveIntervalRef.current = setInterval(() => {
+            if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+              console.warn('Keep-alive interval running but WebSocket is not open');
+              clearInterval(keepAliveIntervalRef.current);
+              keepAliveIntervalRef.current = null;
+              return;
+            }
             
-            // Check if we haven't received a message in too long
-            const timeSinceLastMessage = Date.now() - lastServerMessageTimeRef.current;
-            if (timeSinceLastMessage > 30000) { // 30 seconds
-              console.warn('No server message received in 30 seconds, connection may be stale');
-              // Optionally trigger reconnection here
+            try {
+              wsRef.current.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
+              
+              // Check if we haven't received a message in too long
+              const timeSinceLastMessage = Date.now() - lastServerMessageTimeRef.current;
+              const serverTimeout = parseInt(process.env.NEXT_PUBLIC_WS_SERVER_TIMEOUT || '60000', 10);
+              
+              if (timeSinceLastMessage > serverTimeout) {
+                console.warn(`No server message received in ${serverTimeout/1000} seconds, connection may be stale`);
+                // Close the stale connection which will trigger reconnection
+                wsRef.current.close(4000, 'Server response timeout');
+              }
+            } catch (e) {
+              console.warn('Error in keep-alive mechanism:', e);
+            }
+          }, parseInt(process.env.NEXT_PUBLIC_WS_PING_INTERVAL || '10000', 10)); // Configurable ping interval
+
+          // Flush any queued audio
+          flushAudioQueue();
+          resolve(true);
+        };
+
+        ws.onmessage = async (event) => {
+          lastServerMessageTimeRef.current = Date.now();
+          
+          if (typeof event.data === 'string') {
+            try {
+              const data = JSON.parse(event.data);
+              await handleWebSocketMessage(data);
+            } catch (error) {
+              console.error('Error parsing WebSocket message:', error);
             }
           }
-        }, 10000); // Send ping every 10 seconds
+        };
 
-        // Flush any queued audio
-        flushAudioQueue();
-      };
-
-      ws.onmessage = async (event) => {
-        lastServerMessageTimeRef.current = Date.now();
-        
-        if (typeof event.data === 'string') {
-          try {
-            const data = JSON.parse(event.data);
-            await handleWebSocketMessage(data);
-          } catch (error) {
-            console.error('Error parsing WebSocket message:', error);
+        ws.onerror = (error) => {
+          clearTimeout(connectionTimeout);
+          // Add defensive error handling for potentially undefined error objects
+          const errorMessage = error && (error as any).message ? (error as any).message : 'Unknown WebSocket error';
+          console.error('WebSocket error:', errorMessage);
+          setSession(prev => ({ ...prev, isConnected: false }));
+          if (onError) {
+            onError(`Connection failed: ${errorMessage}`);
           }
-        }
-      };
+          resolve(false);
+        };
 
-      ws.onerror = (error) => {
-        // Add defensive error handling for potentially undefined error objects
-        const errorMessage = error && (error as any).message ? (error as any).message : 'Unknown WebSocket error';
-        console.error('WebSocket error:', errorMessage);
+        ws.onclose = (event) => {
+          clearTimeout(connectionTimeout);
+          const code = event.code || 0;
+          const reason = event.reason || 'No reason provided';
+          console.log(`WebSocket closed: code=${code}, reason=${reason}`);
+          setSession(prev => ({ 
+            ...prev, 
+            isConnected: false, 
+            isRecording: false,
+            isProcessing: false 
+          }));
+          
+          // Clear keep-alive
+          if (keepAliveIntervalRef.current) {
+            clearInterval(keepAliveIntervalRef.current);
+            keepAliveIntervalRef.current = null;
+          }
+
+          // Attempt reconnection if not a normal closure and not cleaning up
+          if (code !== 1000 && !isCleaningUpRef.current && !sessionEndedRef.current) {
+            attemptReconnection();
+          }
+          resolve(false);
+        };
+
+      } catch (error) {
+        console.error('Error creating WebSocket connection:', error);
         setSession(prev => ({ ...prev, isConnected: false }));
         if (onError) {
-          onError(`Connection failed: ${errorMessage}`);
+          onError(`Connection failed: ${error}`);
         }
-      };
-
-      ws.onclose = (event) => {
-        const code = event.code || 0;
-        const reason = event.reason || 'No reason provided';
-        console.log(`WebSocket closed: code=${code}, reason=${reason}`);
-        setSession(prev => ({ 
-          ...prev, 
-          isConnected: false, 
-          isRecording: false,
-          isProcessing: false 
-        }));
-        
-        // Clear keep-alive
-        if (keepAliveIntervalRef.current) {
-          clearInterval(keepAliveIntervalRef.current);
-          keepAliveIntervalRef.current = null;
-        }
-
-        // Attempt reconnection if not a normal closure and not cleaning up
-        if (code !== 1000 && !isCleaningUpRef.current && !sessionEndedRef.current) {
-          attemptReconnection();
-        }
-      };
-
-    } catch (error) {
-      console.error('Error creating WebSocket connection:', error);
-      setSession(prev => ({ ...prev, isConnected: false }));
-      if (onError) {
-        onError(`Connection failed: ${error}`);
+        resolve(false);
       }
-    }
+    });
   }, [wsUrl, onError, flushAudioQueue]);
 
+  // Improved reconnection with exponential backoff
   const attemptReconnection = useCallback(() => {
     if (reconnectAttemptsRef.current >= maxReconnectAttempts || isCleaningUpRef.current || sessionEndedRef.current) {
-      console.log('Max reconnection attempts reached or cleanup in progress');
+      console.log('Max reconnection attempts reached or cleanup in progress, giving up');
       return;
     }
 
+    // Clear any existing reconnection timeout
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+
     reconnectAttemptsRef.current++;
-    const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current - 1), 10000); // Exponential backoff, max 10s
+    const baseDelay = parseInt(process.env.NEXT_PUBLIC_WS_RECONNECT_BASE_DELAY || '1000', 10);
+    const delay = Math.min(baseDelay * Math.pow(2, reconnectAttemptsRef.current - 1), 30000); // Exponential backoff, max 30s
     
     console.log(`Attempting reconnection ${reconnectAttemptsRef.current}/${maxReconnectAttempts} in ${delay}ms`);
     setSession(prev => ({ ...prev, isReconnecting: true }));
 
     reconnectTimeoutRef.current = setTimeout(() => {
-      connectWebSocket();
+      connectWebSocket().then(success => {
+        if (!success && !isCleaningUpRef.current && !sessionEndedRef.current) {
+          // Schedule next reconnection attempt if this one failed
+          attemptReconnection();
+        }
+      });
     }, delay);
-  }, [connectWebSocket]);
+  }, [connectWebSocket, maxReconnectAttempts]);
 
   async function handleWebSocketMessage(data: any) {
     switch (data.type) {

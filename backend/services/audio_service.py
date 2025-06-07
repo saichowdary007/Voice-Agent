@@ -39,12 +39,29 @@ class AudioService:
         self.stream_mode_active: bool = False  # True after first successful decode
         self.last_processed_chunk_size: int = 0  # Track size of last successfully processed chunk
         
+        # Improved error handling for failed chunks
+        self.failed_chunks: List[bytes] = []
+        self.max_failed_chunks: int = settings.max_failed_chunk_retries
+        self.failed_chunks_buffer_size: int = 0
+        self.max_failed_chunks_buffer_size: int = settings.failed_chunk_buffer_max_size
+        
         # Frame size in samples per channel for Opus codec
         self.opus_frame_duration_ms: int = settings.frame_duration_ms # Use configured frame duration for Opus
         self.opus_frame_size_samples: int = int(self.sample_rate * self.opus_frame_duration_ms / 1000)
         
         # Frame size in bytes for general PCM processing (16-bit)
         self.pcm_frame_size_bytes: int = self.opus_frame_size_samples * self.channels * 2 # 2 bytes per sample for 16-bit
+        
+        # Format detection stats
+        self.format_stats = {
+            "wav_success": 0,
+            "webm_success": 0,
+            "ogg_success": 0,
+            "auto_success": 0,
+            "raw_success": 0,
+            "total_attempts": 0,
+            "failures": 0
+        }
         
         logger.info(f"AudioService configured: SR={self.sample_rate}Hz, Chan={self.channels}, FrameDur={self.opus_frame_duration_ms}ms, OpusFrameSamples={self.opus_frame_size_samples}")
 
@@ -251,87 +268,248 @@ class AudioService:
             
         # Check for Ogg header
         if audio_bytes.startswith(b'OggS'):
-            return len(audio_bytes) > 28  # Ogg page header minimum
+            return len(audio_bytes) > 28  # Ogg page header is 28 bytes minimum
             
         return False
 
+    def _detect_audio_format(self, audio_bytes: bytes) -> str:
+        """Enhanced audio format detection using magic bytes."""
+        if not audio_bytes or len(audio_bytes) < 12:
+            return "unknown"
+            
+        # WAV detection (RIFF header)
+        if audio_bytes.startswith(b'RIFF') and b'WAVE' in audio_bytes[:20]:
+            return "wav"
+            
+        # WebM detection (EBML header)
+        if audio_bytes.startswith(b'\x1a\x45\xdf\xa3'):
+            return "webm"
+            
+        # Ogg detection
+        if audio_bytes.startswith(b'OggS'):
+            return "ogg"
+            
+        # MP3 detection (ID3 or MP3 frame sync)
+        if audio_bytes.startswith(b'ID3') or (audio_bytes[0] == 0xFF and (audio_bytes[1] & 0xE0) == 0xE0):
+            return "mp3"
+            
+        # Raw PCM detection (heuristic - check if data looks like 16-bit PCM)
+        if len(audio_bytes) % 2 == 0:  # Must be even number of bytes for 16-bit
+            # Check if data has reasonable variance for audio
+            try:
+                pcm_array = np.frombuffer(audio_bytes, dtype=np.int16)
+                if len(pcm_array) > 10:
+                    std_dev = np.std(pcm_array)
+                    if 100 < std_dev < 20000:  # Typical range for voice audio
+                        return "raw_pcm"
+            except:
+                pass
+                
+        return "unknown"
+
     async def extract_pcm_smart_async(self, audio_data: bytes) -> Optional[np.ndarray]:
         """
-        Extract PCM data from various audio formats with smart buffering for streaming audio.
+        Enhanced smart PCM extraction with stream mode and format prioritization.
         
         Args:
-            audio_data: Binary audio data
+            audio_data: Raw audio bytes in any supported format
             
         Returns:
-            PCM data as numpy array or None if more data is needed
+            Normalized float32 PCM data as numpy array or None if extraction failed
         """
-        try:
-            # Add to buffer
-            if self.stream_mode_active:
-                self.chunk_buffer.extend(audio_data)
-                logger.debug(f"Added {len(audio_data)} bytes to chunk buffer. Total buffer size: {len(self.chunk_buffer)}")
+        self.format_stats["total_attempts"] += 1
+        
+        if not audio_data:
+            logger.warning("Received empty audio data")
+            self.format_stats["failures"] += 1
+            return None
+            
+        # Small chunk handling for stream mode
+        if self.stream_mode_active and len(audio_data) >= settings.small_chunk_buffer_threshold:
+            # When in stream mode, attempt to process smaller chunks immediately
+            # without buffering if they're above the minimum size threshold
+            logger.debug(f"Stream mode active, processing {len(audio_data)} bytes directly")
+            
+            # Detect format based on previous successful chunk
+            detected_format = self._detect_audio_format(audio_data)
+            
+            if detected_format != "unknown":
+                # Try to process the chunk directly based on detected format
+                pcm_array = await self._process_chunk_by_format(audio_data, detected_format)
+                if pcm_array is not None:
+                    return pcm_array
+        
+        # Regular processing with intelligent buffering
+        # If not in stream mode or direct processing failed, use the regular buffer approach
+        if len(self.chunk_buffer) > 0:
+            # Append the new data to existing buffer
+            self.chunk_buffer.extend(audio_data)
+            
+            # Process if buffer is large enough or we're in stream mode
+            if len(self.chunk_buffer) >= self.buffer_size_threshold or self.stream_mode_active:
+                # Copy buffer to avoid reference issues and clear buffer immediately
+                buffer_copy = bytes(self.chunk_buffer)
+                self.chunk_buffer.clear()
                 
-                # Check if we have enough data to try decoding
-                if len(self.chunk_buffer) < 1000 and len(self.chunk_buffer) < self.last_processed_chunk_size * 2:
-                    logger.debug(f"Buffer size {len(self.chunk_buffer)} bytes not enough to try decoding yet.")
+                # Multi-method fallback chain with prioritized formats
+                pcm_array = await self._extract_pcm_from_format(buffer_copy)
+                
+                if pcm_array is not None:
+                    # Stream mode becomes active after first successful decode
+                    if not self.stream_mode_active:
+                        self.stream_mode_active = True
+                        logger.info("🔄 Stream mode activated - will process future chunks immediately")
+                        
+                    # Store buffer size for stats
+                    self.last_processed_chunk_size = len(buffer_copy)
+                    return pcm_array
+                else:
+                    # Processing failed, handle the failed chunk
+                    logger.warning(f"All extraction methods failed for buffered chunk of {len(buffer_copy)} bytes")
+                    self._handle_failed_chunk(buffer_copy)
+                    self.format_stats["failures"] += 1
                     return None
-                    
-                # Try to extract PCM data from the buffered chunk
-                try:
-                    # Use the internal buffer
-                    logger.debug(f"Attempting to extract PCM from buffer of size {len(self.chunk_buffer)} bytes")
-                    pcm_array = await self._extract_pcm_from_format(bytes(self.chunk_buffer))
-                    
-                    if pcm_array is not None:
-                        # Success! Clear the buffer
-                        logger.info(f"Successfully extracted {len(pcm_array)} PCM samples from buffered data of {len(self.chunk_buffer)} bytes")
-                        self.last_processed_chunk_size = len(self.chunk_buffer)
-                        self.chunk_buffer.clear()
-                        return pcm_array
-                    else:
-                        # Need more data, keep in buffer
-                        logger.debug(f"Extraction returned None, keeping data in buffer")
-                        return None
-                except Exception as e:
-                    logger.warning(f"Error extracting PCM from buffer: {str(e)}. Buffer size: {len(self.chunk_buffer)}")
-                    
-                    # If buffer is getting very large, it might be corrupted, so clear it
-                    if len(self.chunk_buffer) > 1024 * 1024: # 1MB limit
-                        logger.warning(f"Clearing large buffer of size {len(self.chunk_buffer)} bytes due to processing error")
-                        self.chunk_buffer.clear()
-                        self.last_processed_chunk_size = 0
+        else:
+            # First chunk or buffer was cleared, check if large enough to process directly
+            if len(audio_data) >= self.buffer_size_threshold:
+                pcm_array = await self._extract_pcm_from_format(audio_data)
+                
+                if pcm_array is not None:
+                    # Stream mode becomes active after first successful decode
+                    if not self.stream_mode_active:
+                        self.stream_mode_active = True
+                        logger.info("🔄 Stream mode activated - will process future chunks immediately")
+                        
+                    self.last_processed_chunk_size = len(audio_data)
+                    return pcm_array
+                else:
+                    # Processing failed, handle the failed chunk
+                    logger.warning(f"All extraction methods failed for direct chunk of {len(audio_data)} bytes")
+                    self._handle_failed_chunk(audio_data)
+                    self.format_stats["failures"] += 1
                     return None
             else:
-                # Direct processing mode (no buffering)
-                logger.debug(f"Direct PCM extraction from {len(audio_data)} bytes (no buffering)")
-                return await self._extract_pcm_from_format(audio_data)
+                # Too small to process reliably, add to buffer
+                self.chunk_buffer.extend(audio_data)
+                logger.debug(f"Added {len(audio_data)} bytes to buffer (now {len(self.chunk_buffer)})")
+                return None
+    
+    async def _process_chunk_by_format(self, audio_data: bytes, format_name: str) -> Optional[np.ndarray]:
+        """Process a chunk directly based on detected format"""
+        if format_name == "wav":
+            # Try WAV first (generally most reliable)
+            pcm_array = await self._run_ffmpeg_conversion_internal_async(
+                audio_data, ['-f', 'wav']
+            )
+            if pcm_array is not None:
+                self.format_stats["wav_success"] += 1
+                return pcm_array
                 
-        except Exception as e:
-            logger.error(f"Critical error in extract_pcm_smart_async: {str(e)}", exc_info=True)
-            return None
-
-    def extract_pcm_smart(self, audio_bytes: bytes) -> Optional[np.ndarray]:
-        """
-        Synchronous wrapper that just processes immediately without buffering.
-        This method should be avoided in favor of extract_pcm_smart_async.
-        """
-        logger.warning("Using synchronous extract_pcm_smart - consider using async version for better buffering")
-        
-        # Basic format detection and processing without buffering
-        if not audio_bytes: 
-            return None
-            
-        is_webm = audio_bytes.startswith(b'\x1a\x45\xdf\xa3')
-        is_wav = audio_bytes.startswith(b'RIFF') and b'WAVE' in audio_bytes[:20]
-        is_ogg = audio_bytes.startswith(b'OggS')
-        
-        # Try raw PCM first (fastest)
-        pcm_array = self.extract_pcm_from_raw(audio_bytes)
+        elif format_name == "webm":
+            # Try WebM
+            pcm_array = await self._run_ffmpeg_conversion_internal_async(
+                audio_data, ['-f', 'webm']
+            )
+            if pcm_array is not None:
+                self.format_stats["webm_success"] += 1
+                return pcm_array
+                
+        elif format_name == "ogg":
+            # Try Ogg
+            pcm_array = await self._run_ffmpeg_conversion_internal_async(
+                audio_data, ['-f', 'ogg']
+            )
+            if pcm_array is not None:
+                self.format_stats["ogg_success"] += 1
+                return pcm_array
+                
+        # Fall back to auto-detect
+        pcm_array = await self._run_ffmpeg_conversion_internal_async(
+            audio_data, []  # No format specified, let FFmpeg auto-detect
+        )
         if pcm_array is not None:
+            self.format_stats["auto_success"] += 1
             return pcm_array
             
-        # Note: Cannot use async FFmpeg methods in sync context
-        logger.warning("Synchronous processing limited - FFmpeg conversion requires async context")
+        return None
+        
+    def _handle_failed_chunk(self, chunk_data: bytes) -> None:
+        """Store failed chunks for potential retry if they're not too large"""
+        if len(self.failed_chunks) >= self.max_failed_chunks:
+            # Remove oldest chunk if we've reached the limit
+            if self.failed_chunks:
+                oldest_chunk = self.failed_chunks.pop(0)
+                self.failed_chunks_buffer_size -= len(oldest_chunk)
+                
+        # Check if adding this chunk would exceed the max buffer size
+        if self.failed_chunks_buffer_size + len(chunk_data) <= self.max_failed_chunks_buffer_size:
+            self.failed_chunks.append(chunk_data)
+            self.failed_chunks_buffer_size += len(chunk_data)
+            logger.debug(f"Stored failed chunk of {len(chunk_data)} bytes for retry (buffer: {len(self.failed_chunks)} chunks, {self.failed_chunks_buffer_size} bytes)")
+        else:
+            logger.warning(f"Failed chunk of {len(chunk_data)} bytes exceeds buffer limit, discarding")
+
+    async def _extract_pcm_from_format(self, audio_data: bytes) -> Optional[np.ndarray]:
+        """
+        Enhanced PCM extraction with format prioritization and retries.
+        
+        Attempts multiple methods in a prioritized order:
+        1. WAV (most reliable)
+        2. WebM (common from browsers)
+        3. Ogg (alternative container)
+        4. Auto-detect
+        5. Raw PCM (last resort)
+        """
+        if not audio_data:
+            return None
+            
+        # Get detected format to help prioritize
+        format_name = self._detect_audio_format(audio_data)
+        logger.debug(f"Detected format: {format_name} for {len(audio_data)} bytes")
+        
+        # Method 1: Try WAV format first (generally most reliable)
+        if format_name == "wav" or format_name == "unknown":
+            pcm_array = await self._run_ffmpeg_conversion_internal_async(
+                audio_data, ['-f', 'wav']
+            )
+            if pcm_array is not None:
+                self.format_stats["wav_success"] += 1
+                return pcm_array
+        
+        # Method 2: Try WebM format (most common from browsers)
+        if format_name == "webm" or format_name == "unknown":
+            pcm_array = await self._run_ffmpeg_conversion_internal_async(
+                audio_data, ['-f', 'webm']
+            )
+            if pcm_array is not None:
+                self.format_stats["webm_success"] += 1
+                return pcm_array
+                
+        # Method 3: Try Ogg format
+        if format_name == "ogg" or format_name == "unknown":
+            pcm_array = await self._run_ffmpeg_conversion_internal_async(
+                audio_data, ['-f', 'ogg']
+            )
+            if pcm_array is not None:
+                self.format_stats["ogg_success"] += 1
+                return pcm_array
+        
+        # Method 4: Try auto-detect format as a fallback
+        pcm_array = await self._run_ffmpeg_conversion_internal_async(
+            audio_data, []  # No format specified, let FFmpeg auto-detect
+        )
+        if pcm_array is not None:
+            self.format_stats["auto_success"] += 1
+            return pcm_array
+            
+        # Method 5: Last resort - try as raw PCM
+        if format_name == "raw_pcm" or format_name == "unknown":
+            pcm_array = self.extract_pcm_from_raw(audio_data)
+            if pcm_array is not None:
+                self.format_stats["raw_success"] += 1
+                return pcm_array
+                
+        # All methods failed
         return None
 
     def reset_session(self):
@@ -365,83 +543,3 @@ class AudioService:
         self.stream_mode_active = False
         self.is_available = False # Mark service as unavailable after cleanup
         logger.info("AudioService cleaned up.")
-
-    async def _extract_pcm_from_format(self, audio_data: bytes) -> Optional[np.ndarray]:
-        """
-        Extract PCM data from various audio formats, trying different approaches
-        
-        Args:
-            audio_data: Binary audio data
-            
-        Returns:
-            PCM data as numpy array or None if extraction fails
-        """
-        if not audio_data:
-            return None
-            
-        # Try different format approaches
-        pcm_array = None
-        
-        # 1. Check if we have a valid header
-        has_header = self._has_valid_header(audio_data)
-        
-        # Process based on detected format
-        if has_header:
-            is_webm = audio_data.startswith(b'\x1a\x45\xdf\xa3')
-            is_wav = audio_data.startswith(b'RIFF') and b'WAVE' in audio_data[:20]
-            is_ogg = audio_data.startswith(b'OggS')
-            
-            try:
-                logger.debug(f"Detected format: webm={is_webm}, wav={is_wav}, ogg={is_ogg}")
-                if is_webm:
-                    logger.debug("Processing WebM/Matroska container")
-                    pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_data, ['-f', 'matroska'])
-                elif is_wav:
-                    logger.debug("Processing WAV container")
-                    pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_data, ['-f', 'wav'])
-                elif is_ogg:
-                    logger.debug("Processing Ogg container")
-                    pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_data, ['-f', 'ogg'])
-            except Exception as e:
-                logger.warning(f"Format-specific processing failed: {e}")
-                # Continue to next method
-                
-        # 2. If no header or header processing failed, try WebM/Matroska (most common from browsers)
-        if pcm_array is None:
-            try:
-                logger.debug("Trying WebM/Matroska format fallback")
-                pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_data, ['-f', 'webm'])
-                if pcm_array is None:
-                    # Try alternate format
-                    pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_data, ['-f', 'matroska'])
-            except Exception as e:
-                logger.warning(f"WebM/Matroska fallback failed: {e}")
-                # Continue to next method
-            
-        # 3. Try auto-detection as last resort
-        if pcm_array is None and self.ffmpeg_available:
-            try:
-                logger.debug("Trying FFmpeg auto-detection")
-                pcm_array = await self._run_ffmpeg_conversion_internal_async(audio_data, [])
-            except Exception as e:
-                logger.warning(f"FFmpeg auto-detection failed: {e}")
-                # Continue to final fallback
-            
-        # 4. Final fallback: raw PCM interpretation
-        if pcm_array is None:
-            try:
-                logger.debug("Trying raw PCM interpretation")
-                pcm_array = self.extract_pcm_from_raw(audio_data)
-            except Exception as e:
-                logger.warning(f"Raw PCM interpretation failed: {e}")
-                # All methods failed
-            
-        if pcm_array is not None:
-            logger.info(f"Successfully processed {len(audio_data)} bytes -> {len(pcm_array)} samples")
-            if not self.stream_mode_active:
-                logger.info("Activating stream mode for subsequent chunks")
-                self.stream_mode_active = True
-            return pcm_array
-            
-        logger.warning(f"All processing methods failed for {len(audio_data)} bytes")
-        return None

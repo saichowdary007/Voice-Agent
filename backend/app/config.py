@@ -31,13 +31,18 @@ class AppSettings(BaseSettings):
     speech_timeout: float = Field(default_factory=lambda: float(os.getenv("SPEECH_TIMEOUT", "3.0")), description="Speech timeout in seconds")
     ws_server_host: str = Field(default_factory=lambda: os.getenv("UVICORN_HOST", "0.0.0.0"), description="WebSocket server host")
     ws_server_port: int = Field(default_factory=lambda: int(os.getenv("UVICORN_PORT", "8003")), description="WebSocket server port")
-    # Note: Frontend WS_URL should be constructed from these in a real deployment scenario if not directly provided.
+    
+    # WebSocket Connection Management & Timeouts
+    ws_ping_interval: int = Field(default_factory=lambda: int(os.getenv("WS_PING_INTERVAL", "15000")), description="WebSocket ping interval in milliseconds")
+    ws_server_timeout: int = Field(default_factory=lambda: int(os.getenv("WS_SERVER_TIMEOUT", "60000")), description="WebSocket server timeout in milliseconds")
+    ws_reconnect_max_attempts: int = Field(default_factory=lambda: int(os.getenv("WS_RECONNECT_MAX_ATTEMPTS", "5")), description="Maximum WebSocket reconnection attempts")
+    ws_reconnect_base_delay: int = Field(default_factory=lambda: int(os.getenv("WS_RECONNECT_BASE_DELAY", "1000")), description="Base delay for WebSocket reconnection in milliseconds")
 
     # Model Paths - Consistent across all services
     model_path: str = Field(default_factory=lambda: os.getenv("MODEL_PATH", "/app/models"), description="Path to AI models directory")
 
-    # API Keys - Standardized naming
-    google_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("GOOGLE_API_KEY"), description="Google AI API Key for Gemini")
+    # Standardized API Keys - Use these consistent names throughout the application
+    google_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("GOOGLE_API_KEY"), description="Google API Key (unified for all Google services)")
     azure_speech_key: Optional[str] = Field(default_factory=lambda: os.getenv("AZURE_SPEECH_KEY"), description="Azure Speech API Key")
     azure_speech_region: Optional[str] = Field(default_factory=lambda: os.getenv("AZURE_SPEECH_REGION", "eastus"), description="Azure Speech Service Region")
     
@@ -52,9 +57,8 @@ class AppSettings(BaseSettings):
     tts_model: str = Field(default_factory=lambda: os.getenv("TTS_MODEL", "en_US-libritts-high"), description="TTS model name")
     tts_voice: str = Field(default_factory=lambda: os.getenv("TTS_VOICE", "en-US-Neural"), description="TTS voice name")
     
-    # LLM Settings
+    # LLM Settings - Use google_api_key for Gemini
     llm_model: str = Field(default_factory=lambda: os.getenv("LLM_MODEL", "gemini-2.0-flash-exp"), description="LLM model name")
-    llm_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("LLM_API_KEY"), description="LLM API key")
     llm_temperature: float = Field(default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.7")), description="LLM temperature (0.0-1.0)")
     llm_max_tokens: int = Field(default_factory=lambda: int(os.getenv("LLM_MAX_TOKENS", "1024")), description="LLM maximum tokens")
 
@@ -100,3 +104,13 @@ def get_channels() -> int:
 def validate_google_api_key() -> bool:
     """Validate that Google API key is configured"""
     return bool(settings.google_api_key and settings.google_api_key.strip()) 
+
+# Helper function to get WebSocket connection settings
+def get_ws_connection_settings() -> dict:
+    """Get standardized WebSocket connection settings"""
+    return {
+        "ping_interval": settings.ws_ping_interval,
+        "server_timeout": settings.ws_server_timeout,
+        "reconnect_max_attempts": settings.ws_reconnect_max_attempts,
+        "reconnect_base_delay": settings.ws_reconnect_base_delay
+    } 

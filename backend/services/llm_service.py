@@ -5,6 +5,7 @@ import time
 from typing import Dict, Any, AsyncGenerator, Optional, List, Union
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 logger = logging.getLogger(__name__)
 
@@ -14,22 +15,41 @@ class LLMService:
     def __init__(self):
         self.model = None
         self.is_available = False
-        # Use GOOGLE_API_KEY to match the config
-        self.api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        # Standardize API key usage
+        self.api_key = os.getenv("GOOGLE_API_KEY")
+        if not self.api_key:
+            self.api_key = os.getenv("GEMINI_API_KEY")
+            if self.api_key:
+                logger.warning("Using GEMINI_API_KEY instead of GOOGLE_API_KEY. Please update your environment variables for consistency.")
+        
         self.model_name = "gemini-2.0-flash-exp"
         
         # Conversation history
         self.conversation_history = []
         self.max_history_length = 10  # Keep last 10 exchanges
         
-        # Retry configuration
+        # Retry and timeout configuration - from config where available
         self.max_retries = 3
-        self.retry_delay = 1.0  # Initial retry delay in seconds
+        self.initial_retry_delay = 1.0  # Initial retry delay in seconds
+        self.max_retry_delay = 8.0  # Maximum retry delay in seconds
+        self.backoff_factor = 2.0  # Exponential backoff multiplier
+        
+        # Timeouts in seconds - use app settings if available
+        try:
+            from backend.app.config import settings
+            self.connect_timeout = settings.ai_response_timeout / 2  # Half the response timeout for connection
+            self.response_timeout = settings.ai_response_timeout
+        except (ImportError, AttributeError):
+            logger.warning("Could not load timeout settings from app config, using defaults")
+            self.connect_timeout = 30.0  # 30 seconds for initial connection
+            self.response_timeout = 60.0  # 60 seconds for full response
         
         logger.info("LLM Service initialized with model: %s", self.model_name)
+        logger.info(f"Timeout settings - Connect: {self.connect_timeout}s, Response: {self.response_timeout}s")
+        logger.info(f"Retry settings - Max retries: {self.max_retries}, Initial delay: {self.initial_retry_delay}s")
         
     async def initialize(self):
-        """Initialize the Gemini model"""
+        """Initialize the Gemini model with robust error handling"""
         try:
             # Check for valid API key (exclude common placeholders)
             invalid_keys = ["test_key_for_demo", "your-google-api-key-here", "", None]
@@ -49,11 +69,17 @@ class LLMService:
                 
             logger.info("Initializing Gemini 2.0 Flash model...")
             
-            # Configure Gemini
-            def configure_genai():
-                genai.configure(api_key=self.api_key)
-            
-            await asyncio.to_thread(configure_genai)
+            # Configure Gemini with timeout
+            try:
+                # Use asyncio.wait_for to add timeout for API initialization
+                await asyncio.wait_for(
+                    self._configure_genai(),
+                    timeout=self.connect_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Gemini API initialization timed out after {self.connect_timeout}s")
+                self.is_available = False
+                return
             
             # Create model with optimized settings for ultra-low latency
             generation_config = genai.types.GenerationConfig(
@@ -90,26 +116,60 @@ class LLMService:
                     safety_settings=safety_settings,
                 )
             
-            # Test the model
-            def test_model():
-                test_response = self.model.generate_content("Hello")
-                return test_response
-            
-            test_response = await asyncio.to_thread(test_model)
-            if test_response and test_response.text:
-                self.is_available = True
-                logger.info("✅ Gemini 2.0 Flash initialized successfully")
-            else:
-                logger.error("Gemini test failed - no response text")
+            # Test the model with timeout
+            try:
+                test_response = await asyncio.wait_for(
+                    self._test_model(),
+                    timeout=self.connect_timeout
+                )
+                
+                if test_response and hasattr(test_response, 'text') and test_response.text:
+                    self.is_available = True
+                    logger.info("✅ Gemini 2.0 Flash initialized successfully")
+                else:
+                    logger.error("Gemini test failed - no response text")
+                    self.is_available = False
+            except asyncio.TimeoutError:
+                logger.error(f"Gemini test request timed out after {self.connect_timeout}s")
                 self.is_available = False
                 
         except Exception as e:
             logger.error(f"Failed to initialize Gemini: {e}")
             self.is_available = False
     
+    async def _configure_genai(self):
+        """Configure Gemini API with error handling"""
+        def configure_genai():
+            genai.configure(api_key=self.api_key)
+        
+        await asyncio.to_thread(configure_genai)
+    
+    async def _test_model(self):
+        """Test the model with a simple prompt"""
+        def test_model():
+            return self.model.generate_content("Hello")
+        
+        return await asyncio.to_thread(test_model)
+    
+    # Retry decorator for generate_content
+    @retry(
+        stop=stop_after_attempt(3),  # Maximum number of retry attempts
+        wait=wait_exponential(multiplier=1, min=1, max=8),  # Exponential backoff
+        retry=retry_if_exception_type((asyncio.TimeoutError, Exception))  # Retry on these exceptions
+    )
+    async def _generate_with_retry(self, prompt, stream=False):
+        """Generate content with retry logic"""
+        def generate():
+            return self.model.generate_content(prompt, stream=stream)
+        
+        return await asyncio.wait_for(
+            asyncio.to_thread(generate),
+            timeout=self.response_timeout
+        )
+    
     async def generate_response(self, user_input: str) -> str:
         """
-        Generate a complete response from user input
+        Generate a complete response from user input with improved error handling
         
         Args:
             user_input: User's text input
@@ -120,61 +180,41 @@ class LLMService:
         if not self.is_available:
             return self._get_mock_response()
         
+        # Add user input to history
+        self.conversation_history.append({"role": "user", "content": user_input})
+        
+        # Create prompt with conversation context
+        prompt = self._build_prompt(user_input)
+        
         try:
-            # Add user input to history
-            self.conversation_history.append({"role": "user", "content": user_input})
+            # Use the retry-wrapped function
+            response = await self._generate_with_retry(prompt)
             
-            # Create prompt with conversation context
-            prompt = self._build_prompt(user_input)
-            
-            # Generate response with retry logic
-            retry_count = 0
-            while retry_count <= self.max_retries:
-                try:
-                    def generate():
-                        return self.model.generate_content(prompt)
-                    
-                    response = await asyncio.wait_for(
-                        asyncio.to_thread(generate),
-                        timeout=60.0  # 60 seconds timeout
-                    )
-                    
-                    if response and response.text:
-                        response_text = response.text.strip()
-                        
-                        # Add response to history
-                        self.conversation_history.append({"role": "assistant", "content": response_text})
-                        
-                        # Trim history if too long
-                        self._trim_history()
-                        
-                        logger.info(f"LLM generated response: '{response_text[:100]}...'")
-                        return response_text
-                    else:
-                        logger.error("No response text from Gemini")
-                        retry_count += 1
-                        if retry_count <= self.max_retries:
-                            await asyncio.sleep(self.retry_delay * retry_count)  # Exponential backoff
-                        
-                except (asyncio.TimeoutError, Exception) as e:
-                    logger.warning(f"LLM generation attempt {retry_count+1} failed: {e}")
-                    retry_count += 1
-                    if retry_count <= self.max_retries:
-                        await asyncio.sleep(self.retry_delay * retry_count)  # Exponential backoff
-                    else:
-                        logger.error(f"All {self.max_retries} LLM generation attempts failed")
-                        break
-            
-            # If we've exhausted all retries, return a mock response
-            return self._get_mock_response()
+            if response and hasattr(response, 'text'):
+                response_text = response.text.strip()
                 
+                # Add response to history
+                self.conversation_history.append({"role": "assistant", "content": response_text})
+                
+                # Trim history if too long
+                self._trim_history()
+                
+                logger.info(f"LLM generated response: '{response_text[:100]}...'")
+                return response_text
+            else:
+                logger.error("No response text from Gemini")
+                return self._get_mock_response()
+                
+        except asyncio.TimeoutError:
+            logger.error(f"LLM generation timed out after {self.response_timeout}s")
+            return self._get_mock_response()
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
             return self._get_mock_response()
     
     async def generate_streaming(self, user_input: str) -> AsyncGenerator[str, None]:
         """
-        Generate streaming response from user input
+        Generate streaming response from user input with improved resilience
         
         Args:
             user_input: User's text input
@@ -191,65 +231,58 @@ class LLMService:
                 await asyncio.sleep(0.05)  # Simulate streaming delay
             return
         
+        # Add user input to history
+        self.conversation_history.append({"role": "user", "content": user_input})
+        
+        # Create prompt with conversation context
+        prompt = self._build_prompt(user_input)
+        
+        # Outer try block for overall streaming operation
         try:
-            # Add user input to history
-            self.conversation_history.append({"role": "user", "content": user_input})
+            # Attempt to get streaming response with retry and timeout for connection
+            response = await self._generate_with_retry(prompt, stream=True)
             
-            # Create prompt with conversation context
-            prompt = self._build_prompt(user_input)
+            response_text = ""
+            stream_timeout = self.response_timeout + 30  # Extra time for streaming
+            stream_start = time.time()
             
-            # Generate streaming response with retry logic
-            retry_count = 0
-            while retry_count <= self.max_retries:
-                try:
-                    # Generate streaming response
-                    response_text = ""
-                    
-                    def generate_stream():
-                        return self.model.generate_content(prompt, stream=True)
-                    
-                    response = await asyncio.wait_for(
-                        asyncio.to_thread(generate_stream),
-                        timeout=30.0  # 30 seconds timeout for stream initialization
-                    )
-                    
-                    for chunk in response:
-                        if chunk.text:
-                            chunk_text = chunk.text
-                            response_text += chunk_text
-                            yield chunk_text
-                            
-                    # Add complete response to history
-                    if response_text:
-                        self.conversation_history.append({"role": "assistant", "content": response_text.strip()})
-                        self._trim_history()
-                        logger.info(f"LLM streamed response: '{response_text[:100]}...'")
-                        return
-                    else:
-                        logger.warning("No text generated in streaming response")
-                        retry_count += 1
-                        if retry_count <= self.max_retries:
-                            await asyncio.sleep(self.retry_delay * retry_count)  # Exponential backoff
-                        
-                except (asyncio.TimeoutError, Exception) as e:
-                    logger.warning(f"LLM streaming attempt {retry_count+1} failed: {e}")
-                    retry_count += 1
-                    if retry_count <= self.max_retries:
-                        await asyncio.sleep(self.retry_delay * retry_count)  # Exponential backoff
-                    else:
-                        logger.error(f"All {self.max_retries} LLM streaming attempts failed")
-                        break
+            # Process each chunk with timeout protection
+            for chunk in response:
+                # Check for stream timeout
+                if time.time() - stream_start > stream_timeout:
+                    logger.warning(f"Stream processing exceeded timeout of {stream_timeout}s")
+                    break
+                
+                if hasattr(chunk, 'text') and chunk.text:
+                    chunk_text = chunk.text
+                    response_text += chunk_text
+                    yield chunk_text
             
-            # If we've exhausted all retries, return a mock response
+            # Add complete response to history if we got something
+            if response_text:
+                self.conversation_history.append({"role": "assistant", "content": response_text.strip()})
+                self._trim_history()
+                logger.info(f"LLM streamed response: '{response_text[:100]}...'")
+            else:
+                logger.warning("No text generated in streaming response")
+                # Yield mock response if nothing was generated
+                mock_response = self._get_mock_response()
+                words = mock_response.split()
+                for word in words:
+                    yield word + " "
+                    await asyncio.sleep(0.05)
+            
+        except asyncio.TimeoutError:
+            logger.error(f"LLM streaming timed out after {self.response_timeout}s")
+            # Fall back to mock response
             mock_response = self._get_mock_response()
             words = mock_response.split()
             for word in words:
                 yield word + " "
                 await asyncio.sleep(0.05)
-                
         except Exception as e:
             logger.error(f"LLM streaming failed: {e}")
-            # Fallback to mock response
+            # Fall back to mock response
             mock_response = self._get_mock_response()
             words = mock_response.split()
             for word in words:
