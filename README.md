@@ -78,8 +78,6 @@ The easiest way to run the application is using the provided launcher scripts:
 # Use our local development script (recommended)
 ./start_local.sh
 
-# Or use the original script
-./run_app.py
 ```
 
 #### Docker Deployment
