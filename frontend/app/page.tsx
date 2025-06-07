@@ -3,6 +3,7 @@
 
 import React, { useState, useCallback } from 'react';
 import dynamic from 'next/dynamic';
+import MagicHeader from '../components/MagicHeader';
 
 // Disable SSR for this client-only app
 export const dynamicParams = false;
@@ -44,6 +45,7 @@ export default function HomePage() {
 
   return (
     <main className="h-screen w-screen overflow-hidden bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 relative">
+      <MagicHeader />
       {/* Always render VoiceAgent - don't unmount it */}
       <VoiceAgent key="voice-agent-singleton" onError={handleError} />
       

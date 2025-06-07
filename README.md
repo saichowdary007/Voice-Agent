@@ -9,6 +9,7 @@ A real-time voice agent application with speech recognition, natural language pr
 - **Natural Language Processing**: Google Gemini for intelligent responses
 - **Text-to-Speech (TTS)**: Fast and natural-sounding voice synthesis
 - **Real-time WebSocket Communication**: Bidirectional real-time communication
+- **Magic UI Frontend**: Stylish interface built with [Magic UI](https://magicui.design)
 
 ## Setup
 
@@ -46,7 +47,7 @@ A real-time voice agent application with speech recognition, natural language pr
    cd ..
    ```
 
-5. Create `.env` file in the project root with your API keys:
+5. Copy `.env.example` to `.env` and add your API keys:
    ```
    # Core settings
    DEBUG=false

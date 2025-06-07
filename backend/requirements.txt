@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+structlog
+python-dotenv
+azure-cognitiveservices-speech
+numpy
+pydantic-settings
+soundfile
+opuslib
+httpx
+websockets
+requests
+google-generativeai
