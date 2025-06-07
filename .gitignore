@@ -127,6 +127,10 @@ data/
 *.jsonl
 *.tsv
 *.txt
+!backend/requirements.txt
+!frontend/package.json
+!frontend/tsconfig.json
+!.env.example
 
 # Frontend automatically downloaded models
 frontend/public/*.onnx
