@@ -46,7 +46,12 @@ async def lifespan(app: FastAPI):
         metrics = MetricsCollector() if settings.enable_metrics else None
         
         # Initialize voice service
-        voice_service = VoiceService()
+        voice_service = VoiceService(
+            chunk_duration_ms=settings.frame_duration_ms,
+            sample_rate=settings.sample_rate,
+            vad_threshold=settings.vad_threshold,
+            speech_timeout=settings.speech_timeout
+        )
         await voice_service.initialize()
         
         # Get service health status
@@ -65,7 +70,7 @@ async def lifespan(app: FastAPI):
                         logger.info(f"{service_name.upper()}: {status_str}")
         
         # Initialize WebSocket manager
-        websocket_manager = WebSocketManager(voice_service, voice_service.audio_service, metrics)
+        websocket_manager = WebSocketManager(voice_service=voice_service, audio_service=voice_service.audio_service)
         
         # Store in app state
         app.state.voice_service = voice_service
@@ -108,23 +113,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on startup"""
+    global voice_service, websocket_manager
+    
+    logger.info(f"Starting {settings.app_name} v{settings.app_version}")
+    
+    # Initialize voice service
+    voice_service = VoiceService(
+        chunk_duration_ms=settings.frame_duration_ms,
+        sample_rate=settings.sample_rate,
+        vad_threshold=settings.vad_threshold,
+        speech_timeout=settings.speech_timeout
+    )
+    await voice_service.initialize()
+    
+    # Initialize WebSocket manager
+    websocket_manager = WebSocketManager(voice_service=voice_service, audio_service=voice_service.audio_service)
+    
+    logger.info(f"{settings.app_name} started successfully")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up on application shutdown"""
+    logger.info("Application shutdown initiated")
+    
+    # Clean up WebSocket connections
+    if websocket_manager:
+        logger.info("Cleaning up WebSocket connections")
+        await websocket_manager.cleanup()
+    
+    # Clean up voice service
+    if voice_service:
+        logger.info("Cleaning up voice service")
+        await voice_service.cleanup()
+    
+    logger.info("Application shutdown complete")
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    try:
-        status = {
-            "status": "healthy",
-            "timestamp": time.time(),
-            "services": {}
-        }
+    if not voice_service:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": "Voice service not initialized"}
+        )
         
-        if voice_service:
-            status["services"] = await voice_service.get_health_status()
+    status = await voice_service.get_health_status()
+    voice_available = status.get("voice_service", {}).get("available", False)
+    
+    if not voice_available:
+        # Get unavailable services
+        unavailable = []
+        for service, details in status.items():
+            if service != "voice_service" and isinstance(details, dict) and not details.get("available", False):
+                unavailable.append(service)
+                
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error", 
+                "message": f"Voice services unavailable: {', '.join(unavailable)}",
+                "details": status
+            }
+        )
         
-        return status
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        raise HTTPException(status_code=503, detail="Service unhealthy")
+    return {"status": "ok", "message": "Service is healthy", "details": status}
 
 @app.get("/metrics")
 async def get_metrics():
@@ -141,11 +196,17 @@ async def get_metrics():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for voice communication"""
+    """WebSocket endpoint for real-time voice communication"""
     if not websocket_manager:
-        await websocket.close(code=1011, reason="Service unavailable")
+        logger.error("WebSocket manager not initialized")
+        await websocket.close(code=1011, reason="Server not initialized")
         return
-    
+        
+    if not voice_service or not voice_service.is_available:
+        logger.error("Voice service not available")
+        await websocket.close(code=1011, reason="Voice service not available")
+        return
+        
     await websocket_manager.handle_connection(websocket)
 
 @app.get("/")

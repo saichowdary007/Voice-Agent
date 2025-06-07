@@ -418,11 +418,18 @@ class VoiceService:
                 except asyncio.QueueEmpty:
                     break
             
+            # Reset state variables
+            self.is_user_speaking = False
+            self.speech_start_time = None
+            self.speech_buffer.clear()
+            
             logger.info(f"Voice session stopped: {self.current_session_id}")
             self.current_session_id = None
             
+            return True
         except Exception as e:
             logger.error(f"Error stopping voice session: {e}")
+            return False
 
     async def get_health_status(self) -> Dict[str, Any]:
         """Get health status of all underlying services"""
@@ -535,7 +542,6 @@ class VoiceService:
             
             # Reset VAD state
             self.is_user_speaking = False
-            self.silence_start_time = None
             self.speech_start_time = None
             
             logger.info("User speech ended by explicit request")

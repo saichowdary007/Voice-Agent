@@ -451,7 +451,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
           }
 
           // Attempt reconnection if not a normal closure and not cleaning up
-          if (code !== 1000 && !isCleaningUpRef.current && !sessionEndedRef.current) {
+          if (code !== 1000 && code !== 1001 && !isCleaningUpRef.current && !sessionEndedRef.current) {
             attemptReconnection();
           }
           resolve(false);
@@ -466,7 +466,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         resolve(false);
       }
     });
-  }, [wsUrl, onError, flushAudioQueue]);
+  }, [wsUrl, onError, flushAudioQueue, sendDiagnosticMode]);
 
   // Improved reconnection with exponential backoff
   const attemptReconnection = useCallback(() => {
@@ -514,6 +514,9 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
             final: [...prev.final, data.text || data.final],
             partial: ''
           }));
+          
+          // Also set processing state if we got a final transcript
+          setSession(prev => ({ ...prev, isProcessing: true }));
         }
         break;
 

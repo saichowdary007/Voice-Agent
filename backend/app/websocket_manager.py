@@ -76,7 +76,11 @@ class WebSocketManager:
             self.sessions[session_id] = session
             
             # Start voice service session
-            await self.voice_service.start_session(session_id)
+            if not await self.voice_service.start_session(session_id):
+                session_logger.error("Failed to start voice service session")
+                await self._send_error(websocket, "Failed to start voice processing session")
+                await websocket.close(code=1011, reason="Failed to start voice processing session")
+                return
             
             # Set up voice service callbacks
             self.voice_service.set_callbacks(
@@ -339,19 +343,29 @@ class WebSocketSessionHandler:
         msg_type = data.get("type")
         self.logger.info(f"Received control message: {msg_type}")
 
-        if msg_type == "config":
-            await self._handle_config_message(data)
-        elif msg_type == "endOfStream":
-            await self._handle_end_of_stream()
-        elif msg_type == "mute":
-            await self._handle_mute(data.get("muted", False))
-        elif msg_type == "endSpeech":
-            await self._handle_end_speech()
-        elif msg_type == "end_session":
-            await self._handle_end_session()
-        else:
-            self.logger.warning(f"Unknown control message type: {msg_type}")
-            await self._send_error(f"Unknown control message type: {msg_type}")
+        try:
+            if msg_type == "config":
+                await self._handle_config_message(data)
+            elif msg_type == "endOfStream":
+                await self._handle_end_of_stream()
+            elif msg_type == "mute":
+                await self._handle_mute(data.get("muted", False))
+            elif msg_type == "endSpeech":
+                await self._handle_end_speech()
+            elif msg_type == "end_session":
+                await self._handle_end_session()
+            elif msg_type == "ping":
+                # Handle ping from client
+                await self._send_message({
+                    "type": "pong",
+                    "timestamp": time.time()
+                })
+            else:
+                self.logger.warning(f"Unknown control message type: {msg_type}")
+                await self._send_error(f"Unknown control message type: {msg_type}")
+        except Exception as e:
+            self.logger.error(f"Error handling control message: {e}", exc_info=True)
+            await self._send_error(f"Error processing control message: {str(e)}")
 
     async def _handle_config_message(self, data: Dict[str, Any]):
         """Handle client configuration message"""
@@ -371,7 +385,8 @@ class WebSocketSessionHandler:
         # Acknowledge config
         await self._send_message({
             "type": "status",
-            "message": "Configuration received"
+            "message": "Configuration received",
+            "timestamp": time.time()
         })
 
     async def _process_audio_frame(self, frame: bytes):
@@ -455,7 +470,10 @@ class WebSocketSessionHandler:
         
         # Close the WebSocket connection
         if self.session.websocket.client_state == WebSocketState.CONNECTED:
-            await self.session.websocket.close(code=1000, reason="Session ended by client")
+            try:
+                await self.session.websocket.close(code=1000, reason="Session ended by client")
+            except Exception as e:
+                self.logger.error(f"Error closing WebSocket: {e}")
 
     def _get_frame_size(self) -> int:
         """Calculate the audio frame size in bytes"""

@@ -8,6 +8,9 @@ export class AudioPlayer {
   private isPlaying: boolean = false;
   private gainNode: GainNode | null = null;
   private currentSource: AudioBufferSourceNode | null = null;
+  private lastError: Error | null = null;
+  private consecutiveErrors: number = 0;
+  private maxConsecutiveErrors: number = 5;
 
   constructor() {
     try {
@@ -23,6 +26,7 @@ export class AudioPlayer {
       console.log('AudioPlayer initialized with sample rate:', this.audioContext.sampleRate);
     } catch (error) {
       console.error('Failed to initialize AudioPlayer:', error);
+      this.lastError = error instanceof Error ? error : new Error(String(error));
     }
   }
 
@@ -38,12 +42,24 @@ export class AudioPlayer {
   }
 
   /**
+   * Get player status
+   */
+  getStatus(): { isPlaying: boolean, queueLength: number, hasError: boolean, lastError?: string } {
+    return {
+      isPlaying: this.isPlaying,
+      queueLength: this.queue.length,
+      hasError: this.lastError !== null,
+      lastError: this.lastError?.message
+    };
+  }
+
+  /**
    * Play a raw ArrayBuffer of audio data
    */
-  async playAudioData(audioData: ArrayBuffer): Promise<void> {
-    if (!this.audioContext) {
-      console.error('AudioContext not initialized');
-      return;
+  async playAudioData(audioData: ArrayBuffer): Promise<boolean> {
+    if (!this.audioContext || !this.gainNode) {
+      console.error('AudioContext or GainNode not initialized');
+      return false;
     }
 
     try {
@@ -52,8 +68,20 @@ export class AudioPlayer {
         await this.audioContext.resume();
       }
 
+      // Safety check for invalid data
+      if (!audioData || audioData.byteLength === 0) {
+        console.warn('Empty audio data received, skipping playback');
+        return false;
+      }
+
       // Decode the audio data
       const audioBuffer = await this.audioContext.decodeAudioData(audioData);
+      
+      // Validate buffer has actual data
+      if (audioBuffer.length === 0 || audioBuffer.duration === 0) {
+        console.warn('Decoded audio buffer is empty, skipping playback');
+        return false;
+      }
       
       // Add to queue and start playing if not already
       this.queue.push(audioBuffer);
@@ -61,8 +89,23 @@ export class AudioPlayer {
       if (!this.isPlaying) {
         this.playNextInQueue();
       }
+      
+      // Reset consecutive errors on success
+      this.consecutiveErrors = 0;
+      this.lastError = null;
+      return true;
     } catch (error) {
-      console.error('Error playing audio data:', error);
+      this.consecutiveErrors++;
+      this.lastError = error instanceof Error ? error : new Error(String(error));
+      console.error(`Error playing audio data (attempt ${this.consecutiveErrors}/${this.maxConsecutiveErrors}):`, error);
+      
+      // If too many consecutive errors, try to recover the audio context
+      if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
+        console.warn('Too many consecutive playback errors, attempting to recover audio context');
+        this._attemptContextRecovery();
+      }
+      
+      return false;
     }
   }
 
@@ -103,11 +146,68 @@ export class AudioPlayer {
         }
       };
       
+      // Add error handler for the source
+      this.currentSource.onerror = (err) => {
+        console.error('AudioBufferSourceNode error:', err);
+        // Cleanup and move to next item
+        if (this.currentSource) {
+          this.currentSource.disconnect();
+          this.currentSource = null;
+        }
+        this.isPlaying = false;
+        
+        // Try to continue with next item if available
+        if (this.queue.length > 0) {
+          setTimeout(() => this.playNextInQueue(), 100);
+        }
+      };
+      
       // Start playback
       this.currentSource.start(0);
     } catch (error) {
       console.error('Error in playNextInQueue:', error);
       this.isPlaying = false;
+      this.lastError = error instanceof Error ? error : new Error(String(error));
+      
+      // Try to continue with next item if available
+      if (this.queue.length > 0) {
+        setTimeout(() => this.playNextInQueue(), 500);
+      }
+    }
+  }
+
+  /**
+   * Attempt to recover the audio context after errors
+   */
+  private async _attemptContextRecovery(): Promise<void> {
+    try {
+      // Cleanup existing resources first
+      this.stop();
+      
+      if (this.gainNode) {
+        this.gainNode.disconnect();
+        this.gainNode = null;
+      }
+      
+      if (this.audioContext) {
+        await this.audioContext.close().catch(e => console.warn('Error closing audio context:', e));
+        this.audioContext = null;
+      }
+      
+      // Recreate audio context
+      const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+      this.audioContext = new AudioContext();
+      
+      // Recreate gain node
+      this.gainNode = this.audioContext.createGain();
+      this.gainNode.gain.value = 1.0;
+      this.gainNode.connect(this.audioContext.destination);
+      
+      // Reset error counter
+      this.consecutiveErrors = 0;
+      console.log('AudioPlayer context recovered successfully');
+    } catch (error) {
+      console.error('Failed to recover audio context:', error);
     }
   }
 
