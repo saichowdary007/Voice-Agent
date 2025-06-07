@@ -535,6 +535,8 @@ class VoiceService:
             
             # Reset VAD state
             self.is_user_speaking = False
+            self.silence_start_time = None
+            self.speech_start_time = None
             
             logger.info("User speech ended by explicit request")
         except Exception as e:

@@ -300,10 +300,13 @@ class AudioService:
 
         return "unknown"
 
-    async def extract_pcm_smart_async(self, audio_data: bytes) -> Optional[np.ndarray]:
+    def extract_pcm_smart_async(self, audio_data: bytes) -> Optional[np.ndarray]:
         """
         Intelligently tries to extract PCM from audio data using format detection and fallback mechanisms.
         This is the primary public method for converting incoming audio chunks to PCM.
+        
+        Note: This method is designed to be called from an asyncio.to_thread() context to avoid
+        blocking the event loop with CPU-intensive work.
         """
         if not audio_data:
             return None
@@ -320,7 +323,7 @@ class AudioService:
         current_chunk = bytes(self.chunk_buffer)
 
         # Attempt to process the chunk using format-priority processing
-        pcm_data = await self._extract_pcm_from_format(current_chunk)
+        pcm_data = self._extract_pcm_from_format(current_chunk)
 
         if pcm_data is not None and pcm_data.size > 0:
             logger.info(f"Successfully processed {len(current_chunk)} bytes of audio into {pcm_data.size} PCM samples.")
@@ -344,7 +347,7 @@ class AudioService:
                 self.chunk_buffer.clear()
             return None
 
-    async def _process_chunk_by_format(self, audio_data: bytes, format_name: str) -> Optional[np.ndarray]:
+    def _process_chunk_by_format(self, audio_data: bytes, format_name: str) -> Optional[np.ndarray]:
         """Helper to process a chunk with a specific format decoder."""
         logger.debug(f"Attempting to decode chunk as {format_name}...")
         start_time = time.monotonic()
@@ -361,10 +364,10 @@ class AudioService:
                     pcm_data = data.astype(np.float32)
             elif format_name == "webm":
                 # Use FFmpeg for WebM
-                pcm_data = await self._run_ffmpeg_conversion_internal_async(audio_data, ['-f', 'webm'])
+                pcm_data = self._run_ffmpeg_conversion_sync(audio_data, ['-f', 'webm'])
             elif format_name == "ogg":
                 # Use FFmpeg for Ogg
-                pcm_data = await self._run_ffmpeg_conversion_internal_async(audio_data, ['-f', 'ogg'])
+                pcm_data = self._run_ffmpeg_conversion_sync(audio_data, ['-f', 'ogg'])
             elif format_name == "opus":
                 # Use internal Opus decoder
                 pcm_data = self.decode_opus_frame(audio_data)
@@ -400,7 +403,7 @@ class AudioService:
         self.failed_chunks_buffer_size += len(chunk_data)
         logger.warning(f"Stored failed chunk. Total failed chunks: {len(self.failed_chunks)}, buffer size: {self.failed_chunks_buffer_size} bytes.")
 
-    async def _extract_pcm_from_format(self, audio_data: bytes) -> Optional[np.ndarray]:
+    def _extract_pcm_from_format(self, audio_data: bytes) -> Optional[np.ndarray]:
         """
         Format-priority processing pipeline. Tries to decode audio by checking for common formats in a specific order.
         Order of attempts: WAV -> WebM -> Ogg -> Raw PCM (as fallback).
@@ -410,33 +413,33 @@ class AudioService:
 
         # 1. Attempt WAV decoding (high-quality, common)
         if audio_data.startswith(b'RIFF'):
-            pcm_data = await self._process_chunk_by_format(audio_data, "wav")
+            pcm_data = self._process_chunk_by_format(audio_data, "wav")
             if pcm_data is not None:
                 return pcm_data
 
         # 2. Attempt WebM decoding (common for web-based clients)
         if audio_data.startswith(b'\x1aE\xdf\xa3'):
-            pcm_data = await self._process_chunk_by_format(audio_data, "webm")
+            pcm_data = self._process_chunk_by_format(audio_data, "webm")
             if pcm_data is not None:
                 return pcm_data
         
         # 3. Attempt Ogg decoding (another common web format)
         if audio_data.startswith(b'OggS'):
-            pcm_data = await self._process_chunk_by_format(audio_data, "ogg")
+            pcm_data = self._process_chunk_by_format(audio_data, "ogg")
             if pcm_data is not None:
                 return pcm_data
         
         # 4. Fallback for Auto-detection (let FFmpeg figure it out, can be slow)
         # This is a broader attempt if specific headers aren't matched.
         logger.debug("Specific format checks failed, attempting auto-detection with FFmpeg.")
-        pcm_data_auto = await self._run_ffmpeg_conversion_internal_async(audio_data, []) # No input args, let FFmpeg detect
+        pcm_data_auto = self._run_ffmpeg_conversion_sync(audio_data, []) # No input args, let FFmpeg detect
         if pcm_data_auto is not None:
              self.format_stats["auto_success"] += 1
              return pcm_data_auto
 
         # 5. Final fallback: Try to interpret as raw PCM data
         logger.warning("All container format decoders failed. Attempting to interpret as raw PCM.")
-        pcm_data_raw = await self._process_chunk_by_format(audio_data, "raw")
+        pcm_data_raw = self._process_chunk_by_format(audio_data, "raw")
         if pcm_data_raw is not None:
             return pcm_data_raw
             
@@ -502,3 +505,51 @@ class AudioService:
         self.stream_mode_active = False
         self.is_available = False # Mark service as unavailable after cleanup
         logger.info("AudioService cleaned up.")
+
+    def _run_ffmpeg_conversion_sync(self, audio_data: bytes, input_args: List[str]) -> Optional[np.ndarray]:
+        """Synchronous version of FFmpeg conversion for use with the non-async extract_pcm_smart_async"""
+        if not self.ffmpeg_available:
+            logger.warning("FFmpeg not available for conversion")
+            return None
+        
+        try:
+            # Create temporary input file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as temp_in:
+                temp_in.write(audio_data)
+                temp_in_path = temp_in.name
+            
+            # Create temporary output file
+            temp_out_path = temp_in_path + '.wav'
+            
+            # Construct FFmpeg command
+            ffmpeg_cmd = ['ffmpeg', '-y', '-loglevel', 'error']
+            if input_args:
+                ffmpeg_cmd.extend(input_args)
+            ffmpeg_cmd.extend(['-i', temp_in_path, '-f', 'wav', '-ar', str(self.sample_rate), '-ac', str(self.channels), temp_out_path])
+            
+            # Run FFmpeg
+            try:
+                subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
+                
+                # Read the output WAV file
+                with open(temp_out_path, 'rb') as f:
+                    data, sr = sf.read(io.BytesIO(f.read()))
+                    pcm_data = data.astype(np.float32)
+                    return pcm_data
+            finally:
+                # Clean up temporary files
+                try:
+                    os.unlink(temp_in_path)
+                    if os.path.exists(temp_out_path):
+                        os.unlink(temp_out_path)
+                except Exception as e:
+                    logger.warning(f"Error cleaning up temporary files: {e}")
+                
+        except Exception as e:
+            logger.error(f"Error in FFmpeg conversion: {e}")
+            return None
+
+    async def extract_pcm_smart_async_legacy(self, audio_data: bytes) -> Optional[np.ndarray]:
+        """Legacy async version - use the synchronous version with asyncio.to_thread instead.
+        This is kept for backwards compatibility only."""
+        return self.extract_pcm_smart_async(audio_data)

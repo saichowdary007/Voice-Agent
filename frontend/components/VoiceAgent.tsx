@@ -121,98 +121,39 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
    * Returns a promise that resolves when all cleanup is complete
    */
   async function cleanupResources() {
-    if (isCleaningUpRef.current) {
-      console.log('Resource cleanup already in progress, skipping duplicate call.');
-      // Return existing cleanup promise if one exists
-      return;
-    }
-    
+    console.log('Starting resource cleanup...');
     isCleaningUpRef.current = true;
-    console.log('Starting comprehensive resource cleanup...');
-    
     const cleanupPromises = [];
 
-    // Clear all timeouts and intervals first to prevent race conditions
-    if (keepAliveIntervalRef.current) {
-      clearInterval(keepAliveIntervalRef.current);
-      keepAliveIntervalRef.current = null;
-    }
-    
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-
-    // Clean up VAD with proper promise handling
-    if (vadRef.current && typeof (vadRef.current as any).destroy === 'function') {
+    // Disable recording first
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      console.log('Stopping MediaRecorder...');
       try {
-        const vadCleanup = (vadRef.current as any).destroy();
-        if (vadCleanup instanceof Promise) {
-          cleanupPromises.push(vadCleanup.catch(e => {
-            console.warn('Error destroying VAD:', e && (e as any).message ? (e as any).message : 'Unknown error');
-          }));
-        }
+        mediaRecorderRef.current.stop();
       } catch (e) {
-        console.warn('Error initiating VAD destroy:', e && (e as any).message ? (e as any).message : 'Unknown error');
+        console.warn('Error stopping MediaRecorder:', e);
       }
+      mediaRecorderRef.current = null;
     }
-    vadRef.current = null;
 
-    // MediaRecorder cleanup with error handling
-    const mr = mediaRecorderRef.current;
-    if (mr && mr.state !== 'inactive') {
-      try { 
-        mr.stop(); 
-      } catch (e) { 
-        const errorMessage = e && (e as any).message ? (e as any).message : 'Unknown error';
-        console.warn('Error stopping MediaRecorder during cleanup:', errorMessage); 
-      }
-    }
-    mediaRecorderRef.current = null;
-
-    // Media stream cleanup
+    // Stop media stream tracks
     if (streamRef.current) {
+      console.log('Stopping media stream tracks...');
       try {
         streamRef.current.getTracks().forEach(track => {
-          try {
-            track.stop();
-          } catch (e) {
-            console.warn('Error stopping media track:', e);
-          }
+          track.stop();
         });
       } catch (e) {
-        console.warn('Error cleaning up media stream:', e);
+        console.warn('Error stopping media stream tracks:', e);
       }
       streamRef.current = null;
     }
 
-    // Audio source cleanup
-    if (sourceRef.current) {
-      try {
-        sourceRef.current.disconnect();
-      } catch (e) {
-        console.warn('Error disconnecting audio source:', e);
-      }
-      sourceRef.current = null;
-    }
-
-    // AudioContext cleanup with proper promise handling
-    const ctx = audioContextRef.current;
-    if (ctx && ctx.state !== 'closed') {
-      try {
-        const ctxCleanup = ctx.close();
-        cleanupPromises.push(ctxCleanup.catch(e => {
-          console.warn('Error closing AudioContext:', e);
-        }));
-      } catch (e) {
-        console.warn('Error initiating AudioContext close:', e);
-      }
-    }
-    audioContextRef.current = null;
-
-    // TTS audio player cleanup
+    // Close TTS audio player
     if (ttsAudioPlayerRef.current) {
+      console.log('Disposing TTS audio player...');
       try {
+        ttsAudioPlayerRef.current.stop();
         ttsAudioPlayerRef.current.dispose();
       } catch (e) {
         console.warn('Error disposing TTS audio player:', e);
@@ -220,12 +161,44 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       ttsAudioPlayerRef.current = null;
     }
 
+    // Dispose of audio context
+    if (audioContextRef.current) {
+      console.log('Closing AudioContext...');
+      try {
+        cleanupPromises.push(audioContextRef.current.close());
+      } catch (e) {
+        console.warn('Error closing AudioContext:', e);
+      }
+      audioContextRef.current = null;
+    }
+
+    // Clean up VAD worker
+    if (vadRef.current) {
+      console.log('Terminating VAD worker...');
+      try {
+        vadRef.current.terminate();
+      } catch (e) {
+        console.warn('Error terminating VAD worker:', e);
+      }
+      vadRef.current = null;
+    }
+
     // WebSocket cleanup last (after other resources)
     if (wsRef.current) {
+      console.log('Closing WebSocket connection...');
       try {
         if (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING) {
-          console.log('Closing WebSocket connection...');
-          wsRef.current.close(1000, 'Session ended by client/cleanup');
+          // Only send end_session if the connection is still OPEN
+          if (wsRef.current.readyState === WebSocket.OPEN && !sessionEndedRef.current) {
+            try {
+              wsRef.current.send(JSON.stringify({ type: 'end_session' }));
+              // Give it a small window to send before closing
+              await new Promise(resolve => setTimeout(resolve, 100));
+            } catch (e) {
+              console.warn('Error sending final end_session message:', e);
+            }
+          }
+          wsRef.current.close();
         }
       } catch (e) {
         console.warn('Error closing WebSocket:', e);
@@ -233,10 +206,22 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       wsRef.current = null;
     }
 
-    // Reset all state
+    // Clear all intervals and timeouts
+    if (keepAliveIntervalRef.current) {
+      console.log('Clearing keep-alive interval...');
+      clearInterval(keepAliveIntervalRef.current);
+      keepAliveIntervalRef.current = null;
+    }
+
+    if (reconnectTimeoutRef.current) {
+      console.log('Clearing reconnect timeout...');
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+
+    // Reset state
     try {
-      setSession(prev => ({
-        ...prev,
+      setSession({
         isConnected: false,
         isRecording: false,
         isMuted: false,
@@ -245,12 +230,13 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         sessionEnded: true,
         isReconnecting: false,
         sessionId: undefined,
-      }));
+      });
       setTranscript({ partial: '', final: [], aiResponse: '', isAiResponding: false });
       setAudioLevel(0);
       setLatency(0);
       setIsUserSpeaking(false);
       audioQueueRef.current = [];
+      sessionEndedRef.current = true;
     } catch (e) {
       console.warn('Error resetting state during cleanup:', e);
     }
@@ -277,6 +263,19 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
    */
   function handleEndSession(backendInitiated = false) {
     console.log(`Ending session... Backend initiated: ${backendInitiated}`);
+    
+    // If this is not backend initiated and we have an active connection,
+    // try to send the end_session message first (unless we already did)
+    if (!backendInitiated && 
+        wsRef.current?.readyState === WebSocket.OPEN && 
+        !sessionEndedRef.current) {
+      console.log('Sending end_session message to server');
+      sendWebSocketMessage({ type: 'end_session' });
+      // Set session as ended to prevent duplicate end_session messages
+      sessionEndedRef.current = true;
+    }
+    
+    // Proceed with cleanup regardless
     cleanupResources().catch(e => {
       console.error('Error during session cleanup:', e);
       // Reset cleanup flag in case of error
@@ -500,6 +499,11 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
   }, [connectWebSocket, maxReconnectAttempts]);
 
   async function handleWebSocketMessage(data: any) {
+    // Log all messages for easier debugging
+    if (data.type !== 'ping' && data.type !== 'pong') {
+      console.log('Received message:', data);
+    }
+    
     switch (data.type) {
       case 'transcript':
         if (data.partial) {
@@ -555,12 +559,28 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         }
         break;
 
+      case 'vad_status':
+        // Handle VAD status updates
+        if (data.status === 'speech_started') {
+          setIsUserSpeaking(true);
+        } else if (data.status === 'speech_ended') {
+          setIsUserSpeaking(false);
+        }
+        break;
+
       case 'tts_start':
         setSession(prev => ({ ...prev, isSpeaking: true }));
         break;
 
       case 'tts_complete':
         setSession(prev => ({ ...prev, isSpeaking: false }));
+        break;
+
+      case 'control':
+        if (data.action === 'session_ended') {
+          console.log(`Server ended session. Reason: ${data.reason || 'not specified'}`);
+          handleEndSession(true); // Pass true: server initiated
+        }
         break;
 
       case 'error':
@@ -582,36 +602,21 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
 
       case 'status':
         // Session status update from server
-        console.log('Session status:', data);
         if (data.ready) {
           console.log('Server confirmed session is ready');
         }
         break;
 
-      case 'control':
-        if (data.action === 'session_ended') {
-          console.log('Server confirmed session end');
-          handleEndSession(true);
-        }
-        break;
-
-      case 'vad_status':
-        // Handle VAD status updates
-        if (data.status === 'speech_started') {
-          setIsUserSpeaking(true);
-        } else if (data.status === 'speech_ended') {
-          setIsUserSpeaking(false);
-        }
-        break;
-
-      case 'config_response':
-        // Handle config response
-        console.log('Server configuration received:', data);
-        break;
-
       case 'eos_ack':
         // Handle end-of-stream acknowledgment
         console.log('End of stream acknowledged by server');
+        break;
+
+      case 'ping':
+        // Server ping, respond with pong
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+        }
         break;
 
       default:
@@ -759,9 +764,17 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
   const endSession = useCallback(() => {
     console.log('User initiated endSession...');
     setSession(prev => ({ ...prev, sessionEnded: true })); // Mark session ended by user
-    sendWebSocketMessage({ type: 'end_session' });
-    // Delay cleanup to allow message to send
-    setTimeout(() => handleEndSession(false), 100); // Pass false: user initiated
+    
+    // Only send end_session if the WebSocket is open
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      sendWebSocketMessage({ type: 'end_session' });
+      
+      // The session will be fully cleaned up when the server responds with
+      // a "control" message with action="session_ended"
+    } else {
+      // If WebSocket is already closed, proceed with immediate cleanup
+      handleEndSession(false); // Pass false: user initiated
+    }
   }, [sendWebSocketMessage]);
 
   const startNewSession = useCallback(async () => {

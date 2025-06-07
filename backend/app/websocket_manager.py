@@ -1,7 +1,8 @@
 import asyncio
 import json
 import time
-from typing import Dict, Set, Optional, Any
+import base64
+from typing import Dict, Set, Optional, Any, Callable
 from dataclasses import dataclass
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -21,6 +22,7 @@ class WebSocketSession:
     created_at: float
     last_activity: float
     is_active: bool = True
+    timeout_task: Optional[asyncio.Task] = None
 
 class WebSocketManager:
     """Manages WebSocket connections and sessions"""
@@ -73,6 +75,19 @@ class WebSocketManager:
             )
             self.sessions[session_id] = session
             
+            # Start voice service session
+            await self.voice_service.start_session(session_id)
+            
+            # Set up voice service callbacks
+            self.voice_service.set_callbacks(
+                on_speech_start=lambda: self._send_message(websocket, {"type": "vad_status", "status": "speech_started"}),
+                on_speech_end=lambda: self._send_message(websocket, {"type": "vad_status", "status": "speech_ended"}),
+                on_partial_transcript=lambda txt: self._send_message(websocket, {"type": "transcript", "partial": True, "text": txt}),
+                on_final_transcript=lambda txt: self._send_message(websocket, {"type": "transcript", "final": True, "text": txt}),
+                on_llm_response=lambda txt: self._send_message(websocket, {"type": "ai_response", "text": txt}),
+                on_audio_response=lambda chunk: self._send_message(websocket, {"type": "audio_chunk", "audio_data": base64.b64encode(chunk).decode()})
+            )
+            
             # Send initial status
             await self._send_message(websocket, {
                 "type": "status",
@@ -85,6 +100,11 @@ class WebSocketManager:
                 }
             })
             
+            # Start timeout monitor
+            session.timeout_task = asyncio.create_task(
+                self._monitor_session_timeout(session, session_logger)
+            )
+            
             # Handle session
             await self._handle_session(session, session_logger)
             
@@ -93,10 +113,47 @@ class WebSocketManager:
         except Exception as e:
             session_logger.error(f"Connection error: {e}", exc_info=True)
         finally:
+            # Stop the voice service session
+            if hasattr(self.voice_service, 'stop_session'):
+                try:
+                    await self.voice_service.stop_session()
+                except Exception as e:
+                    session_logger.error(f"Error stopping voice session: {e}")
+            
+            # Cancel timeout task if it exists
+            if session_id in self.sessions and self.sessions[session_id].timeout_task:
+                self.sessions[session_id].timeout_task.cancel()
+                
             # Cleanup session
             if session_id in self.sessions:
                 del self.sessions[session_id]
                 session_logger.info(f"Session cleaned up. Active sessions: {len(self.sessions)}")
+    
+    async def _monitor_session_timeout(self, session: WebSocketSession, session_logger):
+        """Monitor session for inactivity timeout"""
+        try:
+            while True:
+                await asyncio.sleep(30)  # Check every 30 seconds
+                current_time = time.time()
+                if current_time - session.last_activity > self.session_timeout:
+                    session_logger.info(f"Session timed out after {self.session_timeout} seconds of inactivity")
+                    
+                    # Notify client that session is ending
+                    await self._send_message(session.websocket, {
+                        "type": "control", 
+                        "action": "session_ended",
+                        "reason": "timeout"
+                    })
+                    
+                    # Close the connection
+                    if session.websocket.client_state == WebSocketState.CONNECTED:
+                        await session.websocket.close(code=1000, reason="Session timeout")
+                    break
+        except asyncio.CancelledError:
+            # Task was cancelled, cleanup is handled by the parent
+            pass
+        except Exception as e:
+            session_logger.error(f"Error in session timeout monitor: {e}")
     
     async def _handle_session(self, session: WebSocketSession, session_logger):
         """Handle messages for a WebSocket session"""
@@ -108,7 +165,9 @@ class WebSocketManager:
             voice_service=self.voice_service,
             audio_service=self.audio_service,
             logger=session_logger,
-            metrics=self.metrics
+            metrics=self.metrics,
+            send_message=self._send_message,
+            send_error=self._send_error
         )
         
         try:
@@ -179,7 +238,17 @@ class WebSocketManager:
         # Close all active sessions
         for session_id, session in list(self.sessions.items()):
             try:
+                # Cancel timeout tasks
+                if session.timeout_task:
+                    session.timeout_task.cancel()
+                    
+                # Send session ended notification
                 if session.websocket.client_state == WebSocketState.CONNECTED:
+                    await self._send_message(session.websocket, {
+                        "type": "control",
+                        "action": "session_ended",
+                        "reason": "server_shutdown"
+                    })
                     await session.websocket.close()
             except Exception as e:
                 logger.error(f"Error closing session {session_id}: {e}")
@@ -190,12 +259,17 @@ class WebSocketManager:
 class WebSocketSessionHandler:
     """Handles individual WebSocket session logic"""
     
-    def __init__(self, session: WebSocketSession, voice_service, audio_service, logger, metrics=None):
+    def __init__(self, session: WebSocketSession, voice_service, audio_service, logger, 
+                 metrics=None, send_message=None, send_error=None):
         self.session = session
         self.voice_service = voice_service
         self.audio_service = audio_service
         self.logger = logger
         self.metrics = metrics
+        
+        # Message sending functions
+        self._send_message = send_message
+        self._send_error = send_error
         
         # Audio processing state
         self.audio_buffer = bytearray()
@@ -215,7 +289,10 @@ class WebSocketSessionHandler:
             self.logger.debug(f"Received audio chunk: {len(audio_data)} bytes. Processing with AudioService.")
 
             # Use the robust audio service to convert any format to raw PCM
-            pcm_audio_array = await self.audio_service.extract_pcm_smart_async(audio_data)
+            # Run in executor to avoid blocking the event loop with CPU-intensive work
+            pcm_audio_array = await asyncio.to_thread(
+                self._process_audio_data, audio_data
+            )
 
             if pcm_audio_array is not None and pcm_audio_array.size > 0:
                 # Convert float32 numpy array back to 16-bit PCM bytes for the rest of the pipeline
@@ -248,6 +325,14 @@ class WebSocketSessionHandler:
 
         except Exception as e:
             self.logger.error(f"Error in handle_audio: {e}", exc_info=True)
+    
+    def _process_audio_data(self, audio_data: bytes) -> Optional[np.ndarray]:
+        """Process audio data in a separate thread to avoid blocking the event loop"""
+        try:
+            return self.audio_service.extract_pcm_smart_async(audio_data)
+        except Exception as e:
+            self.logger.error(f"Error processing audio data: {e}")
+            return None
 
     async def handle_control(self, data: Dict[str, Any]):
         """Handle control messages from the client"""
@@ -262,6 +347,8 @@ class WebSocketSessionHandler:
             await self._handle_mute(data.get("muted", False))
         elif msg_type == "endSpeech":
             await self._handle_end_speech()
+        elif msg_type == "end_session":
+            await self._handle_end_session()
         else:
             self.logger.warning(f"Unknown control message type: {msg_type}")
             await self._send_error(f"Unknown control message type: {msg_type}")
@@ -320,32 +407,55 @@ class WebSocketSessionHandler:
         
         # Notify voice service that user speech has ended
         await self.voice_service.end_user_speech()
+        
+        # Acknowledge end of stream to client
+        await self._send_message({
+            "type": "eos_ack",
+            "timestamp": time.time()
+        })
 
     async def _handle_mute(self, muted: bool):
         """Handle mute/unmute commands from client"""
         self.logger.info(f"Setting mute status to: {muted}")
-        # Placeholder for mute logic if needed
+        
+        # Send acknowledgment to client
+        await self._send_message({
+            "type": "mute_status",
+            "muted": muted,
+            "timestamp": time.time()
+        })
 
     async def _handle_end_speech(self):
         """Handle explicit end-of-speech command from client"""
         self.logger.info("Client explicitly ended speech")
         await self.voice_service.end_user_speech()
-
-    async def _send_message(self, data: Dict[str, Any]):
-        """Send a JSON message to the client"""
-        try:
-            if self.session.websocket.client_state == WebSocketState.CONNECTED:
-                await self.session.websocket.send_text(json.dumps(data))
-        except Exception as e:
-            self.logger.error(f"Failed to send message: {e}")
-
-    async def _send_error(self, error: str):
-        """Send an error message to the client"""
+        
+        # Acknowledge to client
         await self._send_message({
-            "type": "error",
-            "message": error,
+            "type": "status",
+            "message": "Speech ended",
             "timestamp": time.time()
         })
+    
+    async def _handle_end_session(self):
+        """Handle explicit end-session command from client"""
+        self.logger.info("Client explicitly ended session")
+        
+        # Notify voice service to stop session
+        if hasattr(self.voice_service, 'stop_session'):
+            await self.voice_service.stop_session()
+        
+        # Send confirmation to client before closing
+        await self._send_message({
+            "type": "control",
+            "action": "session_ended",
+            "reason": "client_request",
+            "timestamp": time.time()
+        })
+        
+        # Close the WebSocket connection
+        if self.session.websocket.client_state == WebSocketState.CONNECTED:
+            await self.session.websocket.close(code=1000, reason="Session ended by client")
 
     def _get_frame_size(self) -> int:
         """Calculate the audio frame size in bytes"""
