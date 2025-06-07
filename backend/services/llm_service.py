@@ -5,7 +5,7 @@ import time
 from typing import Dict, Any, AsyncGenerator, Optional, List, Union
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,7 @@ class LLMService:
         self.initial_retry_delay = 1.0  # Initial retry delay in seconds
         self.max_retry_delay = 8.0  # Maximum retry delay in seconds
         self.backoff_factor = 2.0  # Exponential backoff multiplier
+        self.retry_delay = 1.0  # Base delay for retries
         
         # Timeouts in seconds - use app settings if available
         try:
@@ -151,21 +152,34 @@ class LLMService:
         
         return await asyncio.to_thread(test_model)
     
-    # Retry decorator for generate_content
+    # Enhanced retry decorator for generate_content with explicit backoff settings
     @retry(
         stop=stop_after_attempt(3),  # Maximum number of retry attempts
-        wait=wait_exponential(multiplier=1, min=1, max=8),  # Exponential backoff
-        retry=retry_if_exception_type((asyncio.TimeoutError, Exception))  # Retry on these exceptions
+        wait=wait_exponential(multiplier=1, min=1, max=8),  # Exponential backoff: 1s, 2s, 4s, 8s
+        retry=retry_if_exception_type((asyncio.TimeoutError, ConnectionError, IOError, Exception)),  # Expanded retry exceptions
+        reraise=True  # Re-raise the last exception
     )
     async def _generate_with_retry(self, prompt, stream=False):
-        """Generate content with retry logic"""
+        """Generate content with enhanced retry logic and explicit timeout"""
+        start_time = time.time()
+        logger.info(f"Starting LLM generation request (timeout: {self.response_timeout}s)")
+        
         def generate():
             return self.model.generate_content(prompt, stream=stream)
         
-        return await asyncio.wait_for(
-            asyncio.to_thread(generate),
-            timeout=self.response_timeout
-        )
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(generate),
+                timeout=self.response_timeout
+            )
+        except asyncio.TimeoutError as e:
+            elapsed = time.time() - start_time
+            logger.warning(f"LLM request timed out after {elapsed:.1f}s (timeout: {self.response_timeout}s)")
+            raise  # Re-raise for retry handling
+        except Exception as e:
+            elapsed = time.time() - start_time
+            logger.warning(f"LLM request failed after {elapsed:.1f}s: {str(e)}")
+            raise  # Re-raise for retry handling
     
     async def generate_response(self, user_input: str) -> str:
         """
@@ -187,29 +201,39 @@ class LLMService:
         prompt = self._build_prompt(user_input)
         
         try:
-            # Use the retry-wrapped function
-            response = await self._generate_with_retry(prompt)
+            # Use the enhanced retry-wrapped function
+            start_time = time.time()
+            logger.info(f"Generating LLM response for input: '{user_input[:50]}...'")
             
-            if response and hasattr(response, 'text'):
-                response_text = response.text.strip()
+            try:
+                response = await self._generate_with_retry(prompt)
                 
-                # Add response to history
-                self.conversation_history.append({"role": "assistant", "content": response_text})
-                
-                # Trim history if too long
-                self._trim_history()
-                
-                logger.info(f"LLM generated response: '{response_text[:100]}...'")
-                return response_text
-            else:
-                logger.error("No response text from Gemini")
+                if response and hasattr(response, 'text'):
+                    response_text = response.text.strip()
+                    
+                    # Add response to history
+                    self.conversation_history.append({"role": "assistant", "content": response_text})
+                    
+                    # Trim history if too long
+                    self._trim_history()
+                    
+                    elapsed = time.time() - start_time
+                    logger.info(f"LLM generated response in {elapsed:.2f}s: '{response_text[:100]}...'")
+                    return response_text
+                else:
+                    logger.error("No response text from Gemini")
+                    return self._get_mock_response()
+            except RetryError as re:
+                logger.error(f"All retry attempts failed: {str(re)}")
                 return self._get_mock_response()
                 
         except asyncio.TimeoutError:
-            logger.error(f"LLM generation timed out after {self.response_timeout}s")
+            elapsed = time.time() - start_time
+            logger.error(f"LLM generation timed out after {elapsed:.2f}s (max: {self.response_timeout}s)")
             return self._get_mock_response()
         except Exception as e:
-            logger.error(f"LLM generation failed: {e}")
+            elapsed = time.time() - start_time
+            logger.error(f"LLM generation failed after {elapsed:.2f}s: {e}")
             return self._get_mock_response()
     
     async def generate_streaming(self, user_input: str) -> AsyncGenerator[str, None]:
@@ -237,43 +261,83 @@ class LLMService:
         # Create prompt with conversation context
         prompt = self._build_prompt(user_input)
         
+        # Track timings for detailed logging
+        stream_start = time.time()
+        first_token_received = False
+        token_start_time = None
+        
         # Outer try block for overall streaming operation
         try:
             # Attempt to get streaming response with retry and timeout for connection
-            response = await self._generate_with_retry(prompt, stream=True)
+            logger.info(f"Starting streaming request with timeout {self.response_timeout}s")
             
-            response_text = ""
-            stream_timeout = self.response_timeout + 30  # Extra time for streaming
-            stream_start = time.time()
-            
-            # Process each chunk with timeout protection
-            for chunk in response:
-                # Check for stream timeout
-                if time.time() - stream_start > stream_timeout:
-                    logger.warning(f"Stream processing exceeded timeout of {stream_timeout}s")
-                    break
+            try:
+                response = await self._generate_with_retry(prompt, stream=True)
                 
-                if hasattr(chunk, 'text') and chunk.text:
-                    chunk_text = chunk.text
-                    response_text += chunk_text
-                    yield chunk_text
+                response_text = ""
+                stream_timeout = self.response_timeout + 30  # Extra time for streaming
+                token_count = 0
+                
+                # Process each chunk with timeout protection
+                for chunk in response:
+                    # Track first token latency
+                    if not first_token_received:
+                        first_token_received = True
+                        time_to_first_token = time.time() - stream_start
+                        token_start_time = time.time()
+                        logger.info(f"First token received after {time_to_first_token:.2f}s")
+                    
+                    # Check for stream timeout
+                    current_time = time.time()
+                    if current_time - stream_start > stream_timeout:
+                        logger.warning(f"Stream processing exceeded timeout of {stream_timeout}s")
+                        break
+                    
+                    # Check for token stall (more than 10 seconds without a token)
+                    if first_token_received and (current_time - token_start_time > 10):
+                        logger.warning(f"Token streaming stalled for >10s, breaking stream")
+                        break
+                    
+                    if hasattr(chunk, 'text') and chunk.text:
+                        chunk_text = chunk.text
+                        response_text += chunk_text
+                        token_count += 1
+                        token_start_time = current_time  # Reset token timer
+                        
+                        # Log progress periodically
+                        if token_count % 20 == 0:
+                            elapsed = time.time() - stream_start
+                            logger.debug(f"Streamed {token_count} tokens in {elapsed:.2f}s")
+                            
+                        yield chunk_text
+                
+                # Add complete response to history if we got something
+                total_elapsed = time.time() - stream_start
+                if response_text:
+                    self.conversation_history.append({"role": "assistant", "content": response_text.strip()})
+                    self._trim_history()
+                    logger.info(f"LLM streamed response completed in {total_elapsed:.2f}s: {token_count} tokens, '{response_text[:100]}...'")
+                else:
+                    logger.warning(f"No text generated in streaming response after {total_elapsed:.2f}s")
+                    # Yield mock response if nothing was generated
+                    mock_response = self._get_mock_response()
+                    words = mock_response.split()
+                    for word in words:
+                        yield word + " "
+                        await asyncio.sleep(0.05)
             
-            # Add complete response to history if we got something
-            if response_text:
-                self.conversation_history.append({"role": "assistant", "content": response_text.strip()})
-                self._trim_history()
-                logger.info(f"LLM streamed response: '{response_text[:100]}...'")
-            else:
-                logger.warning("No text generated in streaming response")
-                # Yield mock response if nothing was generated
+            except RetryError as re:
+                logger.error(f"All streaming retry attempts failed: {str(re)}")
+                # Fall back to mock response
                 mock_response = self._get_mock_response()
                 words = mock_response.split()
                 for word in words:
                     yield word + " "
                     await asyncio.sleep(0.05)
-            
+                
         except asyncio.TimeoutError:
-            logger.error(f"LLM streaming timed out after {self.response_timeout}s")
+            elapsed = time.time() - stream_start
+            logger.error(f"LLM streaming timed out after {elapsed:.2f}s (timeout: {self.response_timeout}s)")
             # Fall back to mock response
             mock_response = self._get_mock_response()
             words = mock_response.split()
@@ -281,7 +345,8 @@ class LLMService:
                 yield word + " "
                 await asyncio.sleep(0.05)
         except Exception as e:
-            logger.error(f"LLM streaming failed: {e}")
+            elapsed = time.time() - stream_start
+            logger.error(f"LLM streaming failed after {elapsed:.2f}s: {e}")
             # Fall back to mock response
             mock_response = self._get_mock_response()
             words = mock_response.split()
@@ -310,6 +375,8 @@ class LLMService:
                 yield word + " "
                 await asyncio.sleep(0.05)  # Simulate streaming delay
             return
+        
+        stream_start = time.time()
         
         try:
             # Process incoming messages and update conversation history
@@ -348,82 +415,113 @@ class LLMService:
                     await asyncio.sleep(0.05)
                 return
                 
-            # Generate response with retry logic
-            retry_count = 0
-            while retry_count <= self.max_retries:
+            # Build prompt with full context
+            prompt = self._build_prompt(user_message)
+            logger.debug("Built prompt for LLM: %s", prompt[:100] + "..." if len(prompt) > 100 else prompt)
+            
+            # Attempt to generate with enhanced retry logic
+            try:
+                # Generate stream with explicit timeout handling
+                logger.info(f"Starting stream generation with timeout {self.connect_timeout}s for initial connection")
+                
                 try:
-                    # Generate response using Gemini model
-                    prompt = self._build_prompt(user_message)
-                    logger.debug("Built prompt for LLM: %s", prompt[:100] + "..." if len(prompt) > 100 else prompt)
-                    
                     def generate_stream():
-                        logger.info("Starting generate_content with stream=True")
                         return self.model.generate_content(prompt, stream=True)
                     
-                    logger.info("Waiting for stream initialization (timeout: 30s)")
+                    # Use a shorter timeout for the initial connection, longer for the streaming
                     response = await asyncio.wait_for(
                         asyncio.to_thread(generate_stream),
-                        timeout=30.0  # 30 seconds timeout for stream initialization
+                        timeout=self.connect_timeout
                     )
                     
-                    # Stream the response
+                    # Stream the response with more detailed metrics
                     logger.info("Stream initialized successfully, beginning token streaming")
                     response_text = ""
                     token_count = 0
+                    first_token_time = None
+                    token_start_time = time.time()
+                    stream_timeout = self.response_timeout + 30  # Additional time for streaming
+                    
                     for chunk in response:
-                        if chunk.text:
+                        current_time = time.time()
+                        
+                        # Record first token timing
+                        if token_count == 0:
+                            first_token_time = current_time
+                            first_token_latency = first_token_time - stream_start
+                            logger.info(f"First token received after {first_token_latency:.2f}s")
+                        
+                        # Check for overall stream timeout
+                        if current_time - stream_start > stream_timeout:
+                            logger.warning(f"Stream exceeded timeout of {stream_timeout}s, breaking")
+                            break
+                        
+                        # Check for stalled token stream (10s without tokens)
+                        if token_count > 0 and (current_time - token_start_time) > 10:
+                            logger.warning(f"Token stream stalled for >10s, breaking stream")
+                            break
+                        
+                        if hasattr(chunk, 'text') and chunk.text:
                             chunk_text = chunk.text
                             response_text += chunk_text
                             token_count += 1
-                            if token_count % 10 == 0:
-                                logger.debug("Streamed %d tokens so far", token_count)
-                            yield chunk_text
+                            token_start_time = current_time  # Reset stall timer
                             
+                            # Log progress periodically
+                            if token_count % 20 == 0:
+                                elapsed = current_time - stream_start
+                                tokens_per_second = token_count / elapsed if elapsed > 0 else 0
+                                logger.debug(f"Streamed {token_count} tokens in {elapsed:.2f}s ({tokens_per_second:.1f} t/s)")
+                            
+                            yield chunk_text
+                    
+                    # Log final metrics
+                    total_time = time.time() - stream_start
+                    tokens_per_second = token_count / total_time if total_time > 0 else 0
+                    
                     # Add complete response to history
                     if response_text:
                         self.conversation_history.append({"role": "assistant", "content": response_text.strip()})
                         self._trim_history()
-                        logger.info(f"LLM streamed complete response: {token_count} tokens, '{response_text[:100]}...'")
-                        return
+                        logger.info(f"LLM stream completed in {total_time:.2f}s: {token_count} tokens at {tokens_per_second:.1f} t/s")
                     else:
-                        logger.warning("No text generated in streaming response")
-                        retry_count += 1
-                        if retry_count <= self.max_retries:
-                            logger.info("Retrying stream generation (attempt %d/%d) after delay: %ds", 
-                                      retry_count, self.max_retries, self.retry_delay * retry_count)
-                            await asyncio.sleep(self.retry_delay * retry_count)  # Exponential backoff
-                    
-                except asyncio.TimeoutError as te:
-                    logger.warning(f"LLM streaming timeout (attempt {retry_count+1}/{self.max_retries+1}): {te}")
-                    retry_count += 1
-                    if retry_count <= self.max_retries:
-                        logger.info("Retrying after timeout (attempt %d/%d) with delay: %ds", 
-                                  retry_count, self.max_retries, self.retry_delay * retry_count)
-                        await asyncio.sleep(self.retry_delay * retry_count)  # Exponential backoff
-                    else:
-                        logger.error(f"All {self.max_retries} LLM streaming attempts timed out")
-                        break
-                except Exception as e:
-                    logger.warning(f"LLM streaming attempt {retry_count+1} failed: {e}")
-                    retry_count += 1
-                    if retry_count <= self.max_retries:
-                        logger.info("Retrying after error (attempt %d/%d) with delay: %ds", 
-                                  retry_count, self.max_retries, self.retry_delay * retry_count)
-                        await asyncio.sleep(self.retry_delay * retry_count)  # Exponential backoff
-                    else:
-                        logger.error(f"All {self.max_retries} LLM streaming attempts failed")
-                        break
+                        logger.warning(f"No text generated in stream after {total_time:.2f}s")
+                        # Fall back to mock
+                        mock_response = self._get_mock_response()
+                        for word in mock_response.split():
+                            yield word + " "
+                            await asyncio.sleep(0.05)
                 
-            # If we've exhausted all retries, return a mock response
-            logger.warning("Falling back to mock response after failed retries")
-            mock_response = self._get_mock_response()
-            words = mock_response.split()
-            for word in words:
-                yield word + " "
-                await asyncio.sleep(0.05)
+                except asyncio.TimeoutError:
+                    elapsed = time.time() - stream_start
+                    logger.error(f"Stream initialization timed out after {elapsed:.2f}s")
+                    # Fall back to mock response
+                    mock_response = self._get_mock_response()
+                    for word in mock_response.split():
+                        yield word + " "
+                        await asyncio.sleep(0.05)
+                        
+                except Exception as e:
+                    elapsed = time.time() - stream_start
+                    logger.error(f"Stream generation failed after {elapsed:.2f}s: {str(e)}")
+                    # Fall back to mock response
+                    mock_response = self._get_mock_response()
+                    for word in mock_response.split():
+                        yield word + " "
+                        await asyncio.sleep(0.05)
+                        
+            except RetryError as re:
+                logger.error(f"All retry attempts for stream failed: {str(re)}")
+                # Fall back to mock response
+                mock_response = self._get_mock_response()
+                words = mock_response.split()
+                for word in words:
+                    yield word + " "
+                    await asyncio.sleep(0.05)
                 
         except Exception as e:
-            logger.error(f"LLM response stream failed with critical error: {e}")
+            elapsed = time.time() - stream_start
+            logger.error(f"LLM response stream failed with critical error after {elapsed:.2f}s: {e}")
             # Fallback to mock response
             logger.info("Using mock response after critical error")
             mock_response = self._get_mock_response()
@@ -433,7 +531,8 @@ class LLMService:
                 await asyncio.sleep(0.05)
                 
         finally:
-            logger.info("LLM generate_response_stream completed")
+            total_elapsed = time.time() - stream_start
+            logger.info(f"LLM generate_response_stream completed in {total_elapsed:.2f}s")
     
     def _build_prompt(self, user_input: str) -> str:
         """Build prompt with conversation context"""
@@ -497,7 +596,10 @@ class LLMService:
             return False
         
         try:
+            start_time = time.time()
             test_response = await self.generate_response("Hello, this is a test.")
+            elapsed = time.time() - start_time
+            logger.info(f"LLM connection test completed in {elapsed:.2f}s")
             return len(test_response) > 0
         except Exception as e:
             logger.error(f"LLM connection test failed: {e}")
@@ -511,7 +613,9 @@ class LLMService:
             "api_key_configured": bool(self.api_key and self.api_key != "test_key_for_demo"),
             "conversation_exchanges": len(self.conversation_history) // 2,
             "max_history_length": self.max_history_length,
-            "max_retries": self.max_retries
+            "max_retries": self.max_retries,
+            "connect_timeout": self.connect_timeout,
+            "response_timeout": self.response_timeout
         }
     
     async def cleanup(self):
@@ -536,7 +640,10 @@ class LLMService:
             AI response text or None if failed
         """
         try:
+            start_time = time.time()
             response = await self.generate_response(text)
+            elapsed = time.time() - start_time
+            logger.info(f"Text processing completed in {elapsed:.2f}s")
             return response if response else None
         except Exception as e:
             logger.error(f"Error processing text: {e}")
