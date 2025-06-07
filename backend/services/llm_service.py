@@ -168,18 +168,22 @@ class LLMService:
             return self.model.generate_content(prompt, stream=stream)
         
         try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(generate),
-                timeout=request_timeout
-            )
-        except asyncio.TimeoutError as e:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(generate),
+                    timeout=request_timeout
+                )
+            except asyncio.TimeoutError as e:
+                elapsed = time.time() - start_time
+                logger.warning(f"LLM request timed out after {elapsed:.1f}s (timeout: {request_timeout}s)")
+                raise  # Re-raise for retry handling
+            except Exception as e:
+                elapsed = time.time() - start_time
+                logger.warning(f"LLM request failed after {elapsed:.1f}s: {str(e)}")
+                raise  # Re-raise for retry handling
+        finally:
             elapsed = time.time() - start_time
-            logger.warning(f"LLM request timed out after {elapsed:.1f}s (timeout: {request_timeout}s)")
-            raise  # Re-raise for retry handling
-        except Exception as e:
-            elapsed = time.time() - start_time
-            logger.warning(f"LLM request failed after {elapsed:.1f}s: {str(e)}")
-            raise  # Re-raise for retry handling
+            logger.info(f"LLM request completed or failed after {elapsed:.1f}s")
     
     async def generate_response(self, user_input: str) -> str:
         """

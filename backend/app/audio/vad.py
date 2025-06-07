@@ -103,7 +103,7 @@ class VADEngine:
             logger.debug(f"Buffer size after adding frame: {len(self.audio_buffer)} samples")
             
             # Process when we have enough samples
-            if len(self.audio_buffer) >= self.buffer_size:
+            if len(self.audio_buffer) >= self.buffer_size and self.buffer_size > 0:
                 # Extract chunk
                 chunk = np.array(self.audio_buffer[:self.buffer_size])
                 self.audio_buffer = self.audio_buffer[self.buffer_size:]

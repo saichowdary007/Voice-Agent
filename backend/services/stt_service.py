@@ -124,6 +124,15 @@ class STTService:
             
             self.push_stream = speechsdk.audio.PushAudioInputStream(audio_format)
             self.audio_config = speechsdk.audio.AudioConfig(stream=self.push_stream)
+            
+            # Create speech recognizer during initialization
+            self.speech_recognizer = speechsdk.SpeechRecognizer(
+                speech_config=self.speech_config,
+                audio_config=self.audio_config
+            )
+            
+            # Set up event handlers for real-time processing
+            self._setup_recognition_handlers()
 
             self.is_available = True
             logger.info("✅ Azure Speech STT service initialized successfully")
@@ -153,16 +162,7 @@ class STTService:
                 self.current_session_id = str(uuid.uuid4())[:8]
                 logger.info(f"Starting speech recognition session: {self.current_session_id}")
 
-                # Create speech recognizer
-                self.speech_recognizer = speechsdk.SpeechRecognizer(
-                    speech_config=self.speech_config,
-                    audio_config=self.audio_config
-                )
-
-                # Set up event handlers for real-time processing
-                self._setup_recognition_handlers()
-
-                # Start continuous recognition
+                # Start continuous recognition using the already-configured recognizer
                 await asyncio.get_event_loop().run_in_executor(
                     None, self.speech_recognizer.start_continuous_recognition
                 )

@@ -238,18 +238,29 @@ class AudioService:
             return audio_array
         except asyncio.TimeoutError:
             logger.error(f"FFmpeg async conversion timed out after 15s for args {input_args}. Terminating process.")
-            try: process.terminate() # Try graceful termination
-            except ProcessLookupError: pass # Process might have already exited
+            try: 
+                process.terminate() # Try graceful termination
+            except ProcessLookupError:
+                pass # Process might have already exited
+            except Exception as e:
+                logger.error(f"Error terminating FFmpeg process: {e}")
+                
             await asyncio.sleep(0.1) # Give it a moment
             if process.returncode is None: # Still running
-                try: process.kill() # Force kill
-                except ProcessLookupError: pass 
+                try:
+                    process.kill() # Force kill
+                except ProcessLookupError:
+                    pass
+                except Exception as e:
+                    logger.error(f"Error killing FFmpeg process: {e}")
             return None
         except Exception as e:
             logger.error(f"FFmpeg async conversion with args {input_args} failed with exception: {e}", exc_info=True)
             if process.returncode is None:
-                try: process.kill()
-                except ProcessLookupError: pass
+                try:
+                    process.kill() # Ensure process is killed on any error
+                except Exception as kill_error:
+                    logger.error(f"Error killing FFmpeg process after exception: {kill_error}")
             return None
 
     def _has_valid_header(self, audio_bytes: bytes) -> bool:

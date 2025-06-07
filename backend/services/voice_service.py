@@ -216,6 +216,12 @@ class VoiceService:
         """Background loop for real-time audio processing"""
         logger.info("Starting real-time audio processing loop")
         
+        # Backoff parameters for error handling
+        base_delay = 0.001  # Starting with 1ms
+        max_delay = 0.5  # Maximum backoff of 500ms
+        current_delay = base_delay
+        consecutive_errors = 0
+        
         while True:
             try:
                 # Get audio chunk from queue
@@ -247,17 +253,42 @@ class VoiceService:
                 
                 self.processing_stats.vad_time = vad_time
                 
-                # Track queue latency
-                queue_latency = (time.time() - chunk_timestamp) * 1000
-                if queue_latency > 100:  # Log if queue latency exceeds 100ms
-                    logger.warning(f"High queue latency: {queue_latency:.1f}ms")
+                # Reset backoff on successful processing
+                current_delay = base_delay
+                consecutive_errors = 0
                 
             except asyncio.CancelledError:
+                # Allow task cancellation to propagate
                 logger.info("Audio processing loop cancelled")
                 break
+            except asyncio.QueueEmpty:
+                # Queue is empty - just continue loop
+                continue
+            except (ValueError, TypeError) as data_err:
+                # Data format errors - log and continue
+                consecutive_errors += 1
+                logger.error(f"Data format error in audio processing: {data_err}")
+                await asyncio.sleep(current_delay)
+                # Implement exponential backoff with jitter
+                current_delay = min(current_delay * 2, max_delay) * (0.9 + 0.2 * np.random.random())
             except Exception as e:
-                logger.error(f"Error in audio processing loop: {e}")
-                await asyncio.sleep(0.001)  # Brief pause to prevent tight error loop
+                # For unexpected errors, implement backoff strategy
+                consecutive_errors += 1
+                logger.error(f"Error in audio processing loop: {e}", exc_info=True)
+                
+                # Implement backoff strategy
+                await asyncio.sleep(current_delay)
+                # Exponential backoff with jitter, capped at max_delay
+                current_delay = min(current_delay * 2, max_delay) * (0.9 + 0.2 * np.random.random())
+                
+                # If too many consecutive errors, log warning
+                if consecutive_errors > 10:
+                    logger.warning(f"Multiple consecutive errors ({consecutive_errors}) in audio processing loop")
+                
+                # If critical services are down, break the loop
+                if not self.is_available:
+                    logger.error("Voice service is no longer available. Stopping audio processing loop.")
+                    break
 
     async def _handle_speech_start(self):
         """Handle speech start event"""
