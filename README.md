@@ -1,145 +1,171 @@
 # Voice Agent
 
-A real-time voice agent application with speech recognition, natural language processing, and speech synthesis capabilities.
+A real-time, high-performance voice agent application featuring advanced speech recognition, natural language processing, and text-to-speech capabilities. This project has been refactored for a unified and robust architecture.
 
-## Features
+## 🚀 Key Features & Improvements
 
-- **Real-time Voice Activity Detection (VAD)**: Silero VAD model for accurate speech detection
-- **Speech-to-Text (STT)**: Azure Speech Services for accurate transcription
-- **Natural Language Processing**: Google Gemini for intelligent responses
-- **Text-to-Speech (TTS)**: Fast and natural-sounding voice synthesis
-- **Real-time WebSocket Communication**: Bidirectional real-time communication
-- **Magic UI Frontend**: Stylish interface built with [Magic UI](https://magicui.design)
+-   **Unified Architecture**: A single, cohesive voice service for VAD, STT, LLM, and TTS.
+-   **High Performance**: Async-first design ensures non-blocking operations and reduced latency.
+-   **Real-time WebSocket Communication**: Bidirectional communication for a seamless user experience.
+-   **Advanced Error Recovery**: Robust error handling and automatic recovery mechanisms.
+-   **Magic UI Frontend**: A stylish and responsive interface built with [Magic UI](https://magicui.design).
 
-## Setup
+---
+
+## 🛠️ Setup and Installation
 
 ### Prerequisites
 
-- Python 3.8+
-- Node.js and npm
-- API keys for:
-  - Azure Speech Services
-  - Google Gemini API
+-   Python 3.8+
+-   Node.js and npm
+-   FFmpeg (required for audio processing)
+-   API keys for:
+    -   Azure Speech Services
+    -   Google Gemini API
 
 ### Environment Setup
 
-1. Clone the repository:
-   ```
-   git clone <repository-url>
-   cd Voice\ Agent
-   ```
+1.  **Clone the Repository**:
+    ```bash
+    git clone <repository-url>
+    cd Voice-Agent
+    ```
 
-2. Set up Python virtual environment:
-   ```
-   python -m venv env
-   source env/bin/activate  # On Windows: env\Scripts\activate
-   ```
+2.  **Backend Setup**:
+    -   **Create a Virtual Environment**:
+        ```bash
+        python -m venv venv
+        source venv/bin/activate  # On Windows: venv\Scripts\activate
+        ```
+    -   **Install Python Dependencies**:
+        ```bash
+        pip install -r requirements.txt
+        ```
 
-3. Install Python dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
+3.  **Frontend Setup**:
+    ```bash
+    cd frontend
+    npm install
+    cd ..
+    ```
 
-4. Install frontend dependencies:
-   ```
-   cd frontend
-   npm install
-   cd ..
-   ```
+4.  **Configure Environment Variables**:
+    -   Copy `.env.example` to `.env` and add your API keys. This file configures both the backend and frontend.
+    -   The backend uses environment variables for services, audio settings, and session management.
+    -   The frontend uses `NEXT_PUBLIC_WS_URL` to connect to the backend WebSocket.
 
-5. Copy `.env.example` to `.env` and add your API keys:
-   ```
-   # Core settings
-   DEBUG=false
-   LOG_LEVEL=INFO
+---
 
-   # Azure Speech-to-Text
-   AZURE_SPEECH_KEY=your_azure_speech_key
-   AZURE_SPEECH_REGION=eastus
-   AZURE_SPEECH_ENDPOINT=https://eastus.api.cognitive.microsoft.com/
-   AZURE_SPEECH_LANGUAGE=en-US
+## 🏃‍♀️ Running the Application
 
-   # Google Gemini LLM
-   GOOGLE_API_KEY=your_google_api_key
-   LLM_MODEL=gemini-1.0-pro
+### All-in-One (Recommended)
 
-   # Optional: Use mock services for testing
-   ENABLE_MOCK_SERVICES=false
-   ```
+Use the provided shell scripts to launch the entire application stack.
 
-## Running the Application
-
-### All-in-One Launcher
-
-The easiest way to run the application is using the provided launcher scripts:
-
-#### Local Development
-
-```bash
-# Use our local development script (recommended)
-./start_local.sh
-
-```
-
-#### Docker Deployment
-
-```bash
-# Start with Docker Compose
-./start_docker.sh
-```
+-   **Local Development**:
+    ```bash
+    ./start_local.sh
+    ```
+-   **Docker Deployment**:
+    ```bash
+    ./start_docker.sh
+    ```
 
 ### Running Components Separately
 
-If you prefer to run the components separately:
+1.  **Start the Backend Server**:
+    ```bash
+    # Run the FastAPI backend (defaults to port 8000)
+    PYTHONPATH=. python backend/app/main.py
+    ```
 
-1. Start the backend server:
-   ```bash
-   # Using our helper script (recommended)
-   ./start_backend.sh
-   
-   # Or manually
-   PYTHONPATH=. python3 -m backend.app.main
-   ```
+2.  **Start the Frontend Server**:
+    ```bash
+    # In a separate terminal, run the Next.js frontend
+    cd frontend
+    npm run dev
+    ```
 
-2. In a separate terminal, start the frontend:
-   ```bash
-   # Using our helper script (recommended)
-   ./start_frontend.sh
-   
-   # Or manually
-   cd frontend
-   npm run dev
-   ```
+3.  Access the application at `http://localhost:3000`.
 
-3. Access the application at http://localhost:3000
+---
 
-## Verification
+##  architecture-overview
 
-To verify that all services are working correctly, you can run the verification script:
+The application is composed of a FastAPI backend and a Next.js frontend, communicating via WebSockets.
 
 ```
+┌──────────────────┐      ┌──────────────────┐
+│ Next.js Frontend │ ◀───▶│  FastAPI Backend │
+│ (Magic UI)       │      │ (WebSocket)      │
+└──────────────────┘      └──────────────────┘
+                              │
+                              ▼
+                     ┌─────────────────┐
+                     │  Voice Service  │
+                     └─────────────────┘
+                          │
+              ┌───────────┼───────────┬───────────┐
+              ▼           ▼           ▼           ▼
+        ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
+        │   VAD   │ │   STT   │ │   LLM   │ │   TTS   │
+        └─────────┘ └─────────┘ └─────────┘ └─────────┘
+```
+
+### Backend Components
+
+-   **WebSocket Manager**: Manages all WebSocket connections, sessions, and message routing.
+-   **Voice Service**: A unified service that orchestrates the entire voice processing pipeline, including VAD, STT, LLM, and TTS.
+-   **AI Services**:
+    -   **VAD**: Silero VAD for voice activity detection.
+    -   **STT**: Azure Speech for speech-to-text.
+    -   **LLM**: Gemini 2.0 Flash for natural language understanding.
+    -   **TTS**: Piper TTS for text-to-speech synthesis.
+
+### Frontend Components
+
+-   **VoiceAgent Component**: The main React component that manages the user interface, audio recording, and WebSocket communication.
+-   **AudioPlayer**: A utility for playing back TTS audio streams.
+
+---
+
+## ⚙️ API and WebSocket Protocol
+
+### API Endpoints
+
+-   `GET /`: Service information.
+-   `GET /health`: System health check with detailed service status.
+-   `GET /metrics`: Performance metrics (if enabled).
+-   `ws://localhost:8000/ws`: Main WebSocket endpoint for voice communication.
+
+### WebSocket Messages
+
+The frontend and backend communicate using a JSON-based protocol over WebSockets. Key message types include:
+
+-   **Client → Server**: `ping`, `mute`, `end_speech`, and binary audio chunks.
+-   **Server → Client**: `status`, `partial_transcript`, `final_transcript`, `ai_response`, `tts_audio`, and `tts_complete`.
+
+---
+
+## ✅ Verification and Troubleshooting
+
+### Verification Script
+
+To ensure all backend services are configured and running correctly, use the verification script:
+
+```bash
 cd backend
 PYTHONPATH=.. python verify_services.py
 ```
 
-This will test each component (VAD, STT, LLM, TTS) individually and as an integrated system.
+### Troubleshooting
 
-## Architecture
+-   **API Keys**: If you encounter authentication errors, ensure your API keys are correctly set in the `.env` file. If keys are missing, the system can be configured to use mock services by setting `ENABLE_MOCK_SERVICES=true`.
+-   **Audio Issues**: Verify that your microphone is properly connected and that you have granted microphone permissions in your browser.
+-   **Port Conflicts**: If you encounter port conflicts, you can modify the default ports in the startup scripts or application configuration.
 
-The Voice Agent consists of several key components:
+---
 
-- **Voice Activity Detection (VAD)**: Detects when speech is present in an audio stream
-- **Speech-to-Text (STT)**: Converts spoken words to text
-- **Language Model (LLM)**: Processes text input and generates intelligent responses
-- **Text-to-Speech (TTS)**: Converts text responses to spoken words
-- **WebSocket Manager**: Handles real-time communication between frontend and backend
+## 📄 License
 
-## Troubleshooting
-
-- **Missing API Keys**: If you don't provide valid API keys, the system will use mock services by setting `ENABLE_MOCK_SERVICES=true` in your `.env` file.
-- **Port Conflicts**: If port 8000 is already in use, modify the port in `backend/app/main.py`.
-- **Audio Issues**: Make sure your microphone is properly connected and permissions are granted in your browser.
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details. 
+This project is licensed under the MIT License. See the `LICENSE` file for more details. 

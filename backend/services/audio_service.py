@@ -397,16 +397,27 @@ class AudioService:
     async def _process_chunk_by_format(self, audio_data: bytes, format_name: str) -> Optional[np.ndarray]:
         """Process a chunk directly based on detected format"""
         if format_name == "wav":
-            # Try WAV first (generally most reliable)
-            pcm_array = await self._run_ffmpeg_conversion_internal_async(
-                audio_data, ['-f', 'wav']
-            )
-            if pcm_array is not None:
+            logger.debug("Attempting to decode WAV chunk with soundfile")
+            try:
+                with io.BytesIO(audio_data) as f:
+                    pcm_array, sr = sf.read(f, dtype='float32')
+                if sr != self.sample_rate:
+                    logger.warning(f"Input WAV sample rate {sr} does not match service rate {self.sample_rate}. Audio quality might be affected.")
                 self.format_stats["wav_success"] += 1
+                logger.debug("Successfully decoded WAV with soundfile.")
                 return pcm_array
+            except Exception as e:
+                logger.warning(f"Soundfile WAV decoding failed: {e}. Falling back to FFmpeg.")
+                pcm_array = await self._run_ffmpeg_conversion_internal_async(
+                    audio_data, ['-f', 'wav']
+                )
+                if pcm_array is not None:
+                    self.format_stats["wav_success"] += 1
+                    return pcm_array
                 
         elif format_name == "webm":
             # Try WebM
+            logger.debug("Attempting to decode WebM chunk with FFmpeg")
             pcm_array = await self._run_ffmpeg_conversion_internal_async(
                 audio_data, ['-f', 'webm']
             )
@@ -416,6 +427,7 @@ class AudioService:
                 
         elif format_name == "ogg":
             # Try Ogg
+            logger.debug("Attempting to decode Ogg chunk with FFmpeg")
             pcm_array = await self._run_ffmpeg_conversion_internal_async(
                 audio_data, ['-f', 'ogg']
             )
@@ -424,6 +436,7 @@ class AudioService:
                 return pcm_array
                 
         # Fall back to auto-detect
+        logger.debug("Falling back to FFmpeg auto-detect for chunk")
         pcm_array = await self._run_ffmpeg_conversion_internal_async(
             audio_data, []  # No format specified, let FFmpeg auto-detect
         )
@@ -469,15 +482,27 @@ class AudioService:
         
         # Method 1: Try WAV format first (generally most reliable)
         if format_name == "wav" or format_name == "unknown":
-            pcm_array = await self._run_ffmpeg_conversion_internal_async(
-                audio_data, ['-f', 'wav']
-            )
-            if pcm_array is not None:
+            logger.debug("Attempting to decode as WAV with soundfile")
+            try:
+                with io.BytesIO(audio_data) as f:
+                    pcm_array, sr = sf.read(f, dtype='float32')
+                if sr != self.sample_rate:
+                    logger.warning(f"Input WAV sample rate {sr} does not match service rate {self.sample_rate}. Audio quality might be affected.")
                 self.format_stats["wav_success"] += 1
+                logger.debug("Successfully decoded WAV with soundfile.")
                 return pcm_array
+            except Exception as e:
+                logger.warning(f"Soundfile WAV decoding failed: {e}. Trying FFmpeg for WAV.")
+                pcm_array = await self._run_ffmpeg_conversion_internal_async(
+                    audio_data, ['-f', 'wav']
+                )
+                if pcm_array is not None:
+                    self.format_stats["wav_success"] += 1
+                    return pcm_array
         
         # Method 2: Try WebM format (most common from browsers)
         if format_name == "webm" or format_name == "unknown":
+            logger.debug("Attempting to decode as WebM with FFmpeg")
             pcm_array = await self._run_ffmpeg_conversion_internal_async(
                 audio_data, ['-f', 'webm']
             )
@@ -487,6 +512,7 @@ class AudioService:
                 
         # Method 3: Try Ogg format
         if format_name == "ogg" or format_name == "unknown":
+            logger.debug("Attempting to decode as Ogg with FFmpeg")
             pcm_array = await self._run_ffmpeg_conversion_internal_async(
                 audio_data, ['-f', 'ogg']
             )
@@ -495,6 +521,7 @@ class AudioService:
                 return pcm_array
         
         # Method 4: Try auto-detect format as a fallback
+        logger.debug("Falling back to FFmpeg auto-detect")
         pcm_array = await self._run_ffmpeg_conversion_internal_async(
             audio_data, []  # No format specified, let FFmpeg auto-detect
         )

@@ -34,9 +34,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const vadRef = useRef<MicVAD | null>(null);
-  const pcmPlayerNodeRef = useRef<AudioWorkletNode | null>(null); // May not be used if AudioPlayer handles all
   const keepAliveIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  // const keepAliveTimeoutRef = useRef<NodeJS.Timeout | null>(null); // Removed as logic is combined in interval
 
   const isCleaningUpRef = useRef<boolean>(false);
   const ttsAudioPlayerRef = useRef<AudioPlayer | null>(null);
@@ -68,6 +66,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
   const [audioLevel, setAudioLevel] = useState(0);
   const [latency, setLatency] = useState<number>(0);
   const [isUserSpeaking, setIsUserSpeaking] = useState(false); // For client-side VAD indication
+  const [selectedMimeType, setSelectedMimeType] = useState<string | null>(null);
 
   // Get WebSocket URL from environment variable
   const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8080/ws';
@@ -158,16 +157,6 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         console.warn('Error disconnecting audio source:', e);
       }
       sourceRef.current = null;
-    }
-
-    // Audio worklet node cleanup
-    if (pcmPlayerNodeRef.current) {
-      try {
-        pcmPlayerNodeRef.current.disconnect();
-      } catch (e) {
-        console.warn('Error disconnecting audio worklet node:', e);
-      }
-      pcmPlayerNodeRef.current = null;
     }
 
     // AudioContext cleanup with proper promise handling
@@ -594,18 +583,17 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
   }
 
   const startRecording = useCallback(async () => {
-    if (!session.isConnected || session.isRecording || isCleaningUpRef.current) {
-      console.log('Cannot start recording: not connected, already recording, or cleaning up');
+    if (!session.isConnected || session.isRecording || isCleaningUpRef.current || !selectedMimeType) {
+      console.warn('Cannot start recording: not connected, already recording, cleaning up, or no supported MIME type');
+      if (!selectedMimeType) {
+          onError?.('Your browser does not support the required audio recording formats.');
+      }
       return;
     }
 
     try {
-      console.log('Starting audio recording...');
+      console.log(`Starting audio recording with format: ${selectedMimeType}...`);
       
-      // Log audio format support to help diagnose issues
-      logAudioFormatSupport();
-      
-      // Request microphone access
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           sampleRate: 16000,
@@ -615,80 +603,66 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
           autoGainControl: true,
         }
       });
-
       streamRef.current = stream;
 
-      // Create AudioContext for raw PCM processing
+      const mediaRecorder = new MediaRecorder(stream, { mimeType: selectedMimeType });
+      mediaRecorderRef.current = mediaRecorder;
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (wsRef.current?.readyState !== WebSocket.OPEN) {
+            if(event.data.size > 0) audioQueueRef.current.push(event.data);
+            return;
+        }
+
+        // Perform format-specific validation
+        if (event.data.size > 0) {
+            let minSize = 100; // General minimum size
+            if (selectedMimeType.includes('webm') && audioQueueRef.current.length === 0) {
+                minSize = 20; // WebM header can be small
+            } else if (selectedMimeType.includes('wav')) {
+                minSize = 44; // WAV header is at least 44 bytes
+            }
+
+            if (event.data.size < minSize) {
+                console.warn(`Skipping very small audio chunk (size: ${event.data.size}, format: ${selectedMimeType}).`);
+                return;
+            }
+            console.log(`Sending audio chunk: ${event.data.size} bytes, type: ${selectedMimeType}`);
+            wsRef.current.send(event.data);
+        }
+      };
+      
+      mediaRecorder.onstart = () => {
+          setSession(prev => ({ ...prev, isRecording: true }));
+          console.log('Recording started successfully');
+      };
+
+      mediaRecorder.onerror = (event) => {
+          console.error('MediaRecorder error:', event);
+          const error = (event as any).error;
+          onError?.(`Recording error: ${error.name} - ${error.message}`);
+          handleEndSession(false);
+      };
+      
+      mediaRecorder.start(1000); // Send data every 1000ms
+
+      // Create AudioContext for VAD and audio level monitoring
       const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({
         sampleRate: 16000
       });
       audioContextRef.current = audioContext;
 
-      // Create audio source
       const source = audioContext.createMediaStreamSource(stream);
       sourceRef.current = source;
-
-      // Create ScriptProcessorNode for raw PCM extraction
-      const bufferSize = 4096; // Larger buffer for efficiency
-      const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
       
-      processor.onaudioprocess = (event) => {
-        if (!session.isConnected || session.isMuted || isCleaningUpRef.current) {
-          return;
-        }
-
-        const inputBuffer = event.inputBuffer;
-        const inputData = inputBuffer.getChannelData(0); // Get mono channel
-        
-        // Convert Float32Array to Int16Array (16-bit PCM)
-        const pcmData = new Int16Array(inputData.length);
-        for (let i = 0; i < inputData.length; i++) {
-          // Convert from [-1, 1] to [-32768, 32767]
-          const sample = Math.max(-1, Math.min(1, inputData[i]));
-          pcmData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
-        }
-
-        // Send raw PCM data directly
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          // Validate data before sending
-          if (pcmData.length > 0 && !isAllZeros(pcmData)) {
-            // Debug log on first few packets
-            if (audioSentCounterRef.current < 5) {
-              console.log(`Sending audio chunk #${audioSentCounterRef.current+1}: ${pcmData.length} samples, 16-bit PCM`);
-              audioSentCounterRef.current++;
-            } 
-            wsRef.current.send(pcmData.buffer);
-          } else {
-            console.warn('Skipping empty audio buffer');
-          }
-        } else {
-          if (audioQueueRef.current.length < 20) { // Limit queue size
-            const blob = new Blob([pcmData.buffer], { type: 'audio/raw' });
-            audioQueueRef.current.push(blob);
-          }
-        }
-
-        // Update audio level for UI
-        let sum = 0;
-        for (let i = 0; i < inputData.length; i++) {
-          sum += inputData[i] * inputData[i];
-        }
-        const rms = Math.sqrt(sum / inputData.length);
-        setAudioLevel(rms * 100);
-      };
-
-      // Connect the audio processing chain
-      source.connect(processor);
-      processor.connect(audioContext.destination);
-
-      // Initialize VAD for client-side speech detection
+      // VAD initialization
       try {
         const vad = await MicVAD.new({
           stream,
-          positiveSpeechThreshold: 0.8, // Increase threshold to reduce false positives (default is 0.5)
-          negativeSpeechThreshold: 0.3, // Set slightly lower negative threshold
-          minSpeechFrames: 8, // Require more frames to consider valid speech (default is 3)
-          redemptionFrames: 25, // Increase redemption frames to prevent quick cutoffs
+          positiveSpeechThreshold: 0.8,
+          negativeSpeechThreshold: 0.3,
+          minSpeechFrames: 8,
+          redemptionFrames: 25,
           onSpeechStart: () => {
             console.log('VAD: Speech started');
             setIsUserSpeaking(true);
@@ -696,7 +670,6 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
           onSpeechEnd: () => {
             console.log('VAD: Speech ended');
             setIsUserSpeaking(false);
-            // Send end-of-speech signal to backend
             if (wsRef.current?.readyState === WebSocket.OPEN) {
               wsRef.current.send(JSON.stringify({ type: 'eos' }));
             }
@@ -710,7 +683,6 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         vad.start();
       } catch (vadError) {
         console.warn('VAD initialization failed:', vadError);
-        // Continue without VAD
       }
 
       // Initialize TTS audio player
@@ -718,23 +690,13 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         ttsAudioPlayerRef.current = new AudioPlayer();
       }
 
-      setSession(prev => ({ ...prev, isRecording: true }));
-      console.log('Recording started successfully');
-
     } catch (error) {
       console.error('Error starting recording:', error);
       if (onError) {
         onError(`Failed to start recording: ${error}`);
       }
     }
-  }, [session.isConnected, session.isRecording, session.isMuted, onError]);
-
-  const initializeAudio = useCallback(async () => {
-    // This function is no longer needed as audio initialization
-    // is now handled directly in startRecording with raw PCM processing
-    console.log('initializeAudio called - now handled in startRecording');
-    return true;
-  }, []);
+  }, [session.isConnected, session.isRecording, onError, selectedMimeType]);
 
   const sendWebSocketMessage = useCallback((message: any) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -798,64 +760,74 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
     
     console.log('StartNewSession: Initiating WebSocket connection...');
     connectWebSocket(); // This will attempt to establish a new WebSocket connection
-    // initializeAudio will be called via useEffect when session.isConnected becomes true
-  }, [connectWebSocket]); // Removed session.isConnected to prevent circular dependency
+  }, [connectWebSocket]);
+
+  const getBestSupportedMimeType = useCallback((): string | null => {
+    const mimeTypes = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/ogg;codecs=opus',
+      'audio/ogg',
+      'audio/wav',
+    ];
+    console.log('Checking for best supported MIME type...');
+    for (const mimeType of mimeTypes) {
+      if (MediaRecorder.isTypeSupported(mimeType)) {
+        console.log(`Found supported MIME type: ${mimeType}`);
+        return mimeType;
+      }
+    }
+    console.warn('No supported MIME type found for MediaRecorder');
+    onError?.('Your browser does not support the required audio recording formats.');
+    return null;
+  }, [onError]);
 
   useEffect(() => {
-    // Initial connection attempt - only run once on mount
-    // Use a timeout to allow the component to fully mount before connecting
     const connectionTimer = setTimeout(() => {
       if (!session.isConnected && !session.sessionEnded && !wsRef.current && !isCleaningUpRef.current) {
         console.log("🔗 Initial WebSocket connection attempt after component mount");
+        setSelectedMimeType(getBestSupportedMimeType());
         connectWebSocket();
       }
-    }, 100); // Small delay to ensure component is fully mounted
+    }, 100);
 
-    // Cleanup on component unmount
     return () => {
       console.log("VoiceAgent component unmounting. Performing cleanup.");
-      clearTimeout(connectionTimer); // Cancel pending connection attempt
+      clearTimeout(connectionTimer);
       
-      // Clear reconnection timeout
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
         reconnectTimeoutRef.current = null;
       }
       
-      // Clear audio queue
       audioQueueRef.current = [];
       
-      handleEndSession(false); // User (component unmount) initiated
+      handleEndSession(false);
       if (keepAliveIntervalRef.current) {
         clearInterval(keepAliveIntervalRef.current);
         keepAliveIntervalRef.current = null;
       }
     };
-  }, []); // Empty dependency array - only run on mount/unmount
+  }, [connectWebSocket, getBestSupportedMimeType]);
 
   useEffect(() => {
-    // Attempt to start recording once connected and if not already recording/cleaning up
     if (session.isConnected && !session.isRecording && !streamRef.current && !vadRef.current && !isCleaningUpRef.current) {
       console.log("🔊 useEffect: Connection active, attempting to start recording.");
-      startRecording().then(() => {
-        console.log(`🎯 Recording started successfully`);
-      }).catch(error => {
+      startRecording().catch(error => {
         console.error('Failed to start recording:', error);
       });
     }
-  }, [session.isConnected, session.isRecording, startRecording]); // Depend on isConnected and isRecording
+  }, [session.isConnected, session.isRecording, startRecording]);
 
-  // Get activity indicator based on multiple states
   const getActivityState = () => {
-    if (session.isSpeaking) return 'speaking'; // AI is speaking
-    if (session.isProcessing) return 'processing'; // AI is thinking/STT finalizing
-    if (isUserSpeaking && !session.isMuted) return 'listening'; // User is speaking (client VAD)
-    if (session.isRecording && !session.isMuted) return 'recording'; // Mic is open, VAD might not be active yet
+    if (session.isSpeaking) return 'speaking';
+    if (session.isProcessing) return 'processing';
+    if (isUserSpeaking && !session.isMuted) return 'listening';
+    if (session.isRecording && !session.isMuted) return 'recording';
     return 'idle';
   };
   const activityState = getActivityState();
 
-  // Helper function to validate base64 string
   const isValidBase64 = (str: string): boolean => {
     try {
       return btoa(atob(str)) === str;
@@ -863,11 +835,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       return false;
     }
   };
-
-  // Track number of audio packets sent for logging
-  const audioSentCounterRef = useRef(0);
   
-  // Helper function to log audio format support
   const logAudioFormatSupport = () => {
     const formats = [
       'audio/webm', 
@@ -879,7 +847,7 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       'audio/mpeg'
     ];
     
-    console.log('=== Audio Format Support ===');
+    console.log('=== Browser Audio Format Support ===');
     formats.forEach(format => {
       let supported = false;
       try {
@@ -887,10 +855,9 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
       } catch (e) {
         console.error(`Error checking support for ${format}:`, e);
       }
-      console.log(`${format}: ${supported ? '✅' : '❌'}`);
+      console.log(`${format}: ${supported ? '✅ Supported' : '❌ Not Supported'}`);
     });
     
-    // Log AudioContext information
     try {
       const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
       console.log(`AudioContext: sampleRate=${ctx.sampleRate}, state=${ctx.state}`);
@@ -900,14 +867,6 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
     }
   };
   
-  // Helper function to check if array is all zeros
-  const isAllZeros = (arr: Int16Array): boolean => {
-    for (let i = 0; i < Math.min(arr.length, 100); i++) {
-      if (arr[i] !== 0) return false;
-    }
-    return true;
-  };
-
   const sendDiagnosticMode = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       console.log('Enabling diagnostic mode...');
@@ -918,11 +877,12 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         client_info: {
           userAgent: navigator.userAgent,
           platform: navigator.platform,
-          sampleRate: audioContextRef.current?.sampleRate || 'unknown'
+          sampleRate: audioContextRef.current?.sampleRate || 'unknown',
+          mimeType: selectedMimeType || 'N/A'
         }
       }));
     }
-  }, []);
+  }, [selectedMimeType]);
 
   return (
     <div className="h-screen w-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 flex flex-col">
@@ -998,48 +958,45 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
         )}
         {!transcript.partial && transcript.final.length === 0 && !transcript.aiResponse && !transcript.isAiResponding && (
           <div className="text-white/60 text-center py-8">
-            {session.sessionEnded ? 'Session ended. Click "Start New Session" to begin again.' :
-             session.isConnected ? (session.isMuted ? 'Microphone muted - Click to unmute' : 'Start speaking to begin conversation') :
-             'Connecting to voice service...'}
+            Press the button to start a new session
           </div>
         )}
       </div>
 
-      <div className="absolute bottom-8 left-1/2 transform -translate-x-1/2 flex space-x-6">
+      <div className="absolute bottom-8 left-1/2 -translate-x-1/2 flex flex-col items-center space-y-4">
         {session.sessionEnded ? (
-          <button onClick={startNewSession}
-            className="px-8 py-3 rounded-full bg-green-600 hover:bg-green-700 text-white flex items-center space-x-2 transition-all shadow-lg shadow-green-600/50">
-            <Mic className="w-5 h-5" />
-            <span>Start New Session</span>
+          <button
+            onClick={startNewSession}
+            className="px-8 py-4 bg-blue-600 text-white rounded-full shadow-lg hover:bg-blue-700 transition-all transform hover:scale-105"
+          >
+            Start New Session
           </button>
         ) : (
-          <>
-            <button onClick={toggleMute} disabled={!session.isConnected}
-              className={`w-16 h-16 rounded-full flex items-center justify-center transition-all ${
-                session.isMuted ? 'bg-red-500 hover:bg-red-600 text-white shadow-lg shadow-red-500/50' 
-                                : 'bg-blue-500 hover:bg-blue-600 text-white shadow-lg shadow-blue-500/50'
-              } disabled:opacity-50 disabled:cursor-not-allowed`}>
-              {session.isMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
+          <div className="flex items-center space-x-8">
+            <button
+              onClick={toggleMute}
+              className={`p-4 rounded-full transition-colors ${session.isMuted ? 'bg-red-500/80' : 'bg-gray-700/60 hover:bg-gray-600'}`}
+            >
+              {session.isMuted ? <MicOff className="w-6 h-6 text-white" /> : <Mic className="w-6 h-6 text-white" />}
             </button>
-            <button onClick={endSession} disabled={!session.isConnected || session.isProcessing}
-              className="w-16 h-16 rounded-full bg-red-600 hover:bg-red-700 text-white flex items-center justify-center transition-all shadow-lg shadow-red-600/50 disabled:opacity-50 disabled:cursor-not-allowed">
-              <Square className="w-6 h-6" />
+            <div className="text-white/80 text-sm">
+              {activityState.charAt(0).toUpperCase() + activityState.slice(1)}
+            </div>
+            <button
+              onClick={endSession}
+              className="p-4 rounded-full bg-red-700/80 hover:bg-red-600 transition-colors"
+            >
+              <Square className="w-6 h-6 text-white" />
             </button>
-          </>
+          </div>
+        )}
+        {session.isReconnecting && (
+          <div className="flex items-center space-x-2 text-yellow-400">
+            <AlertTriangle className="w-4 h-4" />
+            <span>Connection lost, attempting to reconnect...</span>
+          </div>
         )}
       </div>
-
-      <div className="absolute bottom-4 right-4 bg-black/30 backdrop-blur-sm rounded-full px-4 py-2">
-        <span className="text-white/80 text-sm capitalize">{activityState}</span>
-      </div>
-
-      {session.isReconnecting && (
-        <div className="absolute top-0 left-0 right-0 bg-yellow-500 text-black text-center p-2 z-50 flex items-center justify-center">
-          <AlertTriangle className="h-5 w-5 mr-2" />
-          Attempting to reconnect to server...
-        </div>
-      )}
-      {/* Processing spinner overlay removed, as processing state is part of activityState visual */}
     </div>
   );
 }

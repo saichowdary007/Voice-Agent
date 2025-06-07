@@ -157,12 +157,12 @@ class LLMService:
         stop=stop_after_attempt(3),  # Maximum number of retry attempts
         wait=wait_exponential(multiplier=1, min=1, max=8),  # Exponential backoff: 1s, 2s, 4s, 8s
         retry=retry_if_exception_type((asyncio.TimeoutError, ConnectionError, IOError, Exception)),  # Expanded retry exceptions
-        reraise=True  # Re-raise the last exception
     )
-    async def _generate_with_retry(self, prompt, stream=False):
+    async def _generate_with_retry(self, prompt, stream=False, timeout: Optional[float] = None):
         """Generate content with enhanced retry logic and explicit timeout"""
         start_time = time.time()
-        logger.info(f"Starting LLM generation request (timeout: {self.response_timeout}s)")
+        request_timeout = timeout if timeout is not None else self.response_timeout
+        logger.info(f"Starting LLM generation request (timeout: {request_timeout}s)")
         
         def generate():
             return self.model.generate_content(prompt, stream=stream)
@@ -170,11 +170,11 @@ class LLMService:
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(generate),
-                timeout=self.response_timeout
+                timeout=request_timeout
             )
         except asyncio.TimeoutError as e:
             elapsed = time.time() - start_time
-            logger.warning(f"LLM request timed out after {elapsed:.1f}s (timeout: {self.response_timeout}s)")
+            logger.warning(f"LLM request timed out after {elapsed:.1f}s (timeout: {request_timeout}s)")
             raise  # Re-raise for retry handling
         except Exception as e:
             elapsed = time.time() - start_time
@@ -419,99 +419,86 @@ class LLMService:
             prompt = self._build_prompt(user_message)
             logger.debug("Built prompt for LLM: %s", prompt[:100] + "..." if len(prompt) > 100 else prompt)
             
-            # Attempt to generate with enhanced retry logic
             try:
-                # Generate stream with explicit timeout handling
+                # Generate stream with explicit timeout handling for initial connection
                 logger.info(f"Starting stream generation with timeout {self.connect_timeout}s for initial connection")
                 
-                try:
-                    def generate_stream():
-                        return self.model.generate_content(prompt, stream=True)
-                    
-                    # Use a shorter timeout for the initial connection, longer for the streaming
-                    response = await asyncio.wait_for(
-                        asyncio.to_thread(generate_stream),
-                        timeout=self.connect_timeout
-                    )
-                    
-                    # Stream the response with more detailed metrics
-                    logger.info("Stream initialized successfully, beginning token streaming")
-                    response_text = ""
-                    token_count = 0
-                    first_token_time = None
-                    token_start_time = time.time()
-                    stream_timeout = self.response_timeout + 30  # Additional time for streaming
-                    
-                    for chunk in response:
-                        current_time = time.time()
-                        
-                        # Record first token timing
-                        if token_count == 0:
-                            first_token_time = current_time
-                            first_token_latency = first_token_time - stream_start
-                            logger.info(f"First token received after {first_token_latency:.2f}s")
-                        
-                        # Check for overall stream timeout
-                        if current_time - stream_start > stream_timeout:
-                            logger.warning(f"Stream exceeded timeout of {stream_timeout}s, breaking")
-                            break
-                        
-                        # Check for stalled token stream (10s without tokens)
-                        if token_count > 0 and (current_time - token_start_time) > 10:
-                            logger.warning(f"Token stream stalled for >10s, breaking stream")
-                            break
-                        
-                        if hasattr(chunk, 'text') and chunk.text:
-                            chunk_text = chunk.text
-                            response_text += chunk_text
-                            token_count += 1
-                            token_start_time = current_time  # Reset stall timer
-                            
-                            # Log progress periodically
-                            if token_count % 20 == 0:
-                                elapsed = current_time - stream_start
-                                tokens_per_second = token_count / elapsed if elapsed > 0 else 0
-                                logger.debug(f"Streamed {token_count} tokens in {elapsed:.2f}s ({tokens_per_second:.1f} t/s)")
-                            
-                            yield chunk_text
-                    
-                    # Log final metrics
-                    total_time = time.time() - stream_start
-                    tokens_per_second = token_count / total_time if total_time > 0 else 0
-                    
-                    # Add complete response to history
-                    if response_text:
-                        self.conversation_history.append({"role": "assistant", "content": response_text.strip()})
-                        self._trim_history()
-                        logger.info(f"LLM stream completed in {total_time:.2f}s: {token_count} tokens at {tokens_per_second:.1f} t/s")
-                    else:
-                        logger.warning(f"No text generated in stream after {total_time:.2f}s")
-                        # Fall back to mock
-                        mock_response = self._get_mock_response()
-                        for word in mock_response.split():
-                            yield word + " "
-                            await asyncio.sleep(0.05)
+                response = await self._generate_with_retry(
+                    prompt,
+                    stream=True,
+                    timeout=self.connect_timeout
+                )
+
+                # Stream the response with more detailed metrics
+                logger.info("Stream initialized successfully, beginning token streaming")
+                response_text = ""
+                token_count = 0
+                first_token_time = None
+                token_start_time = time.time()
+                stream_timeout = self.response_timeout + 30  # Additional time for streaming
                 
-                except asyncio.TimeoutError:
-                    elapsed = time.time() - stream_start
-                    logger.error(f"Stream initialization timed out after {elapsed:.2f}s")
-                    # Fall back to mock response
+                for chunk in response:
+                    current_time = time.time()
+                    
+                    # Record first token timing
+                    if token_count == 0:
+                        first_token_time = current_time
+                        first_token_latency = first_token_time - stream_start
+                        logger.info(f"First token received after {first_token_latency:.2f}s")
+                    
+                    # Check for overall stream timeout
+                    if current_time - stream_start > stream_timeout:
+                        logger.warning(f"Stream exceeded timeout of {stream_timeout}s, breaking")
+                        break
+                    
+                    # Check for stalled token stream (10s without tokens)
+                    if token_count > 0 and (current_time - token_start_time) > 10:
+                        logger.warning(f"Token stream stalled for >10s, breaking stream")
+                        break
+                    
+                    if hasattr(chunk, 'text') and chunk.text:
+                        chunk_text = chunk.text
+                        response_text += chunk_text
+                        token_count += 1
+                        token_start_time = current_time  # Reset stall timer
+                        
+                        # Log progress periodically
+                        if token_count % 20 == 0:
+                            elapsed = current_time - stream_start
+                            tokens_per_second = token_count / elapsed if elapsed > 0 else 0
+                            logger.debug(f"Streamed {token_count} tokens in {elapsed:.2f}s ({tokens_per_second:.1f} t/s)")
+                        
+                        yield chunk_text
+                
+                # Log final metrics
+                total_time = time.time() - stream_start
+                tokens_per_second = token_count / total_time if total_time > 0 else 0
+                
+                # Add complete response to history
+                if response_text:
+                    self.conversation_history.append({"role": "assistant", "content": response_text.strip()})
+                    self._trim_history()
+                    logger.info(f"LLM stream completed in {total_time:.2f}s: {token_count} tokens at {tokens_per_second:.1f} t/s")
+                else:
+                    logger.warning(f"No text generated in stream after {total_time:.2f}s")
+                    # Fall back to mock
                     mock_response = self._get_mock_response()
                     for word in mock_response.split():
                         yield word + " "
                         await asyncio.sleep(0.05)
-                        
-                except Exception as e:
-                    elapsed = time.time() - stream_start
-                    logger.error(f"Stream generation failed after {elapsed:.2f}s: {str(e)}")
-                    # Fall back to mock response
-                    mock_response = self._get_mock_response()
-                    for word in mock_response.split():
-                        yield word + " "
-                        await asyncio.sleep(0.05)
-                        
+
             except RetryError as re:
                 logger.error(f"All retry attempts for stream failed: {str(re)}")
+                # Fall back to mock response
+                mock_response = self._get_mock_response()
+                words = mock_response.split()
+                for word in words:
+                    yield word + " "
+                    await asyncio.sleep(0.05)
+            
+            except Exception as e:
+                elapsed = time.time() - stream_start
+                logger.error(f"LLM streaming failed after {elapsed:.2f}s: {e}")
                 # Fall back to mock response
                 mock_response = self._get_mock_response()
                 words = mock_response.split()
