@@ -38,7 +38,7 @@ class AppSettings(BaseSettings):
 
     # API Keys - Standardized naming
     google_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("GOOGLE_API_KEY"), description="Google AI API Key for Gemini")
-    azure_speech_key: Optional[str] = Field(default_factory=lambda: os.getenv("AZURE_SPEECH_KEY", "3AbXttS4rrG8QqKcH9dEEJePfgzR6Rkssg6rCX3FAioVRBzdKonlJQQJ99BFACYeBjFXJ3w3AAAYACOGaRsS"), description="Azure Speech API Key")
+    azure_speech_key: Optional[str] = Field(default_factory=lambda: os.getenv("AZURE_SPEECH_KEY"), description="Azure Speech API Key")
     azure_speech_region: Optional[str] = Field(default_factory=lambda: os.getenv("AZURE_SPEECH_REGION", "eastus"), description="Azure Speech Service Region")
     
     # Azure STT specific settings
