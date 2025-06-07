@@ -1,23 +1,11 @@
-#!/bin/bash
+#!/bin/sh
+# docker-entrypoint.sh
+
+# Exit immediately if a command exits with a non-zero status
 set -e
 
-# Setup environment
-export PYTHONPATH=/app
-
-# Print Python path info for debugging
-echo "PYTHONPATH: $PYTHONPATH"
-echo "Current directory: $(pwd)"
-echo "Python version: $(python --version)"
-
-# List directories to verify structure
-echo "Directory structure:"
-ls -la
-
-# Create symbolic link if needed
-if [ ! -L "/app/backend" ] && [ -d "/app" ]; then
-    echo "Creating symbolic link for backend module"
-    ln -s /app /app/backend
-fi
-
-# Start the application
-exec "$@" 
+# Run Gunicorn with Uvicorn workers
+exec gunicorn "backend.app.main:app" \
+    --workers 4 \
+    --worker-class "uvicorn.workers.UvicornWorker" \
+    --bind "0.0.0.0:8000" 

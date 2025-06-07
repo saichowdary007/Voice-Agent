@@ -11,6 +11,7 @@ from .vad_service import VADService
 from .stt_service import STTService
 from .llm_service import LLMService
 from .tts_service import TTSService
+from .audio_service import AudioService
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,7 @@ class VoiceService:
         )
         self.llm_service = LLMService()
         self.tts_service = TTSService()
+        self.audio_service = AudioService()
         
         # Service state
         self.is_available = False
@@ -100,7 +102,8 @@ class VoiceService:
                 self.vad_service.initialize(),
                 self.stt_service.initialize(),
                 self.llm_service.initialize(),
-                self.tts_service.initialize()
+                self.tts_service.initialize(),
+                self.audio_service.initialize()
             ]
             
             await asyncio.gather(*init_tasks, return_exceptions=True)
@@ -110,7 +113,8 @@ class VoiceService:
                 self.vad_service.is_available,
                 self.stt_service.is_available,
                 self.llm_service.is_available,
-                self.tts_service.is_available
+                self.tts_service.is_available,
+                self.audio_service.is_available
             ]
             
             if all(services_ready):
@@ -130,7 +134,7 @@ class VoiceService:
                 logger.info("✅ Real-time voice service initialized successfully")
                 logger.info(f"Target latency: 500ms | Chunk size: {self.chunk_size} samples ({self.chunk_duration_ms}ms)")
             else:
-                logger.warning(f"Some services failed to initialize: VAD={services_ready[0]}, STT={services_ready[1]}, LLM={services_ready[2]}, TTS={services_ready[3]}")
+                logger.warning(f"Some services failed to initialize: VAD={services_ready[0]}, STT={services_ready[1]}, LLM={services_ready[2]}, TTS={services_ready[3]}, Audio={services_ready[4]}")
                 self.is_available = any(services_ready)
                 
         except Exception as e:
@@ -390,53 +394,33 @@ class VoiceService:
             logger.error(f"Error stopping voice session: {e}")
 
     async def get_health_status(self) -> Dict[str, Any]:
-        """Get health status of all services with performance metrics"""
-        status = {
-            "voice_service": {
-                "available": self.is_available,
-                "initialized": self.is_initialized,
-                "processing_audio": self.is_processing_audio,
-                "current_session": self.current_session_id,
-                "session_count": self.session_count,
-                "audio_queue_size": self.audio_queue.qsize() if hasattr(self, 'audio_queue') else 0,
-                "processing_stats": {
-                    "avg_vad_time_ms": round(self.processing_stats.vad_time, 2),
-                    "avg_stt_time_ms": round(self.processing_stats.stt_time, 2),
-                    "avg_llm_time_ms": round(self.processing_stats.llm_time, 2),
-                    "avg_tts_time_ms": round(self.processing_stats.tts_time, 2),
-                    "chunks_processed": self.processing_stats.audio_chunks_processed,
-                    "speech_sessions": self.processing_stats.speech_sessions
-                }
-            }
-        }
+        """Get health status of all underlying services"""
         
-        # Check individual services
+        # Helper to get status safely
+        def get_status_safe(service):
+            if hasattr(service, 'get_status'):
+                return service.get_status()
+            elif hasattr(service, 'is_available'):
+                return {"available": service.is_available}
+            return {"available": False, "error": "Status method not found"}
+
         services = {
-            "vad": self.vad_service,
-            "stt": self.stt_service,
-            "llm": self.llm_service,
-            "tts": self.tts_service
+            "vad_service": self.vad_service,
+            "stt_service": self.stt_service,
+            "llm_service": self.llm_service,
+            "tts_service": self.tts_service,
+            "audio_service": self.audio_service
         }
         
-        for name, service in services.items():
-            if service:
-                if hasattr(service, 'get_status') and callable(service.get_status):
-                    try:
-                        if asyncio.iscoroutinefunction(service.get_status):
-                            # Handle async get_status methods
-                            service_status = await service.get_status()
-                            status[name] = service_status
-                        else:
-                            # Handle synchronous get_status methods
-                            status[name] = service.get_status()
-                    except Exception as e:
-                        status[name] = {"available": False, "error": str(e)}
-                else:
-                    status[name] = {"available": False, "error": "No status method"}
-            else:
-                status[name] = {"available": False, "error": "Service not initialized"}
+        service_statuses = {name: get_status_safe(service) for name, service in services.items()}
         
-        return status
+        # Overall voice service status
+        is_healthy = all(status.get('available', False) for status in service_statuses.values())
+        
+        return {
+            "voice_service": {"available": self.is_available and is_healthy, "is_initialized": self.is_initialized},
+            **service_statuses
+        }
 
     async def cleanup(self):
         """Cleanup all voice processing resources"""
@@ -454,13 +438,18 @@ class VoiceService:
                 pass
         
         # Cleanup all services
-        cleanup_tasks = []
-        for service in [self.vad_service, self.stt_service, self.llm_service, self.tts_service]:
-            if service and hasattr(service, 'cleanup'):
-                cleanup_tasks.append(service.cleanup())
+        cleanup_tasks = [
+            self.vad_service.cleanup() if hasattr(self.vad_service, 'cleanup') else asyncio.sleep(0),
+            self.stt_service.cleanup() if hasattr(self.stt_service, 'cleanup') else asyncio.sleep(0),
+            self.llm_service.cleanup() if hasattr(self.llm_service, 'cleanup') else asyncio.sleep(0),
+            self.tts_service.cleanup() if hasattr(self.tts_service, 'cleanup') else asyncio.sleep(0),
+            self.audio_service.cleanup() if hasattr(self.audio_service, 'cleanup') else asyncio.sleep(0)
+        ]
         
-        if cleanup_tasks:
+        try:
             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
         
         logger.info("Voice service cleanup completed")
 
@@ -511,11 +500,10 @@ class VoiceService:
         """Force end current user speech if any"""
         try:
             # Notify STT service to finalize any pending transcription
-            await self.stt_service.end_audio()
+            await self.stt_service.stop_continuous_recognition()
             
             # Reset VAD state
             self.is_user_speaking = False
-            self.user_speech_start_time = None
             
             logger.info("User speech ended by explicit request")
         except Exception as e:

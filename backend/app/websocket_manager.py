@@ -25,8 +25,9 @@ class WebSocketSession:
 class WebSocketManager:
     """Manages WebSocket connections and sessions"""
     
-    def __init__(self, voice_service, metrics=None):
+    def __init__(self, voice_service, audio_service, metrics=None):
         self.voice_service = voice_service
+        self.audio_service = audio_service
         self.metrics = metrics
         self.sessions: Dict[str, WebSocketSession] = {}
         self.max_sessions = settings.max_concurrent_sessions
@@ -105,6 +106,7 @@ class WebSocketManager:
         session_handler = WebSocketSessionHandler(
             session=session,
             voice_service=self.voice_service,
+            audio_service=self.audio_service,
             logger=session_logger,
             metrics=self.metrics
         )
@@ -188,9 +190,10 @@ class WebSocketManager:
 class WebSocketSessionHandler:
     """Handles individual WebSocket session logic"""
     
-    def __init__(self, session: WebSocketSession, voice_service, logger, metrics=None):
+    def __init__(self, session: WebSocketSession, voice_service, audio_service, logger, metrics=None):
         self.session = session
         self.voice_service = voice_service
+        self.audio_service = audio_service
         self.logger = logger
         self.metrics = metrics
         
@@ -204,327 +207,158 @@ class WebSocketSessionHandler:
         self.speech_start_time: Optional[float] = None
         
     async def handle_audio(self, audio_data: bytes):
-        """Handle incoming audio data"""
+        """Handle incoming audio data by passing it to the advanced audio service."""
         try:
-            if not audio_data or len(audio_data) < 100:
+            if not audio_data:
                 return
-            
-            self.logger.debug(f"Received audio chunk: {len(audio_data)} bytes")
-            
-            # Detect audio format and convert if needed
-            is_webm = audio_data.startswith(b'\x1a\x45\xdf\xa3')  # WebM magic bytes
-            is_wav = audio_data.startswith(b'RIFF') and b'WAVE' in audio_data[:20]  # WAV magic bytes
-            is_ogg = audio_data.startswith(b'OggS')  # Ogg magic bytes
-            
-            # Debug log for first few audio chunks
-            if not hasattr(self, '_audio_debug_counter'):
-                self._audio_debug_counter = 0
-            
-            if self._audio_debug_counter < 3:
-                format_name = "unknown"
-                if is_webm:
-                    format_name = "WebM"
-                elif is_wav:
-                    format_name = "WAV"
-                elif is_ogg:
-                    format_name = "OGG"
-                else:
-                    # Try to detect PCM by checking byte patterns
-                    pcm_bytes = audio_data[:20]
-                    if all(0 <= b <= 255 for b in pcm_bytes) and any(b > 0 for b in pcm_bytes):
-                        # Get first few bytes for debug
-                        first_bytes = ", ".join([f"{b:02x}" for b in pcm_bytes[:10]])
-                        format_name = f"Likely PCM (first bytes: {first_bytes})"
+
+            self.logger.debug(f"Received audio chunk: {len(audio_data)} bytes. Processing with AudioService.")
+
+            # Use the robust audio service to convert any format to raw PCM
+            pcm_audio_array = await self.audio_service.extract_pcm_smart_async(audio_data)
+
+            if pcm_audio_array is not None and pcm_audio_array.size > 0:
+                # Convert float32 numpy array back to 16-bit PCM bytes for the rest of the pipeline
+                pcm_bytes = (pcm_audio_array * 32767).astype(np.int16).tobytes()
                 
-                self.logger.info(f"Audio format detection: {format_name}, size: {len(audio_data)} bytes")
-                self._audio_debug_counter += 1
-            
-            if is_webm or is_ogg:
-                self.logger.debug(f"Detected {'WebM' if is_webm else 'Ogg'} format, will convert to PCM")
-                # For WebM and Ogg formats, we need to accumulate data
-                # Add to buffer directly and return
-                self.audio_buffer.extend(audio_data)
-                if len(self.audio_buffer) >= 1024:  # Wait for at least 1KB of data
-                    pcm_data = await self._convert_to_pcm(bytes(self.audio_buffer))
-                    if pcm_data:
-                        # Reset buffer and process the converted PCM
-                        self.audio_buffer = bytearray()
-                        # Process PCM data frame by frame
-                        frame_size = self._get_frame_size()
-                        for i in range(0, len(pcm_data), frame_size):
-                            frame = pcm_data[i:i+frame_size]
-                            if len(frame) == frame_size:
-                                await self._process_audio_frame(frame)
-                            elif len(frame) > 0:
-                                # Pad last frame if needed
-                                padded = frame + bytes(frame_size - len(frame))
-                                await self._process_audio_frame(padded)
-                return
-            elif is_wav:
-                # For WAV, extract PCM data from WAV header
-                if len(audio_data) > 44:  # WAV header is 44 bytes
-                    pcm_data = audio_data[44:]  # Skip WAV header
-                    # Process PCM directly
-                    frame_size = self._get_frame_size()
-                    for i in range(0, len(pcm_data), frame_size):
-                        frame = pcm_data[i:i+frame_size]
-                        if len(frame) == frame_size:
-                            await self._process_audio_frame(frame)
-                        elif len(frame) > 0:
-                            # Pad last frame if needed
-                            padded = frame + bytes(frame_size - len(frame))
-                            await self._process_audio_frame(padded)
-                    return
-            
-            # Default handling for PCM data or unknown format
-            self.audio_buffer.extend(audio_data)
-            
-            # Process if we have enough data
-            frame_size = self._get_frame_size()
-            if len(self.audio_buffer) >= frame_size:
-                await self._process_audio_buffer()
+                self.logger.debug(f"Successfully converted audio to {len(pcm_bytes)} bytes of PCM data.")
                 
+                # Add the processed frame to the audio buffer for processing
+                self.audio_buffer.extend(pcm_bytes)
+                
+                # Process buffer if it contains enough data for a frame
+                frame_size = self._get_frame_size()
+                while len(self.audio_buffer) >= frame_size:
+                    frame = self.audio_buffer[:frame_size]
+                    del self.audio_buffer[:frame_size]
+                    
+                    # Offload the actual processing to avoid blocking the audio reception loop
+                    task = asyncio.create_task(self._process_audio_frame(frame))
+                    self.processing_tasks.add(task)
+                    task.add_done_callback(self.processing_tasks.discard)
+            
+            elif self.audio_service.has_failed_chunks():
+                # Log information about chronically failing chunks if they exist
+                failed_info = self.audio_service.get_failed_chunks_info()
+                self.logger.warning(f"AudioService reported failed chunks: {failed_info['count']} chunks, {failed_info['total_size']} bytes.")
+                # Optional: Clear failed chunks buffer if it gets too large
+                if failed_info['count'] > 10:
+                    self.logger.warning("Clearing accumulated failed audio chunks.")
+                    self.audio_service.clear_failed_chunks()
+
         except Exception as e:
-            error_msg = str(e) or "Unknown audio processing error"
-            self.logger.error(f"Audio handling error: {error_msg}", exc_info=True)
-            await self._send_error(f"Audio processing failed: {error_msg}")
-    
-    async def _convert_to_pcm(self, audio_data: bytes) -> Optional[bytes]:
-        """Convert WebM/Ogg audio to raw PCM data"""
-        try:
-            import tempfile
-            import subprocess
-            import os
-            
-            # Create temporary files
-            with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as in_file, \
-                 tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as out_file:
-                
-                in_path = in_file.name
-                out_path = out_file.name
-                
-                # Write input data
-                in_file.write(audio_data)
-                in_file.flush()
-                
-                # Convert using ffmpeg
-                cmd = [
-                    'ffmpeg',
-                    '-y',  # Overwrite output
-                    '-i', in_path,  # Input file
-                    '-ar', '16000',  # Sample rate
-                    '-ac', '1',  # Mono
-                    '-f', 's16le',  # 16-bit PCM
-                    out_path  # Output file
-                ]
-                
-                # Run ffmpeg
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                _, stderr = await process.communicate()
-                
-                if process.returncode != 0:
-                    error = stderr.decode() if stderr else f"FFmpeg error code: {process.returncode}"
-                    self.logger.error(f"FFmpeg conversion error: {error}")
-                    return None
-                
-                # Read output PCM data
-                with open(out_path, 'rb') as f:
-                    pcm_data = f.read()
-                
-                # Clean up temp files
-                try:
-                    os.unlink(in_path)
-                    os.unlink(out_path)
-                except Exception as e:
-                    self.logger.warning(f"Failed to clean up temp files: {e}")
-                
-                return pcm_data
-                
-        except Exception as e:
-            self.logger.error(f"Audio conversion error: {e}", exc_info=True)
-            return None
-    
+            self.logger.error(f"Error in handle_audio: {e}", exc_info=True)
+
     async def handle_control(self, data: Dict[str, Any]):
-        """Handle control messages"""
-        try:
-            message_type = data.get("type")
-            
-            if message_type == "ping":
-                await self._send_message({"type": "pong"})
-            elif message_type == "mute":
-                await self._handle_mute(data.get("muted", False))
-            elif message_type == "end_speech":
-                await self._handle_end_speech()
-            elif message_type == "eos":
-                await self._handle_end_of_stream()
-            elif message_type == "config":
-                await self._handle_config_message(data)
-            else:
-                self.logger.warning(f"Unknown control message: {message_type}")
-                await self._send_error(f"Unknown control message type: {message_type}")
-                
-        except Exception as e:
-            error_msg = str(e) or "Unknown control message error"
-            self.logger.error(f"Control message error: {error_msg}", exc_info=True)
-            await self._send_error(f"Failed to process message: {error_msg}")
-            
+        """Handle control messages from the client"""
+        msg_type = data.get("type")
+        self.logger.info(f"Received control message: {msg_type}")
+
+        if msg_type == "config":
+            await self._handle_config_message(data)
+        elif msg_type == "endOfStream":
+            await self._handle_end_of_stream()
+        elif msg_type == "mute":
+            await self._handle_mute(data.get("muted", False))
+        elif msg_type == "endSpeech":
+            await self._handle_end_speech()
+        else:
+            self.logger.warning(f"Unknown control message type: {msg_type}")
+            await self._send_error(f"Unknown control message type: {msg_type}")
+
     async def _handle_config_message(self, data: Dict[str, Any]):
-        """Handle configuration message from client"""
-        try:
-            # Enable diagnostic mode
-            if data.get("diagnostics") is True:
-                self.logger.info("Diagnostic mode enabled by client")
-                
-                # Log client info if provided
-                client_info = data.get("client_info", {})
-                if client_info:
-                    self.logger.info(f"Client info: {client_info}")
-                    
-                # Set verbose logging
-                if data.get("verbose_logging") is True:
-                    self.logger.info("Verbose logging enabled")
-                    
-                # Send acknowledgment
-                await self._send_message({
-                    "type": "config_response",
-                    "diagnostics_enabled": True,
-                    "server_info": {
-                        "frame_size": self._get_frame_size(),
-                        "sample_rate": 16000,
-                        "channels": 1,
-                        "bit_depth": 16
-                    }
-                })
-                
-        except Exception as e:
-            self.logger.error(f"Error handling config message: {e}")
-            await self._send_error(f"Failed to apply configuration: {str(e)}")
-    
-    async def _process_audio_buffer(self):
-        """Process accumulated audio buffer"""
-        frame_size = self._get_frame_size()
+        """Handle client configuration message"""
+        config = data.get("config", {})
+        self.logger.info(f"Client configuration received: {config}")
         
-        while len(self.audio_buffer) >= frame_size:
-            # Extract frame
-            frame = bytes(self.audio_buffer[:frame_size])
-            self.audio_buffer = self.audio_buffer[frame_size:]
-            
-            # Process frame asynchronously
-            task = asyncio.create_task(self._process_audio_frame(frame))
-            self.processing_tasks.add(task)
-            task.add_done_callback(self.processing_tasks.discard)
-    
+        # Example: update audio settings if provided
+        sample_rate = config.get("sampleRate")
+        if sample_rate and self.voice_service.sample_rate != sample_rate:
+            self.logger.warning(f"Client sample rate ({sample_rate}) differs from server ({self.voice_service.sample_rate}). Mismatches may cause issues.")
+        
+        # Reset audio service session to clear any buffered data from previous configs
+        if self.audio_service:
+            self.audio_service.reset_session()
+            self.logger.info("Audio service session state has been reset.")
+
+        # Acknowledge config
+        await self._send_message({
+            "type": "status",
+            "message": "Configuration received"
+        })
+
     async def _process_audio_frame(self, frame: bytes):
-        """Process a single audio frame with VAD and send to speech-to-text if speech is detected"""
+        """Process a single audio frame"""
         try:
-            # Convert frame to numpy array for processing
-            frame_array = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32767.0
+            # Send frame to voice service for processing (VAD, STT)
+            result = await self.voice_service.process_audio_frame(frame)
             
-            if len(frame_array) == 0:
-                self.logger.warning("Empty audio frame received")
-                return
-                
-            # Process with VAD service
-            vad_result = await self.voice_service.process_audio_chunk(frame_array)
+            # Update metrics if enabled
+            if self.metrics and 'latency' in result:
+                await self.metrics.record_audio_processing_latency(result['latency'])
             
-            # Add diagnostic info
-            vad_debug_info = {
-                "speech_prob": vad_result.get("confidence", 0),
-                "speech_frames": vad_result.get("consecutive_speech_frames", 0),
-                "silence_frames": vad_result.get("consecutive_silence_frames", 0),
-                "frame_size": len(frame_array)
-            }
+            # Handle VAD events if implemented in voice service
+            # This part is simplified as VoiceService now manages VAD internally
             
-            # Log voice activity transitions with more detailed diagnostics
-            if vad_result.get("speech_started"):
-                self.logger.info(f"VAD: Speech started. Diagnostics: {vad_debug_info}")
-                await self._send_message({"type": "vad_status", "status": "speech_started", "diagnostics": vad_debug_info})
-                
-            if vad_result.get("speech_ended"):
-                self.logger.info(f"VAD: Speech ended. Diagnostics: {vad_debug_info}")
-                await self._send_message({"type": "vad_status", "status": "speech_ended", "diagnostics": vad_debug_info})
-                
-            # Forward audio to voice service for processing if needed
-            if vad_result.get("speech_detected"):
-                await self.voice_service.process_audio(frame)
-                
         except Exception as e:
-            self.logger.error(f"Audio frame processing error: {e}", exc_info=True)
-    
+            self.logger.error(f"Frame processing error: {e}", exc_info=True)
+
     async def _handle_end_of_stream(self):
-        """Handle explicit end-of-stream marker from client"""
-        self.logger.debug("Received end-of-stream signal from client")
+        """Handle end of audio stream from client"""
+        self.logger.info("End of stream received")
         
-        try:
-            # Get latest VAD state for diagnostics
-            vad_status = self.voice_service.get_vad_status()
-            self.logger.info(f"VAD status at end-of-stream: {vad_status}")
+        # Process any remaining audio in the buffer
+        if len(self.audio_buffer) > 0:
+            frame_size = self._get_frame_size()
+            frame = self.audio_buffer[:]
+            if len(frame) < frame_size:
+                # Pad the final frame
+                frame += bytes(frame_size - len(frame))
             
-            # Force end speech processing
-            await self.voice_service.end_user_speech()
-            
-            # Acknowledge EOS to client
-            await self._send_message({
-                "type": "eos_ack",
-                "vad_status": vad_status
-            })
-        except Exception as e:
-            self.logger.error(f"Error handling end-of-stream: {e}", exc_info=True)
-    
+            await self._process_audio_frame(frame)
+            self.audio_buffer.clear()
+        
+        # Notify voice service that user speech has ended
+        await self.voice_service.end_user_speech()
+
     async def _handle_mute(self, muted: bool):
-        """Handle mute/unmute"""
-        self.logger.info(f"Session {'muted' if muted else 'unmuted'}")
-        # Could implement muting logic here
-    
+        """Handle mute/unmute commands from client"""
+        self.logger.info(f"Setting mute status to: {muted}")
+        # Placeholder for mute logic if needed
+
     async def _handle_end_speech(self):
-        """Handle end of speech signal"""
-        if self.is_speaking:
-            self.is_speaking = False
-            await self._send_message({"type": "speech_end"})
-            self.logger.info("Speech ended by client signal")
-    
+        """Handle explicit end-of-speech command from client"""
+        self.logger.info("Client explicitly ended speech")
+        await self.voice_service.end_user_speech()
+
     async def _send_message(self, data: Dict[str, Any]):
-        """Send message to client"""
+        """Send a JSON message to the client"""
         try:
-            websocket = self.session.websocket
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.send_text(json.dumps(data))
+            if self.session.websocket.client_state == WebSocketState.CONNECTED:
+                await self.session.websocket.send_text(json.dumps(data))
         except Exception as e:
-            self.logger.error(f"Failed to send message: {str(e)}")
-    
+            self.logger.error(f"Failed to send message: {e}")
+
     async def _send_error(self, error: str):
-        """Send error message to client"""
-        error_message = error if error else "Unknown server error"
+        """Send an error message to the client"""
         await self._send_message({
             "type": "error",
-            "message": error_message,
+            "message": error,
             "timestamp": time.time()
         })
-    
+
     def _get_frame_size(self) -> int:
-        """Get audio frame size in bytes"""
-        # 16-bit PCM, mono, for frame duration
-        samples_per_frame = settings.sample_rate * settings.frame_duration_ms // 1000
-        return samples_per_frame * 2  # 2 bytes per sample (16-bit)
-    
+        """Calculate the audio frame size in bytes"""
+        # 16000 sample rate, 16-bit depth, 1 channel
+        # Frame duration from settings
+        return int(16000 * (settings.frame_duration_ms / 1000) * 2)
+
     async def cleanup(self):
-        """Cleanup session handler"""
+        """Clean up session resources"""
         self.logger.info("Cleaning up session handler")
-        
-        # Cancel processing tasks
-        for task in list(self.processing_tasks):
-            if not task.done():
-                task.cancel()
-        
-        # Wait for tasks to complete
+        # Cancel any outstanding processing tasks
+        for task in self.processing_tasks:
+            task.cancel()
         if self.processing_tasks:
             await asyncio.gather(*self.processing_tasks, return_exceptions=True)
-        
-        self.processing_tasks.clear()
-        self.audio_buffer.clear()
-        
-        self.logger.info("Session handler cleanup complete") 
+        self.logger.info("Session handler cleanup complete")

@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI):
                         logger.info(f"{service_name.upper()}: {status_str}")
         
         # Initialize WebSocket manager
-        websocket_manager = WebSocketManager(voice_service, metrics)
+        websocket_manager = WebSocketManager(voice_service, voice_service.audio_service, metrics)
         
         # Store in app state
         app.state.voice_service = voice_service
