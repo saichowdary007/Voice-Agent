@@ -11,3 +11,6 @@ httpx
 websockets
 requests
 google-generativeai
+
+grpcio
+grpcio-tools
