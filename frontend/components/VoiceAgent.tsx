@@ -69,8 +69,8 @@ export default function VoiceAgent({ onError }: VoiceAgentProps) {
   const [latency, setLatency] = useState<number>(0);
   const [isUserSpeaking, setIsUserSpeaking] = useState(false); // For client-side VAD indication
 
-  // Update the WebSocket URL to match the backend port and use environment variable
-  const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8003/ws';
+  // Get WebSocket URL from environment variable
+  const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8080/ws';
 
   // Add a ref to track sessionEnded state without causing re-renders
   const sessionEndedRef = useRef(false);
