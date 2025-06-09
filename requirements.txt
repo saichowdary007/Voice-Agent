@@ -1,0 +1,14 @@
+webrtcvad-wheels
+openai-whisper
+google-generativeai
+piper-tts
+pyaudio
+numpy
+fastapi
+uvicorn
+python-dotenv
+soundfile
+fasttext
+sentence-transformers
+psycopg2-binary
+pgvector
