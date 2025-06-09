@@ -21,3 +21,4 @@ build/
 
 # Docker files
 *.dockerfile
+lid.176.bin
