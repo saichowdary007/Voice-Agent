@@ -1,168 +1,118 @@
-import pyaudio
-import time
-import numpy as np
-import collections
-import traceback
+#!/usr/bin/env python3
+"""
+Main entry point for the refactored, ultra-fast voice agent.
+Now with user authentication.
+"""
+# Set this environment variable before importing any other modules.
+# This prevents a deadlock issue with the tokenizers library when used in a forked process.
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-from src.vad import VAD
+import asyncio
+import getpass
 from src.stt import STT
 from src.llm import LLM
 from src.tts import TTS
 from src.conversation import ConversationManager
-from src.audio_utils import AudioPlayer
-from src.language_detection import LanguageDetector
-from src.config import (
-    INPUT_SAMPLE_RATE, INPUT_CHANNELS, INPUT_FORMAT,
-    VAD_FRAME_MS, VAD_SILENCE_TIMEOUT_MS
-)
-
-# --- Constants ---
-WAKE_WORD = "hey gemini"
-CHUNK_SIZE = int(INPUT_SAMPLE_RATE * (VAD_FRAME_MS / 1000.0))
-SILENCE_FRAMES = int(VAD_SILENCE_TIMEOUT_MS / VAD_FRAME_MS)
+from src.auth import AuthManager
+from src.config import USE_SUPABASE
 
 class VoiceAgent:
-    def __init__(self):
-        print("Initializing Voice Agent...")
-        try:
-            self.p = pyaudio.PyAudio()
-            self.vad = VAD()
-            self.stt = STT()
-            self.llm = LLM()
-            self.tts = TTS()
-            self.language_detector = LanguageDetector()
-            self.conversation = ConversationManager()
-            self.player = AudioPlayer()
-            self.state = "IDLE" # IDLE, LISTENING, PROCESSING, SPEAKING
-            print("Voice Agent Initialized.")
-        except Exception as e:
-            print("Failed to initialize Voice Agent components. See error below.")
-            traceback.print_exc()
-            # Exit or handle gracefully
-            raise e
+    """
+    A simple, fast, and conversational voice agent.
+    """
+    def __init__(self, user_id: str, auth_manager: AuthManager):
+        print("🚀 Initializing Ultra-Fast Voice Agent...")
+        self.user_id = user_id
+        self.auth_manager = auth_manager
+        self.stt = STT()
+        self.llm = LLM()
+        self.tts = TTS()
+        if USE_SUPABASE:
+            self.conversation = ConversationManager(user_id=self.user_id)
+        else:
+            self.conversation = None
+        print("✅ Agent Initialized. Ready to chat!")
 
-    def run(self):
-        stream = self.p.open(
-            format=pyaudio.paInt16,
-            channels=INPUT_CHANNELS,
-            rate=INPUT_SAMPLE_RATE,
-            input=True,
-            frames_per_buffer=CHUNK_SIZE
-        )
+    async def run(self):
+        """
+        The main async loop for the voice agent.
+        """
+        while True:
+            # 1. Listen and Transcribe
+            user_text = self.stt.listen_and_transcribe()
 
-        print("\n--- Voice Agent is running ---")
-        print("Say 'Hey Gemini' to wake me up.")
-        print("---------------------------------")
+            if not user_text:
+                continue
+
+            # Check for sign-out command
+            if "sign out" in user_text.lower().strip() or "log out" in user_text.lower().strip():
+                self.auth_manager.sign_out()
+                break
+
+            # 2. Get Conversation History & User Profile (if enabled)
+            history = []
+            profile_facts = []
+            if self.conversation:
+                history, profile_facts = await asyncio.gather(
+                    self.conversation.get_context_for_llm(user_text),
+                    self.conversation.get_user_profile()
+                )
+
+            # 3. Generate AI Response
+            print("🤖 Thinking...")
+            ai_response = await self.llm.generate_response(user_text, history, profile_facts)
+            print(f"💬 AI: {ai_response}")
+
+            # 4. Speak the Response
+            await self.tts.speak(ai_response)
+
+            # 5. Update history and learn new facts
+            if self.conversation:
+                await self.conversation.add_message("user", user_text)
+                await self.conversation.add_message("model", ai_response)
+
+                new_facts = await self.llm.extract_facts(f"User: {user_text}\nAI: {ai_response}")
+                if new_facts:
+                    await self.conversation.update_user_profile(new_facts)
+
+async def main():
+    auth_manager = AuthManager()
+    session = None
+
+    while not session:
+        print("\n--- Voice Agent Login ---")
+        action = input("Choose an action: [1] Login, [2] Sign Up, [3] Exit: ").strip()
         
-        voiced_frames = collections.deque(maxlen=SILENCE_FRAMES)
-        audio_buffer = []
-        is_speaking = False
+        if action == "3":
+            print("👋 Goodbye!")
+            return
 
-        try:
-            while True:
-                try:
-                    frame = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-                    is_speech = self.vad.is_speech(frame)
+        if action not in ["1", "2"]:
+            print("Invalid choice. Please try again.")
+            continue
 
-                    if self.state == "SPEAKING" and is_speech:
-                        print("Barge-in detected! Stopping playback.")
-                        self.player.stop_playback()
-                        self.state = "LISTENING"
-                        is_speaking = False
-                        audio_buffer = [frame] # Start new buffer with the frame that triggered barge-in
-                        voiced_frames.clear()
-                        voiced_frames.append(is_speech)
-                        continue
+        email = input("Enter your email: ").strip()
+        password = getpass.getpass("Enter your password: ").strip()
 
-                    if self.state == "IDLE":
-                        if is_speech:
-                            audio_buffer.append(frame)
-                            if len(audio_buffer) > 50:
-                                full_audio = b''.join(audio_buffer)
-                                audio_np = STT.audio_bytes_to_numpy(full_audio)
-                                text = self.stt.transcribe(audio_np).lower()
-                                
-                                if WAKE_WORD in text:
-                                    print(f"Wake word detected! '{text.strip()}'")
-                                    self.state = "LISTENING"
-                                    audio_buffer = []
-                                    voiced_frames.clear()
-                                    # Play confirmation sound
-                                    self.state = "SPEAKING"
-                                    self.player.start_playback()
-                                    for chunk in self.tts.synthesize_stream("I'm listening", lang='en'):
-                                        self.player.write_chunk(chunk)
-                                    self.player.stop_playback()
-                                    self.state = "LISTENING" # Ready to listen for command
+        if action == "1":
+            session = auth_manager.sign_in(email, password)
+        elif action == "2":
+            auth_manager.sign_up(email, password)
+            print("\nPlease log in with your new credentials.")
 
-                                else:
-                                    audio_buffer.pop(0)
-
-                    elif self.state == "LISTENING":
-                        audio_buffer.append(frame)
-                        voiced_frames.append(is_speech)
-                        
-                        if len(voiced_frames) == SILENCE_FRAMES and all(not s for s in voiced_frames):
-                            self.state = "PROCESSING"
-                            print("End of speech detected. Processing...")
-                            
-                            full_audio = b''.join(audio_buffer)
-                            audio_np = STT.audio_bytes_to_numpy(full_audio)
-                            
-                            audio_buffer = []
-                            voiced_frames.clear()
-
-                            user_text = self.stt.transcribe(audio_np)
-                            print(f"You said: {user_text}")
-
-                            if not user_text.strip():
-                                self.state = "IDLE"
-                                continue
-                            
-                            detected_lang = self.language_detector.detect_language(user_text)
-                            llm_context = self.conversation.get_context_for_llm(user_text)
-                            self.conversation.add_message("user", user_text)
-                            
-                            assistant_response = self.llm.generate_response(user_text, llm_context, language=detected_lang)
-                            self.conversation.add_message("model", assistant_response)
-                            print(f"Assistant ({detected_lang}): {assistant_response}")
-                            
-                            self.state = "SPEAKING"
-                            is_speaking = True
-                            
-                            self.player.start_playback()
-                            for audio_chunk in self.tts.synthesize_stream(assistant_response, lang=detected_lang):
-                                if self.player.is_playing():
-                                    self.player.write_chunk(audio_chunk)
-                                else:
-                                    print("Playback stopped, likely due to barge-in.")
-                                    is_speaking = False
-                                    break
-                            
-                            self.player.stop_playback()
-                            
-                            if is_speaking: # If it finished without interruption
-                                self.state = "IDLE"
-                            is_speaking = False
-                except Exception as e:
-                    print("\nAn error occurred in the main loop:")
-                    traceback.print_exc()
-                    print("Restarting listening loop...")
-                    # Reset state to recover
-                    self.state = "IDLE"
-                    audio_buffer.clear()
-                    voiced_frames.clear()
-                    self.player.stop_playback()
-                    time.sleep(1) # Prevent rapid-fire error loops
-
-        except KeyboardInterrupt:
-            print("Stopping Voice Agent.")
-        finally:
-            stream.stop_stream()
-            stream.close()
-            self.player.stop_playback()
-            self.p.terminate()
+    # If login is successful, start the agent
+    agent = VoiceAgent(user_id=session.user.id, auth_manager=auth_manager)
+    await agent.run()
 
 if __name__ == "__main__":
-    agent = VoiceAgent()
-    agent.run()
+    try:
+        if USE_SUPABASE:
+            asyncio.run(main())
+        else:
+            print("Authentication is disabled because Supabase is not configured in your .env file.")
+            print("Running in offline mode without user profiles or history.")
+            # Simplified offline agent if needed in the future
+            # For now, we'll just exit.
+    except KeyboardInterrupt:
+        print("\n gracefully shutting down")
