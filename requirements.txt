@@ -1,14 +1,14 @@
-webrtcvad-wheels
-openai-whisper
-google-generativeai
-piper-tts
-pyaudio
-numpy
-fastapi
-uvicorn
+# Core Voice Agent Dependencies
+aiohttp
 python-dotenv
-soundfile
-fasttext
+SpeechRecognition
+PyAudio
+edge-tts
+pydub
+simpleaudio
+
+# For Conversation History
+supabase
 sentence-transformers
+numpy
 psycopg2-binary
-pgvector
