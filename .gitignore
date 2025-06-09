@@ -1,2 +1,25 @@
-lid.176.bin
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+/venv/
+*.egg-info/
+dist/
+build/
+
+# Environment
 .env
+
+# macOS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+
+# Models & Binaries
+*.bin
+piper-phonemize
+node_modules/
