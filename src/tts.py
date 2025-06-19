@@ -68,6 +68,27 @@ class TTS:
                 process.kill()
                 await process.wait()
 
+    async def synthesize(self, text: str) -> bytes:
+        """Return raw audio bytes for the given *text*.
+
+        This is useful when running inside the FastAPI backend so we can ship
+        the audio to the front-end over WebSocket instead of playing it on the
+        server.
+        """
+        if not text:
+            return b""
+
+        audio_data = bytearray()
+        try:
+            communicate = edge_tts.Communicate(text, self.voice)
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_data.extend(chunk["data"])
+        except Exception as e:
+            print(f"❌ Error during TTS synthesis: {e}")
+            return b""
+        return bytes(audio_data)
+
 # --- Example Usage ---
 async def main():
     """Example of how to use the TTS module."""

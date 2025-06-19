@@ -1,0 +1,43 @@
+# Git
+.git
+.gitignore
+
+# Docker
+Dockerfile
+Dockerfile.backend
+docker-compose.yml
+.dockerignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# Frontend
+frontend/
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+*.swo
+*~
+
+# Logs and data
+logs/
+uploads/
+realtimesst.log
+
+# Docs
+*.md
+Makefile
+nginx.conf
+docker_init.sql 

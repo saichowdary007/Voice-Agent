@@ -12,6 +12,51 @@ build/
 # Environment
 .env
 
+# Next.js
+.next/
+.next/*
+out/
+
+# Logs
+*.log
+logs/
+
+# Uploads
+uploads/
+
+# Test files
+test_*.py
+*_test.py
+*test*.py
+
+# Debug files
+debug_*.py
+*debug*.py
+
+# Demo files
+demo_*.py
+*demo*.py
+
+# Setup files (one-time use)
+setup_*.py
+*_setup.py
+*.sql
+
+# Development documentation
+TESTING.md
+*_SETUP.md
+*_STATUS.md
+
+# Development Docker files
+docker-compose.dev.yml
+docker-compose.ultra-fast.yml
+Dockerfile.ultra-fast
+deploy-ultra-fast.sh
+
+# Example and backup files
+*.example
+*.backup
+
 # macOS
 .DS_Store
 
