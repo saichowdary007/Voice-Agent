@@ -33,20 +33,24 @@ logger = logging.getLogger(__name__)
 try:
     from src.config import USE_REALTIME_STT, WHISPER_MODEL
     if USE_REALTIME_STT:
-        logger.info(f"🚀 Server-side STT enabled (Whisper, model='{WHISPER_MODEL}')")
+        logger.info(f"🚀 Server-side STT enabled (faster-whisper, model='{WHISPER_MODEL}')")
         try:
-            from src import stt_whisper as STT  # Lazy-loads model on first call
+            import os
+            from src.stt import STT
+            model_size = os.getenv("STT_MODEL_SIZE", "small")
+            stt_instance = STT(model_size=model_size, device="cpu")
+            logger.info(f"✅ Faster-whisper STT initialized with model '{model_size}'")
         except Exception as e:
-            logger.error(f"❌ Failed to load Whisper STT: {e}")
+            logger.error(f"❌ Failed to load faster-whisper STT: {e}")
             USE_REALTIME_STT = False
-            STT = None
+            stt_instance = None
     else:
         logger.info("🚀 Using Web Speech API only (no server-side STT)")
-        STT = None
+        stt_instance = None
 except ImportError:
     logger.warning("⚠️ STT configuration not found, defaulting to browser Web Speech API")
     USE_REALTIME_STT = False
-    STT = None
+    stt_instance = None
 
 from src.config import (
     USE_SUPABASE, 
@@ -104,10 +108,11 @@ api_router = APIRouter(prefix="/api")
 # CORS middleware - SECURITY FIX: Use environment-configured origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,  # Security fix: Use configured origins instead of "*"
+    allow_origins=["https://voice-agent.vercel.app",   # prod
+                   "http://localhost:3000"],           # dev
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],  # Explicit methods instead of "*"
-    allow_headers=["Authorization", "Content-Type"],  # Explicit headers instead of "*"
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Security
@@ -831,7 +836,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
 
                             # If this is the final chunk of an utterance, run STT + LLM pipeline
                             if message.get("is_final", False):
-                                user_text = await STT.transcribe_bytes(bytes(websocket.audio_buffer))
+                                user_text = await stt_instance.transcribe_bytes(bytes(websocket.audio_buffer))
                                 websocket.audio_buffer.clear()
 
                                 if not user_text:
