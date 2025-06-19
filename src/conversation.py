@@ -4,6 +4,7 @@ Enhanced with proper error handling, type safety, and optimized async patterns.
 """
 import asyncio
 import logging
+import os
 from typing import List, Dict, Optional
 from src.config import USE_SUPABASE, SUPABASE_URL, SUPABASE_KEY
 from datetime import datetime
@@ -40,19 +41,13 @@ class ConversationManager:
         self.user_id = user_id
         self.use_supabase = USE_SUPABASE and SUPABASE_AVAILABLE
         self.supabase: Optional[Client] = self._connect_supabase()
+        self.embedding_model = self._load_embedding_model() if self.use_supabase else None
+        self.vector_search_available = True  # Track if vector search is available
         
         if self.use_supabase and self.supabase and SUPABASE_AVAILABLE:
             logger.info("✅ Conversation history is enabled (Supabase).")
-            # The embedding model is loaded only if Supabase is in use.
-            try:
-                self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-                logger.info("✅ Embedding model loaded successfully")
-            except Exception as e:
-                logger.error(f"❌ Failed to load embedding model: {e}")
-                self.embedding_model = None
         else:
             logger.warning("⚠️ Conversation history is disabled. Supabase not configured in .env file.")
-            self.embedding_model = None
 
     def _connect_supabase(self) -> Optional[Client]:
         """Establishes a connection to Supabase if configured."""
@@ -93,7 +88,7 @@ class ConversationManager:
 
     async def _get_semantic_context(self, current_text: str, max_results: int = 3) -> List[Dict]:
         """Retrieves semantically similar messages from the past."""
-        if not self.embedding_model:
+        if not self.embedding_model or not self.vector_search_available:
             return []
             
         try:
@@ -111,7 +106,13 @@ class ConversationManager:
             )
             return response.data or []
         except Exception as e:
-            logger.error(f"❌ Vector search error: {e}")
+            # Check if this is a function not found error
+            error_str = str(e).lower()
+            if 'function' in error_str and 'match_conversations' in error_str:
+                logger.warning("⚠️ Vector search function not available - disabling semantic context")
+                self.vector_search_available = False  # Disable future attempts
+            else:
+                logger.error(f"❌ Vector search error: {e}")
             return []
 
     async def _get_recent_context(self, max_results: int = 4) -> List[Dict]:
@@ -266,6 +267,17 @@ class ConversationManager:
         except Exception as e:
             logger.error(f"❌ Error clearing history in Supabase: {e}")
             return False
+
+    def _load_embedding_model(self):
+        if self.use_supabase and SUPABASE_AVAILABLE and SentenceTransformer:
+            try:
+                model = SentenceTransformer('all-MiniLM-L6-v2')
+                logger.info("✅ Embedding model loaded successfully")
+                return model
+            except Exception as e:
+                logger.error(f"❌ Failed to load embedding model: {e}")
+                return None
+        return None
 
 # --- Example Usage ---
 async def main():
