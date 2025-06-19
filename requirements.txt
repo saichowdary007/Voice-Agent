@@ -1,14 +1,41 @@
 # Core Voice Agent Dependencies
-aiohttp
-python-dotenv
-SpeechRecognition
-PyAudio
-edge-tts
-pydub
-simpleaudio
+aiohttp>=3.9.0,<4.0.0
+python-dotenv>=1.0.0
+SpeechRecognition>=3.10.0
+PyAudio>=0.2.11
+edge-tts>=6.1.0
+pydub>=0.25.1
+simpleaudio>=1.0.4
 
-# For Conversation History
-supabase
-sentence-transformers
-numpy
-psycopg2-binary
+# For Conversation History & ML
+supabase>=2.0.0,<3.0.0
+sentence-transformers>=2.2.0
+numpy>=1.21.0,<2.0.0
+psycopg2-binary>=2.9.0
+
+# Web Server & API
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+websockets>=11.0.0
+redis>=5.0.0
+python-multipart>=0.0.6
+requests>=2.31.0
+
+# Authentication & Security
+email-validator>=2.1.0
+python-jose[cryptography]>=3.3.0
+pydantic>=2.4.0
+
+# Development Tools (only in development)
+watchdog>=3.0.0
+
+# Advanced STT Engine
+RealtimeSTT>=0.3.104
+
+# AI/ML Dependencies
+torch>=2.0.0,<3.0.0
+transformers>=4.35.0
+
+# Additional Security Dependencies
+cryptography>=41.0.0
+pyjwt==2.8.0

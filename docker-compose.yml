@@ -1,0 +1,92 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: voice-agent-db
+    environment:
+      POSTGRES_USER: voiceagent
+      POSTGRES_PASSWORD: voiceagent123
+      POSTGRES_DB: voiceagent
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker_init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - voice-agent-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voiceagent -d voiceagent"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Redis for session management and caching
+  redis:
+    image: redis:7-alpine
+    container_name: voice-agent-redis
+    networks:
+      - voice-agent-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: voice-agent-backend
+    environment:
+      DATABASE_URL: postgresql://voiceagent:voiceagent123@postgres:5432/voiceagent
+      REDIS_URL: redis://redis:6379
+      ENVIRONMENT: production
+      LOG_LEVEL: INFO
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_KEY: ${SUPABASE_KEY}
+      USE_SUPABASE: ${USE_SUPABASE}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      USE_REALTIME_STT: ${USE_REALTIME_STT:-false}
+      WHISPER_MODEL: ${WHISPER_MODEL:-tiny}
+    volumes:
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    networks:
+      - voice-agent-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # React Frontend
+  frontend:
+    build:
+      context: ./react-frontend
+      dockerfile: Dockerfile
+    container_name: voice-agent-frontend
+    environment:
+      REACT_APP_API_URL: http://localhost:3000
+    ports:
+      - "3000:80"
+    networks:
+      - voice-agent-network
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+
+networks:
+  voice-agent-network:
+    driver: bridge
