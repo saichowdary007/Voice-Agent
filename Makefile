@@ -116,7 +116,7 @@ install:
 	@echo "Installing Python dependencies..."
 	pip install -r requirements.txt
 	@echo "Installing Node.js dependencies..."
-	cd frontend && npm install
+	cd react-frontend && npm install --legacy-peer-deps
 	@echo "✅ Dependencies installed!"
 
 # Database commands

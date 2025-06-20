@@ -210,14 +210,16 @@ class AuthManager:
         by the user id. For Supabase we delegate to the Auth client. Returns ``None`` if
         the token is invalid or expired.
         
-        SECURITY FIX: Demo tokens are only accepted in demo mode.
+        SECURITY FIX: Demo tokens are only accepted in demo mode or DEBUG_MODE.
         """
         if not token:
             return None
 
-        # Check for demo tokens - ONLY accept in demo mode for security
+        # Check for demo tokens - accept in demo mode OR debug mode
         if token.startswith("demo_token_"):
-            if not self.demo_mode:
+            from src.config import DEBUG_MODE
+            
+            if not self.demo_mode and not DEBUG_MODE:
                 # Security fix: reject demo tokens in production mode
                 print("❌ Demo tokens not allowed in production mode")
                 return None
