@@ -5,7 +5,8 @@ Enhanced with connection pooling, proper error handling, and type safety.
 import aiohttp
 import json
 import asyncio
-from typing import List, Dict, Optional, ClassVar
+import re
+from typing import List, Dict, Optional, ClassVar, AsyncGenerator
 from src.config import GEMINI_API_KEY
 
 class LLM:
@@ -36,6 +37,10 @@ class LLM:
                 "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
                 f"?key={self.api_key}"
             )
+            self.stream_api_url = (
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent"
+                f"?key={self.api_key}"
+            )
         
         # The system instruction defines the AI's personality.
         # This is now a separate object to be passed in the API call.
@@ -52,6 +57,7 @@ class LLM:
         • Sarcasm: use sparingly, only when it will amuse—not confuse or offend.
         • Sound like real speech: contractions ("I'll", "you're"), varied sentence length, the occasional interjection ("Right, so—").
         • Always give clear, actionable answers before any banter.
+        • Keep responses concise for voice interaction - aim for 1-2 sentences unless detail is specifically requested.
 
         TASK RULES
         1. Accuracy first. If you don't know, admit it and offer to check.
@@ -148,6 +154,86 @@ class LLM:
         
         else:
             return f"That's interesting{user_context}! While I'm running in demo mode, I can still chat with you. Try asking me about jokes, introductions, or how I can help you today!"
+
+    async def _stream_demo_response(self, user_text: str, conversation_history: Optional[List[Dict]] = None, user_profile: Optional[List[Dict]] = None) -> AsyncGenerator[str, None]:
+        """Stream demo response sentence by sentence for testing."""
+        full_response = self._get_demo_response(user_text, conversation_history, user_profile)
+        
+        # Split by sentences and yield with small delays
+        sentences = re.split(r'[.!?]+', full_response)
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if sentence:
+                yield sentence + ". "
+                await asyncio.sleep(0.1)  # Simulate streaming delay
+
+    async def generate_stream(self, user_text: str, conversation_history: Optional[List[Dict]] = None, user_profile: Optional[List[Dict]] = None) -> AsyncGenerator[str, None]:
+        """
+        Stream response generation token by token for ultra-low latency.
+        
+        Args:
+            user_text: The user's input text.
+            conversation_history: A list of previous turns in the conversation.
+            user_profile: A list of key-value facts about the user.
+            
+        Yields:
+            Text chunks as they are generated.
+        """
+        if not user_text:
+            yield "I'm sorry, I didn't hear anything."
+            return
+
+        # Use demo mode streaming if no valid API key
+        if self.demo_mode:
+            async for chunk in self._stream_demo_response(user_text, conversation_history, user_profile):
+                yield chunk
+            return
+
+        # Build request for streaming API
+        contents = []
+        if conversation_history:
+            contents.extend(conversation_history)
+        contents.append({"role": "user", "parts": [{"text": user_text}]})
+
+        # Create the system instruction with profile facts
+        system_text = self.system_instruction['parts'][0]['text']
+        if user_profile:
+            system_text += "\n\nHere are some facts you know about the user. Use them to personalize your response:\n"
+            for fact in user_profile:
+                system_text += f"- {fact['key']}: {fact['value']}\n"
+        
+        system_instruction = {"parts": [{"text": system_text}]}
+        body = {
+            "contents": contents,
+            "system_instruction": system_instruction
+        }
+
+        try:
+            session = await self.get_session()
+            async with session.post(self.stream_api_url, json=body) as resp:
+                if resp.status == 200:
+                    async for line in resp.content:
+                        line_text = line.decode('utf-8').strip()
+                        if line_text.startswith('data: '):
+                            try:
+                                json_data = json.loads(line_text[6:])
+                                if 'candidates' in json_data:
+                                    for candidate in json_data['candidates']:
+                                        if 'content' in candidate and 'parts' in candidate['content']:
+                                            for part in candidate['content']['parts']:
+                                                if 'text' in part:
+                                                    yield part['text']
+                            except json.JSONDecodeError:
+                                continue
+                else:
+                    # Fallback to non-streaming
+                    async for chunk in self._stream_demo_response(user_text, conversation_history, user_profile):
+                        yield chunk
+        except Exception as e:
+            print(f"Streaming generation error: {e}")
+            # Fallback to demo streaming
+            async for chunk in self._stream_demo_response(user_text, conversation_history, user_profile):
+                yield chunk
 
     async def generate_response(self, user_text: str, conversation_history: Optional[List[Dict]] = None, user_profile: Optional[List[Dict]] = None) -> str:
         """
