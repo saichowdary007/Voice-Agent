@@ -9,6 +9,7 @@ import AnimatedGradientText from './components/magicui/animated-gradient-text';
 import OrbitingCircles from './components/magicui/orbiting-circles';
 import { ChatMessage, VoiceSettings } from './types';
 import { cn, formatTime, generateId } from './lib/utils';
+import VoiceInterface from './components/VoiceInterface';
 
 interface ChatInterfaceProps {
   className?: string;
@@ -362,7 +363,7 @@ const AppContent: React.FC = () => {
     );
   }
 
-  return isAuthenticated ? <ChatInterface /> : <Login />;
+  return isAuthenticated ? <VoiceInterface /> : <Login />;
 };
 
 export default App; 
