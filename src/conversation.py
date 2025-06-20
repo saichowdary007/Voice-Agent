@@ -5,6 +5,7 @@ Enhanced with proper error handling, type safety, and optimized async patterns.
 import asyncio
 import logging
 import os
+import re
 from typing import List, Dict, Optional
 from src.config import USE_SUPABASE, SUPABASE_URL, SUPABASE_KEY
 from datetime import datetime
@@ -43,6 +44,10 @@ class ConversationManager:
         self.supabase: Optional[Client] = self._connect_supabase()
         self.embedding_model = self._load_embedding_model() if self.use_supabase else None
         self.vector_search_available = True  # Track if vector search is available
+        
+        # Personal fact storage settings
+        self.max_snippets_per_user = 200
+        self.similarity_threshold = 0.88  # For deduplication
         
         if self.use_supabase and self.supabase and SUPABASE_AVAILABLE:
             logger.info("✅ Conversation history is enabled (Supabase).")
@@ -106,9 +111,10 @@ class ConversationManager:
             )
             return response.data or []
         except Exception as e:
-            # Check if this is a function not found error
+            # Check for HTTP 404 (function not found) or general function errors
             error_str = str(e).lower()
-            if 'function' in error_str and 'match_conversations' in error_str:
+            if ('404' in error_str or 'function' in error_str and 'match_conversations' in error_str or 
+                'does not exist' in error_str):
                 logger.warning("⚠️ Vector search function not available - disabling semantic context")
                 self.vector_search_available = False  # Disable future attempts
             else:
@@ -278,6 +284,294 @@ class ConversationManager:
                 logger.error(f"❌ Failed to load embedding model: {e}")
                 return None
         return None
+
+    # === PERSONAL FACT STORAGE PIPELINE ===
+
+    async def _classify_personal_fact(self, sentence: str, llm_interface) -> bool:
+        """
+        Fast classification to determine if sentence contains personal information.
+        Returns True if it contains personal facts worth saving.
+        """
+        if not llm_interface:
+            return False
+            
+        fact_prompt = f"""
+Decide whether the USER sentence contains PERSONAL FACTS worth saving:
+
+USER: "{sentence}"
+
+Respond with exactly one token:
+- YES  -> contains new personal info
+- NO   -> does NOT contain personal info
+"""
+        
+        try:
+            # Use a simplified call for classification
+            response = await llm_interface.generate_response(
+                user_text=fact_prompt,
+                conversation_history=[],
+                user_profile=[]
+            )
+            
+            # Clean and check response
+            decision = response.strip().upper()
+            return decision == "YES"
+            
+        except Exception as e:
+            logger.error(f"❌ Error in personal fact classification: {e}")
+            return False
+
+    async def _summarize_to_bullet(self, text: str, llm_interface) -> str:
+        """
+        Summarizes user text into a single bullet point.
+        """
+        if not llm_interface:
+            return text
+            
+        prompt = f"""
+Rewrite the USER's sentence as one bullet starting with '• '. 
+Keep concrete nouns & numbers; drop filler words.
+
+USER: "{text}"
+"""
+        
+        try:
+            response = await llm_interface.generate_response(
+                user_text=prompt,
+                conversation_history=[],
+                user_profile=[]
+            )
+            
+            bullet = response.strip()
+            if not bullet.startswith('•'):
+                bullet = f"• {bullet}"
+            return bullet
+            
+        except Exception as e:
+            logger.error(f"❌ Error in summarization: {e}")
+            return f"• {text}"
+
+    def _redact_pii(self, text: str) -> str:
+        """
+        Basic PII redaction using regex patterns.
+        """
+        # Phone numbers
+        text = re.sub(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', '[PHONE]', text)
+        
+        # Email addresses
+        text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '[EMAIL]', text)
+        
+        # SSN patterns
+        text = re.sub(r'\b\d{3}-\d{2}-\d{4}\b', '[SSN]', text)
+        
+        # Credit card patterns
+        text = re.sub(r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b', '[CARD]', text)
+        
+        return text
+
+    async def _check_duplicate(self, fact: str) -> bool:
+        """
+        Check if a similar fact already exists using cosine similarity.
+        Returns True if duplicate exists (similarity > threshold).
+        """
+        if not self.embedding_model or not self.use_supabase or not self.supabase:
+            return False
+            
+        try:
+            fact_embedding = self.embedding_model.encode(fact).tolist()
+            
+            # Get existing snippets for this user
+            response = await asyncio.to_thread(
+                lambda: self.supabase.table('memory_snippets')
+                .select('content, embedding')
+                .eq('user_id', self.user_id)
+                .execute()
+            )
+            
+            existing_snippets = response.data or []
+            
+            # Check similarity with existing snippets
+            for snippet in existing_snippets:
+                if 'embedding' in snippet and snippet['embedding']:
+                    # Calculate cosine similarity
+                    similarity = self._cosine_similarity(fact_embedding, snippet['embedding'])
+                    if similarity > self.similarity_threshold:
+                        return True
+                        
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ Error checking for duplicates: {e}")
+            return False
+
+    def _cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
+        """Calculate cosine similarity between two vectors."""
+        try:
+            import numpy as np
+            vec1 = np.array(vec1)
+            vec2 = np.array(vec2)
+            
+            dot_product = np.dot(vec1, vec2)
+            norm_vec1 = np.linalg.norm(vec1)
+            norm_vec2 = np.linalg.norm(vec2)
+            
+            if norm_vec1 == 0 or norm_vec2 == 0:
+                return 0
+                
+            return dot_product / (norm_vec1 * norm_vec2)
+        except Exception as e:
+            logger.error(f"❌ Error calculating cosine similarity: {e}")
+            return 0
+
+    async def _store_fact(self, fact: str) -> bool:
+        """
+        Store a personal fact in the memory_snippets table.
+        """
+        if not self.use_supabase or not self.supabase or not self.embedding_model:
+            return False
+            
+        try:
+            # Redact PII
+            clean_fact = self._redact_pii(fact)
+            
+            # Check for duplicates
+            if await self._check_duplicate(clean_fact):
+                logger.debug(f"Skipping duplicate fact: {clean_fact}")
+                return True  # Not an error, just a duplicate
+            
+            # Generate embedding
+            embedding = self.embedding_model.encode(clean_fact).tolist()
+            
+            # Store the fact
+            await asyncio.to_thread(
+                lambda: self.supabase.table('memory_snippets').insert({
+                    'user_id': self.user_id,
+                    'content': clean_fact,
+                    'importance': 7,  # Default importance
+                    'embedding': embedding
+                }).execute()
+            )
+            
+            # Prune old facts if over limit
+            await self._prune_old_facts()
+            
+            logger.info(f"✅ Stored personal fact: {clean_fact}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error storing fact: {e}")
+            return False
+
+    async def _prune_old_facts(self) -> None:
+        """
+        Keep only the most recent facts, prune by lowest importance.
+        """
+        if not self.use_supabase or not self.supabase:
+            return
+            
+        try:
+            # Count current snippets
+            count_response = await asyncio.to_thread(
+                lambda: self.supabase.table('memory_snippets')
+                .select('id', count='exact')
+                .eq('user_id', self.user_id)
+                .execute()
+            )
+            
+            current_count = count_response.count
+            
+            if current_count <= self.max_snippets_per_user:
+                return
+                
+            # Get snippets to delete (oldest and lowest importance)
+            snippets_to_delete = current_count - self.max_snippets_per_user
+            
+            response = await asyncio.to_thread(
+                lambda: self.supabase.table('memory_snippets')
+                .select('id')
+                .eq('user_id', self.user_id)
+                .order('importance', desc=False)
+                .order('created_at', desc=False)
+                .limit(snippets_to_delete)
+                .execute()
+            )
+            
+            if response.data:
+                ids_to_delete = [item['id'] for item in response.data]
+                await asyncio.to_thread(
+                    lambda: self.supabase.table('memory_snippets')
+                    .delete()
+                    .in_('id', ids_to_delete)
+                    .execute()
+                )
+                logger.info(f"✅ Pruned {len(ids_to_delete)} old facts")
+                
+        except Exception as e:
+            logger.error(f"❌ Error pruning old facts: {e}")
+
+    async def handle_user_turn(self, user_msg: str, assistant_msg: str, llm_interface) -> None:
+        """
+        Main pipeline for handling user turns and storing personal facts.
+        
+        Args:
+            user_msg: The user's message
+            assistant_msg: The assistant's response
+            llm_interface: LLM interface for classification and summarization
+        """
+        if not user_msg.strip():
+            return
+            
+        try:
+            # 1. Check for explicit verbs
+            user_lower = user_msg.lower()
+            explicit_keywords = ("remember", "save this", "note this")
+            
+            if any(keyword in user_lower for keyword in explicit_keywords):
+                # Store raw or summarized version
+                bullet = await self._summarize_to_bullet(user_msg, llm_interface)
+                await self._store_fact(bullet)
+                return
+            
+            # 2. Run the classification
+            if await self._classify_personal_fact(user_msg, llm_interface):
+                # 3. Summarize into one bullet
+                bullet = await self._summarize_to_bullet(user_msg, llm_interface)
+                await self._store_fact(bullet)
+            
+        except Exception as e:
+            logger.error(f"❌ Error in handle_user_turn: {e}")
+
+    async def get_memory_snippets(self, query_text: str, max_results: int = 5) -> List[Dict]:
+        """
+        Retrieve memory snippets semantically similar to the query.
+        """
+        if not self.embedding_model or not self.use_supabase or not self.supabase:
+            return []
+            
+        try:
+            query_embedding = self.embedding_model.encode(query_text).tolist()
+            
+            response = await asyncio.to_thread(
+                lambda: self.supabase.rpc(
+                    'match_memory_snippets',
+                    {
+                        'query_embedding': query_embedding,
+                        'match_threshold': 0.35,
+                        'match_count': max_results,
+                        'user_id': self.user_id
+                    }
+                ).execute()
+            )
+            
+            return response.data or []
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            if '404' in error_str or 'function' in error_str:
+                logger.warning("⚠️ Memory snippets search function not available")
+            else:
+                logger.error(f"❌ Error retrieving memory snippets: {e}")
+            return []
 
 # --- Example Usage ---
 async def main():

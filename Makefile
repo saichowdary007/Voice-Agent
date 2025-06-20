@@ -24,6 +24,10 @@ help:
 	@echo "Setup:"
 	@echo "  make setup     - Initial setup with example env file"
 	@echo "  make install   - Install dependencies locally"
+	@echo ""
+	@echo "Testing:"
+	@echo "  make test      - Run all tests"
+	@echo "  make test-personal-facts - Test personal fact storage pipeline"
 
 # Production commands
 build:
@@ -144,6 +148,10 @@ test:
 	@echo "🧪 Running tests..."
 	docker-compose exec backend python -m pytest
 	docker-compose exec frontend npm test
+
+test-personal-facts:
+	@echo "🧪 Testing Personal Facts Pipeline..."
+	python test_personal_facts.py
 
 # Security scan
 security-scan:

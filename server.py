@@ -592,6 +592,9 @@ async def chat(request: MessageRequest, current_user: dict = Depends(get_current
                 new_facts = await llm_interface.extract_facts(f"User: {request.text}\nAI: {ai_response}")
                 if new_facts:
                     await conversation_mgr.update_user_profile(new_facts)
+                
+                # Handle personal fact storage pipeline
+                await conversation_mgr.handle_user_turn(request.text, ai_response, llm_interface)
             except Exception as e:
                 logger.warning(f"Failed to save conversation: {e}")
         
@@ -772,6 +775,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                                     new_facts = await llm_interface.extract_facts(f"User: {user_text}\nAI: {ai_response}")
                                     if new_facts:
                                         await conversation_mgr.update_user_profile(new_facts)
+                                    
+                                    # Handle personal fact storage pipeline
+                                    await conversation_mgr.handle_user_turn(user_text, ai_response, llm_interface)
                             else:
                                 ai_response = "Sorry, the AI service is currently unavailable."
                             
@@ -914,6 +920,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                                     new_facts = await llm_interface.extract_facts(f"User: {user_text}\nAI: {ai_response}")
                                     if new_facts:
                                         await conversation_mgr.update_user_profile(new_facts)
+                                    
+                                    # Handle personal fact storage pipeline
+                                    await conversation_mgr.handle_user_turn(user_text, ai_response, llm_interface)
                                 else:
                                     # Handle case where LLM engine is not available
                                     await connection_manager.send_personal_message(
