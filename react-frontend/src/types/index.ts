@@ -33,8 +33,10 @@ export interface ChatResponse {
 }
 
 export interface WebSocketMessage {
-  type: 'message' | 'audio' | 'status' | 'error';
-  data: any;
+  type: 'message' | 'audio' | 'status' | 'error' | 'audio_response' | 'vad_status' | 'text_response' | 'audio_processed' | 'listening_started' | 'listening_stopped' | 'heartbeat';
+  data?: any;
+  text?: string;
+  isActive?: boolean;
   timestamp?: string;
 }
 

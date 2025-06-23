@@ -257,7 +257,15 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
       const sound = new THREE.Audio(listener);
       soundRef.current = sound;
 
-      // Real audio analysis function
+      // Advanced VAD with proper audio processing
+      let audioRecordingBuffer: Int16Array[] = [];
+      let isCurrentlyRecording = false;
+      let silenceCounter = 0;
+      let speechCounter = 0;
+      const SILENCE_THRESHOLD = 8; // ~160ms of silence before stopping
+      const SPEECH_THRESHOLD = 3; // ~60ms of speech before starting
+      const VAD_FRAME_SIZE = 320; // 20ms at 16kHz
+      
       const getAverageFrequency = (): number => {
         if (!analyserRef.current || muted) return 0;
         
@@ -265,24 +273,150 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         const dataArray = new Uint8Array(bufferLength);
         analyserRef.current.getByteFrequencyData(dataArray);
         
-        // Calculate average frequency for lower frequencies (more sensitive to voice)
-        const voiceRange = Math.floor(bufferLength * 0.3); // Focus on lower 30% of frequency range
+        // More sophisticated voice activity detection
+        const voiceRange = Math.floor(bufferLength * 0.4); // Focus on human voice frequencies
         const sum = dataArray.slice(0, voiceRange).reduce((acc, value) => acc + value, 0);
         const average = sum / voiceRange;
         
-        // Voice activity detection with more sensitive threshold
-        const voiceThreshold = 15; // Lowered threshold for better sensitivity
-        const isVoiceActive = average > voiceThreshold;
+        // Enhanced VAD logic with multiple thresholds
+        const noiseFloor = 8; // Minimum background noise level
+        const voiceThreshold = 25; // Higher threshold to avoid false positives
+        const strongVoiceThreshold = 40; // Strong voice activity
         
-        // Add some logging for debugging (reduced frequency)
-        if (isVoiceActive && Math.random() < 0.01) { // Log very occasionally when voice is detected
-          console.log('🎙️ Voice detected - average frequency:', average);
+        // Determine voice activity with better logic
+        let isVoiceActive = false;
+        
+        if (average > strongVoiceThreshold) {
+          // Strong voice detected
+          speechCounter = Math.min(speechCounter + 2, SPEECH_THRESHOLD);
+          silenceCounter = 0;
+          isVoiceActive = true;
+        } else if (average > voiceThreshold && average > noiseFloor * 2) {
+          // Moderate voice detected
+          speechCounter = Math.min(speechCounter + 1, SPEECH_THRESHOLD);
+          silenceCounter = Math.max(silenceCounter - 1, 0);
+          isVoiceActive = speechCounter >= SPEECH_THRESHOLD;
+        } else {
+          // Silence or noise
+          speechCounter = Math.max(speechCounter - 1, 0);
+          silenceCounter = Math.min(silenceCounter + 1, SILENCE_THRESHOLD);
+          isVoiceActive = speechCounter >= SPEECH_THRESHOLD && silenceCounter < SILENCE_THRESHOLD;
         }
+        
+        // Handle audio recording and streaming
+        handleAudioRecording(isVoiceActive, average);
         
         // Call voice activity callback
         stableVoiceActivity(isVoiceActive);
         
         return average;
+      };
+      
+      // Audio recording and streaming logic
+      const handleAudioRecording = (isVoiceActive: boolean, audioLevel: number) => {
+        if (!audioContextRef.current || !microphoneRef.current) return;
+        
+        // Start recording when voice is detected
+        if (isVoiceActive && !isCurrentlyRecording) {
+          console.log('🎙️ Starting voice recording...');
+          isCurrentlyRecording = true;
+          audioRecordingBuffer = [];
+          speechCounter = SPEECH_THRESHOLD; // Reset counters
+          silenceCounter = 0;
+        }
+        
+        // Continue recording while voice is active or during short silence
+        if (isCurrentlyRecording) {
+          // Capture current audio frame
+          captureAudioFrame();
+          
+          // Stop recording after sufficient silence
+          if (!isVoiceActive && silenceCounter >= SILENCE_THRESHOLD) {
+            console.log('🎙️ Stopping voice recording...');
+            isCurrentlyRecording = false;
+            
+            // Send final audio chunk to backend
+            if (audioRecordingBuffer.length > 0) {
+              sendAudioToBackend(true); // is_final = true
+            }
+            
+            // Reset state
+            audioRecordingBuffer = [];
+            speechCounter = 0;
+            silenceCounter = 0;
+          }
+        }
+      };
+      
+      // Capture current audio frame for streaming
+      const captureAudioFrame = () => {
+        if (!analyserRef.current) return;
+        
+        // Get time domain data (actual audio samples)
+        const bufferLength = analyserRef.current.fftSize;
+        const dataArray = new Float32Array(bufferLength);
+        analyserRef.current.getFloatTimeDomainData(dataArray);
+        
+        // Convert to 16-bit PCM for backend processing
+        const pcmData = new Int16Array(dataArray.length);
+        for (let i = 0; i < dataArray.length; i++) {
+          // Convert from [-1, 1] to [-32768, 32767]
+          pcmData[i] = Math.max(-32768, Math.min(32767, dataArray[i] * 32768));
+        }
+        
+        audioRecordingBuffer.push(pcmData);
+        
+        // Send chunks every ~200ms (avoid overwhelming the backend)
+        if (audioRecordingBuffer.length >= 10) { // ~200ms worth of frames
+          sendAudioToBackend(false); // is_final = false
+        }
+      };
+      
+      // Send audio data to backend via WebSocket
+      const sendAudioToBackend = (isFinal: boolean) => {
+        if (audioRecordingBuffer.length === 0) return;
+        
+        try {
+          // Concatenate all buffered audio frames
+          const totalLength = audioRecordingBuffer.reduce((sum, arr) => sum + arr.length, 0);
+          const combinedAudio = new Int16Array(totalLength);
+          let offset = 0;
+          
+          for (const frame of audioRecordingBuffer) {
+            combinedAudio.set(frame, offset);
+            offset += frame.length;
+          }
+          
+                     // Convert to bytes for backend processing
+           const audioBytes = new Uint8Array(combinedAudio.buffer);
+           const base64Audio = btoa(String.fromCharCode.apply(null, Array.from(audioBytes)));
+           
+           // Send via WebSocket (note: WebSocket logic will be implemented separately)
+           const audioMessage = {
+             type: "audio_chunk",
+             data: base64Audio,
+             is_final: isFinal,
+             sample_rate: 44100, // Using the actual sample rate from audio context
+             timestamp: Date.now()
+           };
+           
+           console.log(`🎵 Sending audio chunk: ${audioBytes.length} bytes, final: ${isFinal}`);
+           
+           // This will be connected to the WebSocket hook
+           if ((window as any).voiceAgentWebSocket && (window as any).voiceAgentWebSocket.readyState === WebSocket.OPEN) {
+             (window as any).voiceAgentWebSocket.send(JSON.stringify(audioMessage));
+           } else {
+             console.warn('⚠️ WebSocket not connected, discarding audio chunk');
+           }
+          
+          // Clear the buffer for non-final chunks
+          if (!isFinal) {
+            audioRecordingBuffer = audioRecordingBuffer.slice(-2); // Keep last 2 frames for overlap
+          }
+          
+        } catch (error) {
+          console.error('❌ Failed to send audio to backend:', error);
+        }
       };
 
       // ——————————————————————————————————————————

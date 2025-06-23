@@ -24,7 +24,7 @@ interface UseWebSocketOptions {
 
 export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: boolean = false): UseWebSocketReturn => {
   const {
-    url = process.env.REACT_APP_WS_URL || 'ws://localhost:8000',
+    url = process.env.REACT_APP_WS_URL || 'ws://localhost:8080',
     reconnectInterval = 3000,
     maxReconnectAttempts = 5,
     onOpen,
@@ -44,6 +44,37 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isConnectingRef = useRef(false);
   const isConnectedRef = useRef(false);
+  
+  // Audio playback function
+  const playAudioResponse = useCallback((audioData: string) => {
+    try {
+      // Convert base64 audio to blob
+      const audioBytes = atob(audioData);
+      const audioArray = new Uint8Array(audioBytes.length);
+      for (let i = 0; i < audioBytes.length; i++) {
+        audioArray[i] = audioBytes.charCodeAt(i);
+      }
+      
+      const audioBlob = new Blob([audioArray], { type: 'audio/wav' });
+      const audioUrl = URL.createObjectURL(audioBlob);
+      
+      // Play the audio
+      const audio = new Audio(audioUrl);
+      audio.play().then(() => {
+        console.log('🔊 Playing AI response audio');
+      }).catch((error) => {
+        console.error('❌ Failed to play audio:', error);
+      });
+      
+      // Cleanup URL after playback
+      audio.onended = () => {
+        URL.revokeObjectURL(audioUrl);
+      };
+      
+    } catch (error) {
+      console.error('❌ Failed to process audio response:', error);
+    }
+  }, []);
 
   const sendMessage = useCallback((message: any) => {
     if (socket && socket.readyState === WebSocket.OPEN) {
@@ -91,6 +122,8 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
         setError(null);
 
         const wsUrl = `${url}/ws/${encodeURIComponent(token)}`;
+        console.log('🔗 Attempting WebSocket connection to:', wsUrl);
+        console.log('🎫 Using token:', token.substring(0, 20) + '...');
         const newSocket = new WebSocket(wsUrl);
         currentSocket = newSocket;
 
@@ -103,12 +136,22 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           setConnectionStatus('connected');
           setError(null);
           reconnectAttemptsRef.current = 0;
+          
+          // Make WebSocket globally available for AudioVisualizer
+          (window as any).voiceAgentWebSocket = newSocket;
+          
           onOpen?.();
         };
 
         newSocket.onmessage = (event) => {
           try {
             const message: WebSocketMessage = JSON.parse(event.data);
+            
+            // Handle audio response from server
+            if (message.type === 'audio_response' && message.data) {
+              playAudioResponse(message.data);
+            }
+            
             setLastMessage(message);
             onMessage?.(message);
           } catch (err) {
@@ -119,7 +162,9 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
 
         newSocket.onerror = (event) => {
           console.error('WebSocket error:', event);
-          setError('WebSocket connection error');
+          console.error('WebSocket readyState:', newSocket.readyState);
+          console.error('WebSocket URL:', wsUrl);
+          setError(`WebSocket connection error: ${newSocket.readyState === WebSocket.CLOSED ? 'Connection rejected by server' : 'Network error'}`);
           setConnectionStatus('error');
           onError?.(event);
         };
@@ -132,6 +177,12 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           setIsConnecting(false);
           setSocket(null);
           setConnectionStatus('disconnected');
+          
+          // Cleanup global WebSocket reference
+          if ((window as any).voiceAgentWebSocket === newSocket) {
+            (window as any).voiceAgentWebSocket = null;
+          }
+          
           onClose?.();
 
           // Attempt to reconnect if we haven't exceeded max attempts

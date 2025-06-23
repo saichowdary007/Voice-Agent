@@ -102,8 +102,8 @@ class STT:
             
             # For partial results, use last 3 seconds of audio
             if not is_final:
-                buffer_size = min(48000, len(self._audio_buffer))  # 3s at 16kHz
-                if buffer_size < 8000:  # Need at least 0.5s of audio
+                buffer_size = min(9600, len(self._audio_buffer))  # 0.6s at 16kHz
+                if buffer_size < 3200:  # Need at least 0.2s of audio
                     return None
                     
                 audio_segment = np.array(list(self._audio_buffer)[-buffer_size:])
