@@ -252,6 +252,42 @@ class AuthManager:
                 return response.user if response and response.user else None
             except Exception as e:
                 print(f"❌ Token verification failed: {e}")
+                # Development fallback: accept any well-formed JWT when DEBUG_MODE is enabled
+                try:
+                    from src.config import DEBUG_MODE
+                    if DEBUG_MODE:
+                        from jose import jwt
+                        try:
+                            claims = jwt.get_unverified_claims(token)
+                            sub = claims.get("sub", "debug-user")
+                            email = claims.get("email", f"{sub}@example.com")
+                            mock_user = MockUser(email)
+                            mock_user.id = sub
+                            print(f"🔓 DEBUG_MODE active – bypassing Supabase verification for user {email}")
+                            return mock_user
+                        except Exception as parse_err:
+                            print(f"⚠️ Failed to parse JWT in DEBUG_MODE fallback: {parse_err}")
+                except Exception:
+                    # If DEBUG_MODE import fails or disabled, just fall through
+                    pass
                 return None
         
+        # DEBUG_MODE fallback when in demo mode (or general fallback)
+        try:
+            from src.config import DEBUG_MODE
+            if DEBUG_MODE:
+                from jose import jwt
+                try:
+                    claims = jwt.get_unverified_claims(token)
+                    sub = claims.get("sub", "debug-user")
+                    email = claims.get("email", f"{sub}@example.com")
+                    mock_user = MockUser(email)
+                    mock_user.id = sub
+                    print(f"🔓 DEBUG_MODE fallback – accepting JWT for user {email}")
+                    return mock_user
+                except Exception as parse_err:
+                    print(f"⚠️ Failed to parse JWT in DEBUG_MODE fallback (demo_mode): {parse_err}")
+        except Exception:
+            pass
+
         return None 

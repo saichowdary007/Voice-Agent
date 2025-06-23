@@ -269,6 +269,12 @@ except Exception as e:
     logger.error(f"❌ Failed to initialize Auth manager: {e}")
     auth_manager = None
 
+# Import VAD
+from src.vad import VAD  # Voice Activity Detection
+
+# Global VAD instance (set during startup)
+vad_instance = None
+
 # FastAPI app
 app = FastAPI(
     title="Voice Agent API",
@@ -851,11 +857,32 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
             try:
                 user = await get_current_user(HTTPAuthorizationCredentials(scheme="Bearer", credentials=token))
                 user_id = user["id"]
-            except HTTPException:
-                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-                return
+            except HTTPException as e:
+                # Enhanced error logging for WebSocket authentication failures
+                logger.error(f"WebSocket authentication failed for token: {token[:20]}... Error: {e}")
+                
+                # Try auth manager fallback (includes DEBUG_MODE support)
+                if auth_manager:
+                    try:
+                        auth_user = auth_manager.verify_token(token)
+                        if auth_user:
+                            user_id = auth_user.id
+                            logger.info(f"WebSocket authentication succeeded via auth_manager fallback for user: {auth_user.email}")
+                        else:
+                            logger.error("WebSocket authentication failed: auth_manager.verify_token returned None")
+                            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                            return
+                    except Exception as fallback_error:
+                        logger.error(f"WebSocket authentication fallback failed: {fallback_error}")
+                        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                        return
+                else:
+                    logger.error("WebSocket authentication failed: auth_manager is None")
+                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                    return
 
         await connection_manager.connect(websocket, user_id)
+        logger.info(f"✅ WebSocket connected successfully for user_id: {user_id}")
         
         try:
             # Send welcome message
@@ -872,6 +899,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                 }),
                 websocket
             )
+            logger.info(f"📨 Welcome message sent to user_id: {user_id}")
             
             conversation_mgr = connection_manager.get_conversation_manager(websocket)
             
@@ -887,7 +915,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                         is_text_message = False
                     except Exception as e:
                         logger.error(f"Failed to receive WebSocket message: {e}")
-                        continue
+                        # Terminate the loop on unrecoverable receive errors
+                        break
                 
                 try:
                     if is_text_message:
@@ -1017,6 +1046,19 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
 
                             audio_bytes = base64.b64decode(encoded_audio)
                             
+                            # Skip silent chunks early using VAD for latency savings
+                            if vad_instance and not vad_instance.is_speech(audio_bytes) and not is_final:
+                                # Notify client (optional) and skip processing
+                                await connection_manager.send_personal_message(
+                                    json.dumps({
+                                        "type": "vad_status",
+                                        "isActive": False,
+                                        "timestamp": datetime.utcnow().isoformat()
+                                    }),
+                                    websocket
+                                )
+                                continue
+
                             # Use streaming STT processing
                             user_text = await handle_streaming_stt_chunk(
                                 websocket=websocket,
@@ -1188,6 +1230,11 @@ async def startup_event():
         logger.warning("⚠️ Auth manager not available")
     
     logger.info("✅ Voice Agent API startup complete")
+
+    # Initialize VAD
+    global vad_instance
+    vad_instance = VAD(sample_rate=16000, mode=2)
+    logger.info("✅ VAD initialized (WebRTC mode 2)")
 
 @app.on_event("shutdown")
 async def shutdown_event():
