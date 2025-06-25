@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Test</title>
+</head>
+<body>
+    <h1>WebSocket Connection Test</h1>
+    <div id="status">Disconnected</div>
+    <div id="messages"></div>
+    <button onclick="testConnection()">Test Connection</button>
+    <button onclick="testAuth()">Test with Auth</button>
+
+    <script>
+        let ws = null;
+
+        function log(message) {
+            const div = document.getElementById('messages');
+            div.innerHTML += '<p>' + new Date().toLocaleTimeString() + ': ' + message + '</p>';
+            console.log(message);
+        }
+
+        function updateStatus(status) {
+            document.getElementById('status').textContent = status;
+        }
+
+        function testConnection() {
+            if (ws) {
+                ws.close();
+            }
+
+            updateStatus('Connecting...');
+            log('Testing WebSocket connection to ws://localhost:8080/ws/guest_test');
+            
+            ws = new WebSocket('ws://localhost:8080/ws/guest_test');
+            
+            ws.onopen = function() {
+                updateStatus('Connected');
+                log('✅ WebSocket connected successfully!');
+                
+                // Send a test message
+                ws.send(JSON.stringify({
+                    type: 'ping',
+                    timestamp: Date.now()
+                }));
+            };
+            
+            ws.onmessage = function(event) {
+                log('📨 Received: ' + event.data);
+            };
+            
+            ws.onerror = function(event) {
+                updateStatus('Error');
+                log('❌ WebSocket error: ' + event.type);
+            };
+            
+            ws.onclose = function(event) {
+                updateStatus('Disconnected');
+                log('🔌 WebSocket closed: ' + event.code + ' - ' + event.reason);
+            };
+        }
+
+        async function testAuth() {
+            try {
+                // First, try to get an auth token
+                const response = await fetch('http://localhost:8080/api/auth/debug-signin', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        email: 'test@example.com',
+                        password: 'test123'
+                    })
+                });
+
+                if (response.ok) {
+                    const authData = await response.json();
+                    log('🎫 Got auth token: ' + authData.access_token.substring(0, 20) + '...');
+                    
+                    // Now test WebSocket with auth
+                    if (ws) {
+                        ws.close();
+                    }
+
+                    updateStatus('Connecting with auth...');
+                    const wsUrl = 'ws://localhost:8080/ws/' + encodeURIComponent(authData.access_token);
+                    log('Testing authenticated WebSocket connection to: ' + wsUrl);
+                    
+                    ws = new WebSocket(wsUrl);
+                    
+                    ws.onopen = function() {
+                        updateStatus('Connected (Authenticated)');
+                        log('✅ Authenticated WebSocket connected successfully!');
+                    };
+                    
+                    ws.onmessage = function(event) {
+                        log('📨 Received: ' + event.data);
+                    };
+                    
+                    ws.onerror = function(event) {
+                        updateStatus('Auth Error');
+                        log('❌ Authenticated WebSocket error: ' + event.type);
+                    };
+                    
+                    ws.onclose = function(event) {
+                        updateStatus('Disconnected');
+                        log('🔌 Authenticated WebSocket closed: ' + event.code + ' - ' + event.reason);
+                    };
+                } else {
+                    log('❌ Failed to get auth token: ' + response.status);
+                }
+            } catch (error) {
+                log('❌ Auth test failed: ' + error.message);
+            }
+        }
+    </script>
+</body>
+</html> 

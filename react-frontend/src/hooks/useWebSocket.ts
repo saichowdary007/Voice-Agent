@@ -24,7 +24,7 @@ interface UseWebSocketOptions {
 
 export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: boolean = false): UseWebSocketReturn => {
   const {
-    url = process.env.REACT_APP_WS_URL || 'ws://localhost:8080',
+    url = process.env.REACT_APP_WS_URL || 'ws://localhost:8000',
     reconnectInterval = 3000,
     maxReconnectAttempts = 5,
     onOpen,
@@ -137,8 +137,10 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           setError(null);
           reconnectAttemptsRef.current = 0;
           
-          // Make WebSocket globally available for AudioVisualizer
-          (window as any).voiceAgentWebSocket = newSocket;
+          // Make WebSocket globally available for AudioVisualizer with delay to ensure stability
+          setTimeout(() => {
+            (window as any).voiceAgentWebSocket = newSocket;
+          }, 100);
           
           onOpen?.();
         };
@@ -169,8 +171,8 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           onError?.(event);
         };
 
-        newSocket.onclose = () => {
-          console.log('WebSocket disconnected');
+        newSocket.onclose = (event) => {
+          console.log('WebSocket disconnected', event.code, event.reason);
           isConnectedRef.current = false;
           isConnectingRef.current = false;
           setIsConnected(false);
@@ -185,6 +187,13 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           
           onClose?.();
 
+          // Don't reconnect immediately if the connection was rejected
+          if (event.code === 1008) {
+            setError('Authentication failed');
+            setConnectionStatus('error');
+            return;
+          }
+
           // Attempt to reconnect if we haven't exceeded max attempts
           if (reconnectAttemptsRef.current < maxReconnectAttempts) {
             reconnectAttemptsRef.current += 1;
@@ -192,7 +201,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
             
             reconnectTimeoutRef.current = setTimeout(() => {
               connectWebSocket();
-            }, reconnectInterval);
+            }, reconnectInterval * Math.pow(2, reconnectAttemptsRef.current - 1)); // Exponential backoff
           } else {
             setError('Max reconnection attempts reached');
             setConnectionStatus('error');

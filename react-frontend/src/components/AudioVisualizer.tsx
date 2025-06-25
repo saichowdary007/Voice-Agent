@@ -66,7 +66,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true,
-            sampleRate: 44100
+            sampleRate: 16000
           } 
         });
         
@@ -396,15 +396,21 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
              type: "audio_chunk",
              data: base64Audio,
              is_final: isFinal,
-             sample_rate: 44100, // Using the actual sample rate from audio context
+             sample_rate: 16000,
              timestamp: Date.now()
            };
            
            console.log(`🎵 Sending audio chunk: ${audioBytes.length} bytes, final: ${isFinal}`);
            
            // This will be connected to the WebSocket hook
-           if ((window as any).voiceAgentWebSocket && (window as any).voiceAgentWebSocket.readyState === WebSocket.OPEN) {
-             (window as any).voiceAgentWebSocket.send(JSON.stringify(audioMessage));
+           const ws = (window as any).voiceAgentWebSocket;
+           if (ws && ws.readyState === WebSocket.OPEN) {
+             try {
+               ws.send(JSON.stringify(audioMessage));
+               console.log(`✅ Audio chunk sent successfully: ${audioBytes.length} bytes`);
+             } catch (error) {
+               console.error('❌ Failed to send audio message:', error);
+             }
            } else {
              console.warn('⚠️ WebSocket not connected, discarding audio chunk');
            }
