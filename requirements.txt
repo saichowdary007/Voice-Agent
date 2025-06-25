@@ -46,3 +46,4 @@ pyjwt==2.8.0
 
 # Voice Activity Detection
 webrtcvad>=2.0.10
+python-dotenv

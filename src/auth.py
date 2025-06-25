@@ -64,8 +64,8 @@ class AuthManager:
     Manages user sign-up, sign-in, and session state with Supabase.
     Includes demo mode for testing without real Supabase credentials.
     """
-    def __init__(self):
-        self.demo_mode = _should_use_demo_mode()
+    def __init__(self, demo_mode: bool = False):
+        self.demo_mode = demo_mode or _should_use_demo_mode()
         
         if self.demo_mode:
             print("⚠️ Running in DEMO mode - not using real Supabase")
@@ -87,24 +87,17 @@ class AuthManager:
             The user session object on success, None on failure.
         """
         if self.demo_mode:
-            try:
-                if email in self.demo_users:
-                    print(f"❌ Demo sign-up failed: User {email} already exists")
-                    return None
-                
-                # Create demo user with hashed password
-                user = MockUser(email)
-                self.demo_users[email] = {
-                    'user': user,
-                    'password_hash': _hash_password(password)  # Hash passwords in demo mode
-                }
-                
-                session = MockSession(user)
-                print(f"✅ Demo sign-up successful for {email}")
-                return session
-            except Exception as e:
-                print(f"❌ Demo sign-up failed: {e}")
-                return None
+            if email in self.demo_users:
+                raise Exception(f"User {email} already exists")
+            
+            user = MockUser(email)
+            self.demo_users[email] = {
+                'user': user,
+                'password_hash': _hash_password(password)
+            }
+            
+            session = MockSession(user)
+            return session
         else:
             try:
                 credentials = {"email": email, "password": password}
@@ -124,27 +117,15 @@ class AuthManager:
             The user session object on success, None on failure.
         """
         if self.demo_mode:
-            try:
-                if email not in self.demo_users:
-                    # Auto-create demo user for convenience
-                    print(f"🔧 Auto-creating demo user for {email}")
-                    user = MockUser(email)
-                    self.demo_users[email] = {
-                        'user': user,
-                        'password_hash': _hash_password(password)
-                    }
-                
-                stored_user = self.demo_users[email]
-                if stored_user['password_hash'] == _hash_password(password):
-                    session = MockSession(stored_user['user'])
-                    print(f"✅ Demo login successful! Welcome back, {email}")
-                    return session
-                else:
-                    print(f"❌ Demo login failed: Invalid password for {email}")
-                    return None
-            except Exception as e:
-                print(f"❌ Demo login failed: {e}")
-                return None
+            if email not in self.demo_users:
+                raise Exception(f"User {email} not found")
+            
+            stored_user = self.demo_users[email]
+            if stored_user['password_hash'] != _hash_password(password):
+                raise Exception(f"Invalid password for {email}")
+            
+            session = MockSession(stored_user['user'])
+            return session
         else:
             try:
                 response = self.auth.sign_in_with_password({"email": email, "password": password})
@@ -213,36 +194,31 @@ class AuthManager:
         SECURITY FIX: Demo tokens are only accepted in demo mode or DEBUG_MODE.
         """
         if not token:
-            return None
+            raise ValueError("Token cannot be empty")
 
         # Check for demo tokens - accept in demo mode OR debug mode
         if token.startswith("demo_token_"):
             from src.config import DEBUG_MODE
             
             if not self.demo_mode and not DEBUG_MODE:
-                # Security fix: reject demo tokens in production mode
-                print("❌ Demo tokens not allowed in production mode")
-                return None
+                raise Exception("Demo tokens not allowed in production mode")
                 
             user_id = token[len("demo_token_"):]
             
             if self.demo_mode:
-                # Look up the user in the in-memory store
                 for user_record in getattr(self, "demo_users", {}).values():
                     user = user_record.get("user")
                     if user and user.id == user_id:
                         return user
-                return None
+                raise Exception("Invalid demo token")
             else:
-                # Create a temporary mock user for debug authentication
-                # This allows debug endpoints to work even with real Supabase config
                 try:
                     email = f"debug-user-{user_id}@example.com"
                     mock_user = MockUser(email)
-                    mock_user.id = user_id  # Override with the token's user ID
+                    mock_user.id = user_id
                     return mock_user
                 except Exception:
-                    return None
+                    raise Exception("Invalid demo token")
         
         # Handle real Supabase tokens
         if not self.demo_mode:
@@ -290,4 +266,4 @@ class AuthManager:
         except Exception:
             pass
 
-        return None 
+        raise ValueError("Invalid token")

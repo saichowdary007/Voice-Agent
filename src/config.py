@@ -133,6 +133,8 @@ SESSION_TIMEOUT_HOURS = int(os.getenv("SESSION_TIMEOUT_HOURS", "24"))
 REFRESH_TOKEN_TIMEOUT_DAYS = int(os.getenv("REFRESH_TOKEN_TIMEOUT_DAYS", "30"))
 
 # --- STT Global Toggle ---
-USE_REALTIME_STT = os.getenv("USE_REALTIME_STT", "false").lower() == "true"
+# Enable server-side STT by default. Set USE_REALTIME_STT=false in the
+# environment when you want the browser-only Web-Speech fallback instead.
+USE_REALTIME_STT = os.getenv("USE_REALTIME_STT", "true").lower() == "true"
 # Whisper model size to load when USE_REALTIME_STT is true (tiny, base, small, ...)
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny") 

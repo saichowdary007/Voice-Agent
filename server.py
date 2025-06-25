@@ -25,183 +25,18 @@ from pydantic import BaseModel, EmailStr, Field, validator
 import uvicorn
 import json
 from datetime import datetime
+from starlette.websockets import WebSocketState
+try:
+    from fastapi.websockets import ConnectionClosedError
+except ImportError:
+    # Fallback for older FastAPI versions
+    from starlette.websockets import WebSocketDisconnect as ConnectionClosedError
 
 # Configure logging first
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Latency tracking utilities
-class LatencyTracker:
-    """Tracks latency events for a single voice interaction pipeline."""
-    
-    def __init__(self):
-        self.events: Dict[str, float] = {}
-        self.start_time = time.perf_counter()
-    
-    def mark(self, event_name: str):
-        """Mark a timestamp for an event."""
-        self.events[event_name] = time.perf_counter() - self.start_time
-    
-    def get_duration(self, start_event: str, end_event: str) -> Optional[float]:
-        """Get duration between two events in milliseconds."""
-        if start_event in self.events and end_event in self.events:
-            return (self.events[end_event] - self.events[start_event]) * 1000
-        return None
-    
-    def get_total_latency(self) -> float:
-        """Get total latency from start to last event in milliseconds."""
-        if not self.events:
-            return 0.0
-        return max(self.events.values()) * 1000
-    
-    def log_summary(self):
-        """Log a summary of all timing events."""
-        if not self.events:
-            return
-        
-        logger.info("=== Latency Summary ===")
-        sorted_events = sorted(self.events.items(), key=lambda x: x[1])
-        
-        prev_time = 0.0
-        for event, timestamp in sorted_events:
-            duration_from_prev = (timestamp - prev_time) * 1000
-            total_elapsed = timestamp * 1000
-            logger.info(f"  {event}: +{duration_from_prev:.1f}ms (total: {total_elapsed:.1f}ms)")
-            prev_time = timestamp
-        
-        total_latency = self.get_total_latency()
-        logger.info(f"  TOTAL LATENCY: {total_latency:.1f}ms")
-        
-        # Log key segment durations
-        key_durations = [
-            ("audio_received", "stt_complete"),
-            ("stt_complete", "llm_complete"), 
-            ("llm_complete", "tts_complete"),
-            ("tts_complete", "audio_sent")
-        ]
-        
-        for start, end in key_durations:
-            duration = self.get_duration(start, end)
-            if duration is not None:
-                logger.info(f"  {start} -> {end}: {duration:.1f}ms")
-
-def get_latency_tracker(websocket: WebSocket) -> LatencyTracker:
-    """Get or create latency tracker for a websocket connection."""
-    if not hasattr(websocket, "_latency_tracker"):
-        websocket._latency_tracker = LatencyTracker()
-    return websocket._latency_tracker
-
-# Streaming pipeline functions for ultra-low latency
-async def stream_text_to_audio_pipeline(
-    user_text: str,
-    history: list,
-    profile_facts: list,
-    llm_interface,
-    tts_engine,
-    websocket: WebSocket,
-    latency_tracker: LatencyTracker
-) -> str:
-    """
-    Stream the entire LLM->TTS pipeline for ultra-low latency.
-    Starts TTS as soon as LLM begins producing tokens.
-    """
-    try:
-        latency_tracker.mark("llm_start")
-        
-        # Stream LLM response and feed directly to TTS
-        llm_stream = llm_interface.generate_stream(
-            user_text=user_text,
-            conversation_history=history,
-            user_profile=profile_facts
-        )
-        
-        latency_tracker.mark("tts_start")
-        
-        # Stream TTS synthesis from LLM stream
-        audio_stream = tts_engine.stream_synthesize(llm_stream)
-        
-        first_audio_sent = False
-        full_response = ""
-        
-        async for audio_chunk in audio_stream:
-            if audio_chunk:
-                if not first_audio_sent:
-                    latency_tracker.mark("first_audio_sent")
-                    first_audio_sent = True
-                
-                # Send audio chunk to client immediately
-                await websocket.send_json({
-                    "type": "audio_stream",
-                    "data": base64.b64encode(audio_chunk).decode("ascii"),
-                    "mime": "audio/mp3"
-                })
-        
-        latency_tracker.mark("tts_complete")
-        
-        # Collect full response for conversation history (re-generate for now)
-        full_response = await llm_interface.generate_response(user_text, history, profile_facts)
-        
-        latency_tracker.mark("pipeline_complete")
-        latency_tracker.log_summary()
-        
-        return full_response
-        
-    except Exception as e:
-        logger.error(f"Streaming pipeline error: {e}")
-        # Fallback to non-streaming
-        if llm_interface:
-            response = await llm_interface.generate_response(user_text, history, profile_facts)
-            audio_bytes = await tts_engine.synthesize(response)
-            if audio_bytes:
-                await websocket.send_json({
-                    "type": "tts_audio",
-                    "data": base64.b64encode(audio_bytes).decode("ascii"),
-                    "mime": "audio/mp3"
-                })
-            return response
-        return "Sorry, I'm having trouble processing that right now."
-
-async def handle_streaming_stt_chunk(
-    websocket: WebSocket, 
-    audio_chunk: bytes, 
-    is_final: bool,
-    stt_instance,
-    latency_tracker: LatencyTracker
-) -> Optional[str]:
-    """
-    Handle a single STT audio chunk with streaming processing.
-    Returns transcript if is_final=True, None otherwise.
-    """
-    try:
-        if not is_final:
-            latency_tracker.mark("audio_received")
-        
-        # Process with streaming STT
-        transcript = await stt_instance.stream_transcribe_chunk(audio_chunk, is_final=is_final)
-        
-        if transcript:
-            if is_final:
-                latency_tracker.mark("stt_complete")
-                # Send final transcription result
-                await websocket.send_json({
-                    "type": "stt_result",
-                    "transcript": transcript,
-                    "is_final": True
-                })
-                return transcript
-            else:
-                # Send partial result
-                await websocket.send_json({
-                    "type": "stt_partial",
-                    "transcript": transcript,
-                    "is_final": False
-                })
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"STT chunk processing error: {e}")
-        return None
+# Import WebSocket handlers from dedicated module
 
 # Import Voice Agent modules
 try:
@@ -209,11 +44,10 @@ try:
     if USE_REALTIME_STT:
         logger.info(f"🚀 Server-side STT enabled (faster-whisper, model='{WHISPER_MODEL}')")
         try:
-            import os
             from src.stt import STT
-            model_size = os.getenv("STT_MODEL_SIZE", "small")
-            stt_instance = STT(model_size=model_size, device="auto")
-            logger.info(f"✅ Faster-whisper STT initialized with model '{model_size}'")
+            # Use the same Whisper model name from config (default: 'tiny')
+            stt_instance = STT(model_size=WHISPER_MODEL, device="auto")
+            logger.info(f"✅ Faster-whisper STT initialized with model '{WHISPER_MODEL}'")
         except Exception as e:
             logger.error(f"❌ Failed to load faster-whisper STT: {e}")
             USE_REALTIME_STT = False
@@ -408,7 +242,7 @@ class ConnectionManager:
 
     async def connect(self, websocket: WebSocket, user_id: str):
         """Connect a websocket and initialize conversation manager if needed."""
-        await websocket.accept()
+        # NOTE: WebSocket should already be accepted before calling this method
         self.active_connections[websocket] = user_id
         
         # Initialize conversation manager if Supabase is enabled
@@ -431,10 +265,26 @@ class ConnectionManager:
     async def send_personal_message(self, message: str, websocket: WebSocket):
         """Send a message to a specific websocket."""
         try:
+            # Check if websocket is still connected before sending
+            if websocket.client_state != WebSocketState.CONNECTED:
+                logger.warning("Attempted to send message to disconnected websocket")
+                return False
+                
             await websocket.send_text(message)
+            logger.debug(f"Successfully sent message to websocket")
+            return True
+        except ConnectionClosedError:
+            logger.warning("WebSocket connection closed while sending message")
+            self.disconnect(websocket)
+            return False
+        except WebSocketDisconnect:
+            logger.warning("WebSocket disconnected while sending message")
+            self.disconnect(websocket)
+            return False
         except Exception as e:
             logger.error(f"Failed to send message to websocket: {e}")
             self.disconnect(websocket)
+            return False
 
     async def broadcast(self, message: str):
         """Send a message to all connected websockets."""
@@ -839,6 +689,17 @@ async def get_status():
 
 app.include_router(api_router)
 
+from src.websocket_handlers import (
+    handle_text_message,
+    handle_audio_chunk,
+    handle_ping,
+    handle_vad_status,
+    handle_start_listening,
+    handle_stop_listening,
+    handle_heartbeat,
+    handle_unknown_message,
+)
+
 # WebSocket endpoint for real-time voice interaction
 @app.websocket("/ws/{token}")
 async def websocket_endpoint(websocket: WebSocket, token: str):
@@ -847,16 +708,24 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
     Handles audio streaming and real-time messaging with actual STT/LLM/TTS processing.
     """
     try:
+        logger.info(f"🔌 New WebSocket connection attempt with token: {token[:20]}...")
+        
+        # CRITICAL: Accept the WebSocket connection FIRST before any other operations
+        await websocket.accept()
+        logger.info("✅ WebSocket connection accepted")
+        
         # -----------------------------------
         # Authenticate user (token path param)
         # -----------------------------------
         if token.startswith("guest_"):
             # Guest / unauthenticated connection – use token as pseudo user_id
             user_id = token
+            logger.info(f"🎭 Guest connection established: {user_id}")
         else:
             try:
                 user = await get_current_user(HTTPAuthorizationCredentials(scheme="Bearer", credentials=token))
                 user_id = user["id"]
+                logger.info(f"🔐 Authenticated connection for user: {user_id}")
             except HTTPException as e:
                 # Enhanced error logging for WebSocket authentication failures
                 logger.error(f"WebSocket authentication failed for token: {token[:20]}... Error: {e}")
@@ -881,40 +750,78 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                     await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                     return
 
-        await connection_manager.connect(websocket, user_id)
+        # Register the connection (without calling accept again since we already did)
+        connection_manager.active_connections[websocket] = user_id
+        
+        # Initialize conversation manager if Supabase is enabled
+        if USE_SUPABASE and user_id not in connection_manager.conversation_managers:
+            try:
+                connection_manager.conversation_managers[user_id] = ConversationManager(user_id=user_id)
+            except Exception as e:
+                logger.error(f"Failed to create ConversationManager for {user_id}: {e}")
         logger.info(f"✅ WebSocket connected successfully for user_id: {user_id}")
         
         try:
-            # Send welcome message
-            await connection_manager.send_personal_message(
-                json.dumps({
-                    "type": "connection",
-                    "status": "connected",
-                    "message": "Voice Agent WebSocket connected",
-                    "services": {
-                        "stt": USE_REALTIME_STT,
-                        "llm": llm_interface is not None,
-                        "tts": tts_engine is not None
-                    }
-                }),
+            # Send welcome message immediately after connection is established
+            welcome_message = {
+                "type": "connection",
+                "status": "connected", 
+                "message": "Voice Agent WebSocket connected",
+                "services": {
+                    "stt": USE_REALTIME_STT,
+                    "llm": llm_interface is not None,
+                    "tts": tts_engine is not None
+                }
+            }
+            
+            welcome_sent = await connection_manager.send_personal_message(
+                json.dumps(welcome_message),
                 websocket
             )
-            logger.info(f"📨 Welcome message sent to user_id: {user_id}")
+            
+            if welcome_sent:
+                logger.info(f"📨 Welcome message sent to user_id: {user_id}")
+            else:
+                logger.warning(f"Failed to send welcome message to user_id: {user_id}")
+                # Connection failed, close and return
+                await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+                return
             
             conversation_mgr = connection_manager.get_conversation_manager(websocket)
+            
+            message_handlers = {
+                "text_message": handle_text_message,
+                "audio_chunk": handle_audio_chunk,
+                "ping": handle_ping,
+                "vad_status": handle_vad_status,
+                "start_listening": handle_start_listening,
+                "stop_listening": handle_stop_listening,
+                "heartbeat": handle_heartbeat,
+            }
             
             while True:
                 # Receive message from client
                 try:
+                    # Check connection state before receiving
+                    if websocket.client_state != WebSocketState.CONNECTED:
+                        logger.info("WebSocket connection no longer active, breaking message loop")
+                        break
+                        
                     data = await websocket.receive_text()
                     is_text_message = True
-                except Exception:
+                except WebSocketDisconnect:
+                    logger.info("WebSocket disconnected normally")
+                    break
+                except ConnectionClosedError:
+                    logger.info("WebSocket connection closed")
+                    break
+                except Exception as e:
                     # If text receive fails, try binary
                     try:
                         data = await websocket.receive_bytes()
                         is_text_message = False
-                    except Exception as e:
-                        logger.error(f"Failed to receive WebSocket message: {e}")
+                    except Exception as binary_error:
+                        logger.error(f"Failed to receive WebSocket message: {e}, binary attempt: {binary_error}")
                         # Terminate the loop on unrecoverable receive errors
                         break
                 
@@ -930,269 +837,15 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                         }
                     
                     message_type = message.get("type", "unknown")
+                    handler = message_handlers.get(message_type, handle_unknown_message)
                     
-                    if message_type == "ping":
-                        # Respond to ping with pong
-                        await connection_manager.send_personal_message(
-                            json.dumps({"type": "pong", "timestamp": message.get("timestamp")}),
-                            websocket
-                        )
-                    
-                    elif message_type == "text_message":
-                        # Process text message through streaming LLM->TTS pipeline
-                        user_text = message.get("text", "")
-                        language = message.get("language", "en")
-                        
-                        if not user_text.strip():
-                            await connection_manager.send_personal_message(
-                                json.dumps({
-                                    "type": "error",
-                                    "message": "Empty message received"
-                                }),
-                                websocket
-                            )
-                            continue
-                            
-                        try:
-                            # Initialize latency tracking
-                            latency_tracker = get_latency_tracker(websocket)
-                            latency_tracker.mark("text_received")
-                            
-                            # Get conversation context
-                            history = []
-                            profile_facts = []
-                            
-                            if conversation_mgr:
-                                history, profile_facts = await asyncio.gather(
-                                    conversation_mgr.get_context_for_llm(user_text),
-                                    conversation_mgr.get_user_profile()
-                                )
-                            
-                            # Use streaming pipeline for ultra-low latency
-                            if llm_interface and tts_engine:
-                                ai_response = await stream_text_to_audio_pipeline(
-                                    user_text=user_text,
-                                    history=history,
-                                    profile_facts=profile_facts,
-                                    llm_interface=llm_interface,
-                                    tts_engine=tts_engine,
-                                    websocket=websocket,
-                                    latency_tracker=latency_tracker
-                                )
-                                
-                                # Send text response back to client
-                                response_payload = {
-                                    "type": "text_response",
-                                    "text": ai_response,
-                                    "language": language,
-                                    "timestamp": datetime.utcnow().isoformat()
-                                }
-                                await connection_manager.send_personal_message(json.dumps(response_payload), websocket)
-                                
-                                # Save conversation
-                                if conversation_mgr:
-                                    await conversation_mgr.add_message("user", user_text)
-                                    await conversation_mgr.add_message("model", ai_response)
-                                    
-                                    # Extract and save new facts
-                                    new_facts = await llm_interface.extract_facts(f"User: {user_text}\nAI: {ai_response}")
-                                    if new_facts:
-                                        await conversation_mgr.update_user_profile(new_facts)
-                                    
-                                    # Handle personal fact storage pipeline
-                                    await conversation_mgr.handle_user_turn(user_text, ai_response, llm_interface)
-                            else:
-                                ai_response = "Sorry, the AI service is currently unavailable."
-                                # Fallback to regular response
-                                response_payload = {
-                                    "type": "text_response",
-                                    "text": ai_response,
-                                    "language": language,
-                                    "timestamp": datetime.utcnow().isoformat()
-                                }
-                                await connection_manager.send_personal_message(json.dumps(response_payload), websocket)
-                                    
-                        except Exception as e:
-                            logger.error(f"Error processing text message: {e}")
-                            await connection_manager.send_personal_message(
-                                json.dumps({
-                                    "type": "error",
-                                    "message": f"Processing error: {str(e)}"
-                                }),
-                                websocket
-                            )
-                    
+                    if message_type == "text_message":
+                        await handler(websocket, message, conversation_mgr, llm_interface, tts_engine)
                     elif message_type == "audio_chunk":
-                        # Handle streamed audio data with streaming STT
-                        if not USE_REALTIME_STT:
-                            await connection_manager.send_personal_message(
-                                json.dumps({
-                                    "type": "error",
-                                    "message": "STT service not available"
-                                }),
-                                websocket
-                            )
-                            continue
-
-                        try:
-                            # Initialize latency tracking
-                            latency_tracker = get_latency_tracker(websocket)
-                            
-                            encoded_audio = message.get("data")
-                            is_final = message.get("is_final", False)
-                            
-                            if not encoded_audio:
-                                raise ValueError("Missing audio data")
-
-                            audio_bytes = base64.b64decode(encoded_audio)
-                            
-                            # Skip silent chunks early using VAD for latency savings
-                            if vad_instance and not vad_instance.is_speech(audio_bytes) and not is_final:
-                                # Notify client (optional) and skip processing
-                                await connection_manager.send_personal_message(
-                                    json.dumps({
-                                        "type": "vad_status",
-                                        "isActive": False,
-                                        "timestamp": datetime.utcnow().isoformat()
-                                    }),
-                                    websocket
-                                )
-                                continue
-
-                            # Use streaming STT processing
-                            user_text = await handle_streaming_stt_chunk(
-                                websocket=websocket,
-                                audio_chunk=audio_bytes,
-                                is_final=is_final,
-                                stt_instance=stt_instance,
-                                latency_tracker=latency_tracker
-                            )
-
-                            # If we got a final transcript, run the LLM->TTS pipeline
-                            if user_text and is_final:
-                                language = message.get("language", "en")
-
-                                # Get conversation context
-                                history = []
-                                profile_facts = []
-
-                                if conversation_mgr:
-                                    history, profile_facts = await asyncio.gather(
-                                        conversation_mgr.get_context_for_llm(user_text),
-                                        conversation_mgr.get_user_profile()
-                                    )
-
-                                if llm_interface and tts_engine:
-                                    # Use streaming pipeline for maximum speed
-                                    ai_response = await stream_text_to_audio_pipeline(
-                                        user_text=user_text,
-                                        history=history,
-                                        profile_facts=profile_facts,
-                                        llm_interface=llm_interface,
-                                        tts_engine=tts_engine,
-                                        websocket=websocket,
-                                        latency_tracker=latency_tracker
-                                    )
-                                    
-                                    # Send text response back to client
-                                    response_payload = {
-                                        "type": "text_response",
-                                        "text": ai_response,
-                                        "language": language,
-                                        "timestamp": datetime.utcnow().isoformat()
-                                    }
-                                    await connection_manager.send_personal_message(json.dumps(response_payload), websocket)
-
-                                    # Save conversation
-                                    if conversation_mgr:
-                                        await conversation_mgr.add_message("user", user_text)
-                                        await conversation_mgr.add_message("model", ai_response)
-                                    
-                                        # Extract and save new facts
-                                        new_facts = await llm_interface.extract_facts(f"User: {user_text}\nAI: {ai_response}")
-                                        if new_facts:
-                                            await conversation_mgr.update_user_profile(new_facts)
-                                        
-                                        # Handle personal fact storage pipeline
-                                        await conversation_mgr.handle_user_turn(user_text, ai_response, llm_interface)
-                                else:
-                                    # Handle case where LLM engine is not available
-                                    await connection_manager.send_personal_message(
-                                        json.dumps({
-                                            "type": "error",
-                                            "message": "LLM service is not available."
-                                        }),
-                                        websocket
-                                    )
-                            elif not is_final:
-                                # This is a partial chunk, acknowledge receipt
-                                await connection_manager.send_personal_message(
-                                    json.dumps({
-                                        "type": "audio_processed",
-                                        "status": "receiving",
-                                        "message": "Audio chunk received"
-                                    }),
-                                    websocket
-                                )
-                        except Exception as e:
-                            logger.error(f"Audio processing error: {e}")
-                            await connection_manager.send_personal_message(
-                                json.dumps({
-                                    "type": "error",
-                                    "message": f"Audio processing failed: {str(e)}"
-                                }),
-                                websocket
-                            )
-                    
-                    elif message_type == "vad_status":
-                        # Voice Activity Detection status
-                        is_active = message.get("isActive", False)
-                        await connection_manager.send_personal_message(
-                            json.dumps({
-                                "type": "vad_status", 
-                                "isActive": is_active,
-                                "timestamp": datetime.utcnow().isoformat()
-                            }),
-                            websocket
-                        )
-                    
-                    elif message_type == "start_listening":
-                        # Signal that client is ready to listen
-                        await connection_manager.send_personal_message(
-                            json.dumps({
-                                "type": "listening_started",
-                                "status": "ready",
-                                "message": "Voice Agent is listening..."
-                            }),
-                            websocket
-                        )
-                    
-                    elif message_type == "stop_listening":
-                        # Signal that client stopped listening
-                        await connection_manager.send_personal_message(
-                            json.dumps({
-                                "type": "listening_stopped",
-                                "status": "ready",
-                                "message": "Voice Agent stopped listening"
-                            }),
-                            websocket
-                        )
-                    
-                    elif message_type == "heartbeat":
-                        await connection_manager.send_personal_message(
-                            json.dumps({"type": "heartbeat", "data": "pong", "timestamp": message.get("timestamp")}),
-                            websocket
-                        )
-                    
+                        await handler(websocket, message, conversation_mgr, stt_instance, llm_interface, tts_engine, vad_instance)
                     else:
-                        # Unknown message type
-                        await connection_manager.send_personal_message(
-                            json.dumps({
-                                "type": "error",
-                                "message": f"Unknown message type: {message_type}"
-                            }),
-                            websocket
-                        )
+
+                        await handler(websocket, message)
                         
                 except json.JSONDecodeError:
                     await connection_manager.send_personal_message(
