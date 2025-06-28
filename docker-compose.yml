@@ -4,9 +4,9 @@ services:
     image: postgres:15-alpine
     container_name: voice-agent-db
     environment:
-      POSTGRES_USER: voiceagent
-      POSTGRES_PASSWORD: voiceagent123
-      POSTGRES_DB: voiceagent
+      POSTGRES_USER: ${DB_USER:-voiceagent}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME:-voiceagent}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./docker_init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -39,16 +39,18 @@ services:
       dockerfile: Dockerfile.backend
     container_name: voice-agent-backend
     environment:
-      DATABASE_URL: postgresql://voiceagent:voiceagent123@postgres:5432/voiceagent
-      REDIS_URL: redis://redis:6379
-      ENVIRONMENT: production
-      LOG_LEVEL: INFO
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       SUPABASE_URL: ${SUPABASE_URL}
       SUPABASE_KEY: ${SUPABASE_KEY}
-      USE_SUPABASE: ${USE_SUPABASE}
+      USE_SUPABASE: ${USE_SUPABASE:-false}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       USE_REALTIME_STT: ${USE_REALTIME_STT:-false}
       WHISPER_MODEL: ${WHISPER_MODEL:-tiny}
+    ports:
+      - "8080:8080"
     volumes:
       - ./uploads:/app/uploads
       - ./logs:/app/logs
@@ -61,7 +63,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -74,7 +76,8 @@ services:
       dockerfile: Dockerfile
     container_name: voice-agent-frontend
     environment:
-      REACT_APP_API_URL: http://localhost:3000
+      REACT_APP_API_URL: ${REACT_APP_API_URL:-http://localhost:8080}
+      REACT_APP_WS_URL: ${REACT_APP_WS_URL:-ws://localhost:8080}
     ports:
       - "3000:80"
     networks:

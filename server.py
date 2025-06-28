@@ -19,9 +19,10 @@ import base64
 import time
 from typing import Optional, Union, Dict, List
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, status, APIRouter
+from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr, Field, validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 import uvicorn
 import json
 from datetime import datetime
@@ -109,11 +110,55 @@ from src.vad import VAD  # Voice Activity Detection
 # Global VAD instance (set during startup)
 vad_instance = None
 
+# Application lifecycle management using modern lifespan pattern
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifecycle manager."""
+    # Startup
+    logger.info("🚀 Voice Agent API starting up...")
+    
+    # Validate critical services
+    if not USE_REALTIME_STT:
+        logger.warning("⚠️ STT engine not available")
+    if not llm_interface:
+        logger.warning("⚠️ LLM engine not available")
+    if not tts_engine:
+        logger.warning("⚠️ TTS engine not available")
+    if not auth_manager:
+        logger.warning("⚠️ Auth manager not available")
+    
+    logger.info("✅ Voice Agent API startup complete")
+
+    # Initialize VAD
+    global vad_instance
+    vad_instance = VAD(sample_rate=16000, mode=2)
+    logger.info("✅ VAD initialized (WebRTC mode 2)")
+    
+    yield
+    
+    # Shutdown
+    logger.info("🛑 Voice Agent API shutting down...")
+    
+    try:
+        # Clean up WebSocket connections
+        await connection_manager.cleanup_all()
+        
+        # Clean up LLM session
+        if llm_interface:
+            await llm_interface.cleanup_session()
+            
+        logger.info("✅ Resource cleanup complete")
+    except Exception as e:
+        logger.error(f"❌ Error during shutdown: {e}")
+    
+    logger.info("👋 Voice Agent API shutdown complete")
+
 # FastAPI app
 app = FastAPI(
     title="Voice Agent API",
     description="Real-time voice interaction API with 3D audio visualization",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # API Router
@@ -147,7 +192,8 @@ class MessageRequest(BaseModel):
     language: str = Field(default="en", pattern="^[a-z]{2}(-[A-Z]{2})?$", description="Language code")
     user_id: Optional[str] = Field(None, max_length=100)
 
-    @validator('text')
+    @field_validator('text')
+    @classmethod
     def validate_text(cls, v):
         if not v.strip():
             raise ValueError('Text cannot be empty or only whitespace')
@@ -864,48 +910,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
 
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
-
-# Application lifecycle events
-@app.on_event("startup")
-async def startup_event():
-    """Initialize application resources on startup."""
-    logger.info("🚀 Voice Agent API starting up...")
-    
-    # Validate critical services
-    if not USE_REALTIME_STT:
-        logger.warning("⚠️ STT engine not available")
-    if not llm_interface:
-        logger.warning("⚠️ LLM engine not available")
-    if not tts_engine:
-        logger.warning("⚠️ TTS engine not available")
-    if not auth_manager:
-        logger.warning("⚠️ Auth manager not available")
-    
-    logger.info("✅ Voice Agent API startup complete")
-
-    # Initialize VAD
-    global vad_instance
-    vad_instance = VAD(sample_rate=16000, mode=2)
-    logger.info("✅ VAD initialized (WebRTC mode 2)")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up resources on shutdown."""
-    logger.info("🛑 Voice Agent API shutting down...")
-    
-    try:
-        # Clean up WebSocket connections
-        await connection_manager.cleanup_all()
-        
-        # Clean up LLM session
-        if llm_interface:
-            await llm_interface.cleanup_session()
-            
-        logger.info("✅ Resource cleanup complete")
-    except Exception as e:
-        logger.error(f"❌ Error during shutdown: {e}")
-    
-    logger.info("👋 Voice Agent API shutdown complete")
 
 # Server startup
 if __name__ == "__main__":
