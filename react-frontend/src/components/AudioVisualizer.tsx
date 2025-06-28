@@ -262,8 +262,8 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
       let isCurrentlyRecording = false;
       let silenceCounter = 0;
       let speechCounter = 0;
-      const SILENCE_THRESHOLD = 8; // ~160ms of silence before stopping
-      const SPEECH_THRESHOLD = 3; // ~60ms of speech before starting
+      const SILENCE_THRESHOLD = 15; // ~300ms of silence before stopping (doubled for stability)
+      const SPEECH_THRESHOLD = 6; // ~120ms of speech before starting (doubled to reduce false positives)
       const VAD_FRAME_SIZE = 320; // 20ms at 16kHz
       
       const getAverageFrequency = (): number => {
@@ -278,10 +278,10 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         const sum = dataArray.slice(0, voiceRange).reduce((acc, value) => acc + value, 0);
         const average = sum / voiceRange;
         
-        // Enhanced VAD logic with multiple thresholds
-        const noiseFloor = 8; // Minimum background noise level
-        const voiceThreshold = 25; // Higher threshold to avoid false positives
-        const strongVoiceThreshold = 40; // Strong voice activity
+        // Enhanced VAD logic with higher thresholds to reduce sensitivity
+        const noiseFloor = 15; // Increased minimum background noise level
+        const voiceThreshold = 45; // Significantly higher threshold to avoid false positives
+        const strongVoiceThreshold = 65; // Much higher threshold for strong voice activity
         
         // Determine voice activity with better logic
         let isVoiceActive = false;
@@ -291,8 +291,8 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
           speechCounter = Math.min(speechCounter + 2, SPEECH_THRESHOLD);
           silenceCounter = 0;
           isVoiceActive = true;
-        } else if (average > voiceThreshold && average > noiseFloor * 2) {
-          // Moderate voice detected
+        } else if (average > voiceThreshold && average > noiseFloor * 3) {
+          // Moderate voice detected (increased noise floor multiplier)
           speechCounter = Math.min(speechCounter + 1, SPEECH_THRESHOLD);
           silenceCounter = Math.max(silenceCounter - 1, 0);
           isVoiceActive = speechCounter >= SPEECH_THRESHOLD;
@@ -303,18 +303,20 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
           isVoiceActive = speechCounter >= SPEECH_THRESHOLD && silenceCounter < SILENCE_THRESHOLD;
         }
         
-        // Handle audio recording and streaming
-        handleAudioRecording(isVoiceActive, average);
+        // Handle audio recording and streaming (only if not muted)
+        if (!muted) {
+          handleAudioRecording(isVoiceActive, average);
+        }
         
-        // Call voice activity callback
-        stableVoiceActivity(isVoiceActive);
+        // Call voice activity callback (only report activity if not muted)
+        stableVoiceActivity(!muted && isVoiceActive);
         
         return average;
       };
       
       // Audio recording and streaming logic
       const handleAudioRecording = (isVoiceActive: boolean, audioLevel: number) => {
-        if (!audioContextRef.current || !microphoneRef.current) return;
+        if (!audioContextRef.current || !microphoneRef.current || muted) return;
         
         // Start recording when voice is detected
         if (isVoiceActive && !isCurrentlyRecording) {
@@ -350,7 +352,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
       
       // Capture current audio frame for streaming
       const captureAudioFrame = () => {
-        if (!analyserRef.current) return;
+        if (!analyserRef.current || muted) return;
         
         // Get time domain data (actual audio samples)
         const bufferLength = analyserRef.current.fftSize;
@@ -400,14 +402,11 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
              timestamp: Date.now()
            };
            
-           console.log(`🎵 Sending audio chunk: ${audioBytes.length} bytes, final: ${isFinal}`);
-           
            // This will be connected to the WebSocket hook
            const ws = (window as any).voiceAgentWebSocket;
            if (ws && ws.readyState === WebSocket.OPEN) {
              try {
                ws.send(JSON.stringify(audioMessage));
-               console.log(`✅ Audio chunk sent successfully: ${audioBytes.length} bytes`);
              } catch (error) {
                console.error('❌ Failed to send audio message:', error);
              }
@@ -436,7 +435,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
 
         // Color changes based on voice activity
         const frequency = uniforms.u_frequency.value;
-        if (frequency > 15) { // Match the voice threshold
+        if (frequency > 45) { // Match the updated voice threshold
           // Active voice - colorful
           uniforms.u_red.value = 0.5 + Math.sin(clock.getElapsedTime() * 2) * 0.5;
           uniforms.u_green.value = 0.5 + Math.sin(clock.getElapsedTime() * 2 + Math.PI / 3) * 0.5;

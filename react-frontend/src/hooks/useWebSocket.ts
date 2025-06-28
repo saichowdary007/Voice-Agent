@@ -24,7 +24,7 @@ interface UseWebSocketOptions {
 
 export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: boolean = false): UseWebSocketReturn => {
   const {
-    url = process.env.REACT_APP_WS_URL || 'ws://localhost:8000',
+    url = process.env.REACT_APP_WS_URL || 'ws://localhost:3000',
     reconnectInterval = 3000,
     maxReconnectAttempts = 5,
     onOpen,
