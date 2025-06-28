@@ -750,44 +750,43 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                     await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                     return
 
-        # Register the connection (without calling accept again since we already did)
-        connection_manager.active_connections[websocket] = user_id
-        
-        # Initialize conversation manager if Supabase is enabled
-        if USE_SUPABASE and user_id not in connection_manager.conversation_managers:
-            try:
-                connection_manager.conversation_managers[user_id] = ConversationManager(user_id=user_id)
-            except Exception as e:
-                logger.error(f"Failed to create ConversationManager for {user_id}: {e}")
+        # -----------------------------------
+        # Send a lightweight welcome message **before** heavy initialization
+        # -----------------------------------
+        welcome_message = {
+            "type": "connection",
+            "status": "connected",
+            "message": "Voice Agent WebSocket connected",
+            "services": {
+                "stt": USE_REALTIME_STT,
+                "llm": llm_interface is not None,
+                "tts": tts_engine is not None,
+            },
+        }
+
+        try:
+            await websocket.send_json(welcome_message)
+            logger.info(f"📨 Welcome message sent to user_id: {user_id}")
+        except ConnectionClosedError:
+            logger.warning(
+                f"Failed to send welcome message to user_id: {user_id} (connection closed)"
+            )
+            return
+
+        # -----------------------------------
+        # Register the connection (may trigger heavier operations like model load)
+        # -----------------------------------
+        await connection_manager.connect(websocket, user_id)
         logger.info(f"✅ WebSocket connected successfully for user_id: {user_id}")
         
         try:
-            # Send welcome message immediately after connection is established
-            welcome_message = {
-                "type": "connection",
-                "status": "connected", 
-                "message": "Voice Agent WebSocket connected",
-                "services": {
-                    "stt": USE_REALTIME_STT,
-                    "llm": llm_interface is not None,
-                    "tts": tts_engine is not None
-                }
-            }
+            conversation_mgr = connection_manager.get_conversation_manager(websocket)
             
-            welcome_sent = await connection_manager.send_personal_message(
-                json.dumps(welcome_message),
-                websocket
-            )
-            
-            if welcome_sent:
-                logger.info(f"📨 Welcome message sent to user_id: {user_id}")
-            else:
-                logger.warning(f"Failed to send welcome message to user_id: {user_id}")
-                # Connection failed, close and return
+            # Ensure ConversationManager exists when Supabase integration is expected
+            if USE_SUPABASE and conversation_mgr is None:
+                logger.error("ConversationManager could not be initialised – aborting WebSocket session")
                 await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
                 return
-            
-            conversation_mgr = connection_manager.get_conversation_manager(websocket)
             
             message_handlers = {
                 "text_message": handle_text_message,
@@ -916,7 +915,7 @@ if __name__ == "__main__":
     
     # Get configuration from environment
     host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 8080))
     log_level = os.getenv("LOG_LEVEL", "info").lower()
     
     logger.info(f"Starting Voice Agent API server on {host}:{port}")

@@ -1,5 +1,5 @@
 # Voice Agent Docker Management
-.PHONY: help build build-dev up up-dev down down-dev logs clean restart health
+.PHONY: help build build-dev up up-dev down down-dev logs clean restart health start-native stop-native test-kokoro
 
 # Default target
 help:
@@ -14,6 +14,11 @@ help:
 	@echo "  make build-dev - Build development containers"
 	@echo "  make up-dev    - Start development environment"
 	@echo "  make down-dev  - Stop development environment"
+	@echo ""
+	@echo "Native Development:"
+	@echo "  make start-native - Start services natively (no Docker)"
+	@echo "  make stop-native  - Stop native services"
+	@echo "  make test-kokoro  - Test Kokoro TTS connection"
 	@echo ""
 	@echo "Management:"
 	@echo "  make logs      - Show logs for all services"
@@ -157,3 +162,16 @@ test-personal-facts:
 security-scan:
 	@echo "🔒 Running security scan..."
 	docker run --rm -v $(PWD):/app clair-scanner:latest /app 
+
+# Native development commands
+start-native:
+	@echo "🚀 Starting Voice Agent natively..."
+	./start_voice_agent.sh
+
+stop-native:
+	@echo "🛑 Stopping native Voice Agent services..."
+	./stop_voice_agent.sh
+
+test-kokoro:
+	@echo "🧪 Testing Kokoro TTS connection..."
+	python test_kokoro_connection.py 

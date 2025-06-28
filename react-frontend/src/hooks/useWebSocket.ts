@@ -121,11 +121,34 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
         setConnectionStatus('connecting');
         setError(null);
 
-        const wsUrl = `${url}/ws/${encodeURIComponent(token)}`;
+        // Convert http(s) URL to ws(s) if needed
+        const baseUrl = url.startsWith('http')
+          ? url.replace(/^http/, 'ws')
+          : url;
+
+        const wsUrl = `${baseUrl}/ws/${encodeURIComponent(token)}`;
         console.log('🔗 Attempting WebSocket connection to:', wsUrl);
         console.log('🎫 Using token:', token.substring(0, 20) + '...');
         const newSocket = new WebSocket(wsUrl);
         currentSocket = newSocket;
+
+        // Heartbeat timer id
+        let heartbeatId: NodeJS.Timeout | null = null;
+
+        const startHeartbeat = () => {
+          heartbeatId = setInterval(() => {
+            if (newSocket.readyState === WebSocket.OPEN) {
+              newSocket.send(JSON.stringify({ type: 'heartbeat' }));
+            }
+          }, 15000); // 15-second heartbeat to keep connection alive
+        };
+
+        const stopHeartbeat = () => {
+          if (heartbeatId) {
+            clearInterval(heartbeatId);
+            heartbeatId = null;
+          }
+        };
 
         newSocket.onopen = () => {
           console.log('WebSocket connected');
@@ -142,6 +165,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
             (window as any).voiceAgentWebSocket = newSocket;
           }, 100);
           
+          startHeartbeat();
           onOpen?.();
         };
 
@@ -206,6 +230,8 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
             setError('Max reconnection attempts reached');
             setConnectionStatus('error');
           }
+
+          stopHeartbeat();
         };
 
         setSocket(newSocket);

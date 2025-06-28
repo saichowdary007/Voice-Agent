@@ -6,42 +6,47 @@ import asyncio
 import logging
 import os
 import re
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any, TYPE_CHECKING
 from src.config import USE_SUPABASE, SUPABASE_URL, SUPABASE_KEY
 from datetime import datetime
 
 # Configure logger
 logger = logging.getLogger(__name__)
 
+# For type checkers, import the type
+if TYPE_CHECKING:
+    from supabase import Client
+
 # Conditional imports to avoid dependency issues
 if USE_SUPABASE:
     try:
         from sentence_transformers import SentenceTransformer
-        from supabase import create_client, Client
+        from supabase import create_client
         SUPABASE_AVAILABLE = True
     except ImportError as e:
         logger.warning(f"⚠️ Supabase dependencies not available: {e}")
         SUPABASE_AVAILABLE = False
         SentenceTransformer = None
         create_client = None
-        Client = None
 else:
     SUPABASE_AVAILABLE = False
     SentenceTransformer = None
     create_client = None
-    Client = None
 
 class ConversationManager:
     """
     Manages conversation state and history using Supabase.
     This class is designed to be used in an async environment with proper error handling.
     """
+    # Shared embedding model to avoid re-loading on every new WebSocket connection
+    _shared_embedding_model = None
+
     def __init__(self, user_id: str):
         if not user_id:
             raise ValueError("A user ID must be provided to initialize the ConversationManager.")
         self.user_id = user_id
         self.use_supabase = USE_SUPABASE and SUPABASE_AVAILABLE
-        self.supabase: Optional[Client] = self._connect_supabase()
+        self.supabase: Optional['Client'] = self._connect_supabase()
         self.embedding_model = self._load_embedding_model() if self.use_supabase else None
         self.vector_search_available = True  # Track if vector search is available
         
@@ -54,7 +59,7 @@ class ConversationManager:
         else:
             logger.warning("⚠️ Conversation history is disabled. Supabase not configured in .env file.")
 
-    def _connect_supabase(self) -> Optional[Client]:
+    def _connect_supabase(self) -> Optional['Client']:
         """Establishes a connection to Supabase if configured."""
         if self.use_supabase and SUPABASE_AVAILABLE and create_client:
             try:
@@ -78,6 +83,7 @@ class ConversationManager:
             embedding = self.embedding_model.encode(text).tolist()
             
             # Use asyncio.to_thread for CPU-bound operation
+            assert self.supabase is not None
             await asyncio.to_thread(
                 lambda: self.supabase.table('conversation_history').insert({
                     'session_id': self.user_id,
@@ -98,6 +104,7 @@ class ConversationManager:
             
         try:
             current_embedding = self.embedding_model.encode(current_text).tolist()
+            assert self.supabase is not None
             response = await asyncio.to_thread(
                 lambda: self.supabase.rpc(
                     'match_conversations', 
@@ -124,9 +131,10 @@ class ConversationManager:
     async def _get_recent_context(self, max_results: int = 4) -> List[Dict]:
         """Retrieves the most recent messages."""
         try:
+            assert self.supabase is not None
             response = await asyncio.to_thread(
                 lambda: self.supabase.table('conversation_history')
-                .select('role, text, created_at')
+                .select('role, text, content:text, created_at')
                 .eq('session_id', self.user_id)
                 .order('created_at', desc=True)
                 .limit(max_results)
@@ -137,7 +145,7 @@ class ConversationManager:
             logger.error(f"❌ Error fetching recent history from Supabase: {e}")
             return []
 
-    async def get_context_for_llm(self, current_text: str) -> List[Dict[str, str]]:
+    async def get_context_for_llm(self, current_text: str) -> List[Dict[str, Any]]:
         """
         Retrieves a combined context of recent and semantically relevant messages.
         
@@ -170,7 +178,7 @@ class ConversationManager:
             # Process recent history
             for item in recent_history:
                 item_text = item.get('text')
-                if item_text:
+                if item_text and item_text not in combined_history:
                     # Unify the key to 'content' for consistent formatting
                     item['content'] = item_text
                     combined_history[item_text] = item
@@ -196,6 +204,7 @@ class ConversationManager:
             return []
             
         try:
+            assert self.supabase is not None
             response = await asyncio.to_thread(
                 lambda: self.supabase.table('user_profile')
                 .select('key, value')
@@ -220,6 +229,7 @@ class ConversationManager:
         try:
             # Process facts in parallel with error handling
             tasks = []
+            assert self.supabase is not None
             for fact in facts:
                 if 'key' in fact and 'value' in fact:
                     task = asyncio.to_thread(
@@ -262,6 +272,7 @@ class ConversationManager:
             return False
             
         try:
+            assert self.supabase is not None
             await asyncio.to_thread(
                 lambda: self.supabase.table('conversation_history')
                 .delete()
@@ -275,15 +286,22 @@ class ConversationManager:
             return False
 
     def _load_embedding_model(self):
-        if self.use_supabase and SUPABASE_AVAILABLE and SentenceTransformer:
-            try:
-                model = SentenceTransformer('all-MiniLM-L6-v2')
-                logger.info("✅ Embedding model loaded successfully")
-                return model
-            except Exception as e:
-                logger.error(f"❌ Failed to load embedding model: {e}")
+        """Loads the sentence transformer model only once and reuses it for subsequent instances."""
+        if ConversationManager._shared_embedding_model is not None:
+            return ConversationManager._shared_embedding_model
+
+        try:
+            if SentenceTransformer is None:
+                logger.warning("SentenceTransformer is not available")
                 return None
-        return None
+
+            # Load and cache the model
+            ConversationManager._shared_embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.info("✅ Embedding model loaded successfully (cached)")
+            return ConversationManager._shared_embedding_model
+        except Exception as e:
+            logger.error(f"❌ Failed to load embedding model: {e}")
+            return None
 
     # === PERSONAL FACT STORAGE PIPELINE ===
 
@@ -355,8 +373,8 @@ USER: "{text}"
         """
         Basic PII redaction using regex patterns.
         """
-        # Phone numbers
-        text = re.sub(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', '[PHONE]', text)
+        # Phone numbers (supports various formats)
+        text = re.sub(r'(\b\+?\d{1,3}[-.\s]?)?(\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}\b', '[PHONE]', text)
         
         # Email addresses
         text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '[EMAIL]', text)
@@ -364,8 +382,8 @@ USER: "{text}"
         # SSN patterns
         text = re.sub(r'\b\d{3}-\d{2}-\d{4}\b', '[SSN]', text)
         
-        # Credit card patterns
-        text = re.sub(r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b', '[CARD]', text)
+        # Credit card patterns (very basic, targets 13-16 digit numbers)
+        text = re.sub(r'\b(?:\d[ -]*?){13,16}\b', '[CARD]', text)
         
         return text
 
@@ -381,6 +399,7 @@ USER: "{text}"
             fact_embedding = self.embedding_model.encode(fact).tolist()
             
             # Get existing snippets for this user
+            assert self.supabase is not None
             response = await asyncio.to_thread(
                 lambda: self.supabase.table('memory_snippets')
                 .select('content, embedding')
@@ -443,6 +462,7 @@ USER: "{text}"
             embedding = self.embedding_model.encode(clean_fact).tolist()
             
             # Store the fact
+            assert self.supabase is not None
             await asyncio.to_thread(
                 lambda: self.supabase.table('memory_snippets').insert({
                     'user_id': self.user_id,
@@ -471,6 +491,7 @@ USER: "{text}"
             
         try:
             # Count current snippets
+            assert self.supabase is not None
             count_response = await asyncio.to_thread(
                 lambda: self.supabase.table('memory_snippets')
                 .select('id', count='exact')
@@ -486,6 +507,7 @@ USER: "{text}"
             # Get snippets to delete (oldest and lowest importance)
             snippets_to_delete = current_count - self.max_snippets_per_user
             
+            assert self.supabase is not None
             response = await asyncio.to_thread(
                 lambda: self.supabase.table('memory_snippets')
                 .select('id')
@@ -498,6 +520,7 @@ USER: "{text}"
             
             if response.data:
                 ids_to_delete = [item['id'] for item in response.data]
+                assert self.supabase is not None
                 await asyncio.to_thread(
                     lambda: self.supabase.table('memory_snippets')
                     .delete()
@@ -551,6 +574,7 @@ USER: "{text}"
         try:
             query_embedding = self.embedding_model.encode(query_text).tolist()
             
+            assert self.supabase is not None
             response = await asyncio.to_thread(
                 lambda: self.supabase.rpc(
                     'match_memory_snippets',
@@ -605,5 +629,5 @@ if __name__ == '__main__':
     # This requires a running event loop to work.
     # To run this file directly: python -m asyncio
     # And then in the REPL: from src.conversation import main; await main()
-    # Or simply run the main_refactored.py which uses this class.
-    print("To test this module, run main_refactored.py or use an asyncio REPL.")
+    # Or simply run the server.py which uses this class.
+    print("To test this module, run server.py or use an asyncio REPL.")
