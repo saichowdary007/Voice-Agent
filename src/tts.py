@@ -1,23 +1,56 @@
 """
-Refactored Text-to-Speech (TTS) module using edge-tts for a fast and high-quality voice.
-Enhanced with streaming capabilities for ultra-low latency voice responses.
+Text-to-Speech (TTS) module backed by the Kokoro FastAPI service.
+
+The implementation keeps the same public interface that the rest of the codebase
+relies on (`stream_synthesize`, `speak`, `synthesize`, etc.) but swaps out the
+underlying engine from Microsoft Edge-TTS to the Kokoro engine that is exposed
+over an OpenAI-compatible HTTP API (see https://github.com/remsky/Kokoro-FastAPI).
+
+Latency-optimised streaming is preserved by issuing the request with
+`stream=true` and yielding the base64-encoded audio chunks as they arrive.
 """
+
 import asyncio
-import edge_tts
-import re
+import base64
+import json
 import logging
+import re
 from typing import AsyncGenerator, AsyncIterator
-from src.config import EDGE_TTS_VOICE
+
+import aiohttp
+
+from src.config import (
+    KOKORO_TTS_URL,
+    KOKORO_TTS_VOICE,
+    KOKORO_TTS_MODEL,
+    KOKORO_TTS_SPEED,
+)
 
 logger = logging.getLogger(__name__)
 
 class TTS:
+    """Kokoro-backed Text-to-Speech helper.
+
+    The rest of the application instantiates this class with no arguments, so
+    we take our configuration from environment variables that are surfaced in
+    `src.config`. All parameters are overridable at runtime without code
+    changes.
     """
-    Handles Text-to-Speech synthesis using Microsoft Edge's TTS engine.
-    Enhanced with streaming capabilities for immediate audio playback as text becomes available.
-    """
-    def __init__(self, voice: str = EDGE_TTS_VOICE):
-        self.voice = voice
+
+    def __init__(
+        self,
+        *,
+        base_url: str | None = None,
+        voice: str | None = None,
+        model: str | None = None,
+        speed: float | None = None,
+    ):
+        self.base_url = base_url or KOKORO_TTS_URL.rstrip("/")
+        self.voice = voice or KOKORO_TTS_VOICE
+        self.model = model or KOKORO_TTS_MODEL
+        self.speed = speed or KOKORO_TTS_SPEED
+
+        # Buffer used by stream_synthesize to accumulate partial sentences.
         self._sentence_buffer = ""
         
     def _split_into_speech_chunks(self, text: str) -> list:
@@ -105,13 +138,47 @@ class TTS:
         if not text.strip():
             return
             
+        url = f"{self.base_url}/v1/audio/speech"
+        payload = {
+            "input": text.strip(),
+            "model": self.model,
+            "voice": self.voice,
+            "speed": self.speed,
+            "response_format": "mp3",
+            "stream": True,
+        }
+
         try:
-            communicate = edge_tts.Communicate(text.strip(), self.voice)
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    yield chunk["data"]
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        err_text = await resp.text()
+                        logger.error(
+                            "Kokoro TTS error (%s): %s", resp.status, err_text[:200]
+                        )
+                        return
+
+                    # The Kokoro API streams JSON lines with base64 encoded audio.
+                    buffer = b""
+                    async for chunk_bytes in resp.content.iter_chunked(4096):
+                        if not chunk_bytes:
+                            continue
+                        buffer += chunk_bytes
+                        while b"\n" in buffer:
+                            line, buffer = buffer.split(b"\n", 1)
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                data_json = json.loads(line.decode("utf-8"))
+                                audio_b64 = data_json.get("audio")
+                                if audio_b64:
+                                    yield base64.b64decode(audio_b64)
+                            except json.JSONDecodeError:
+                                # Partial line or keep-alive heartbeat; continue accumulating
+                                continue
         except Exception as e:
-            logger.error(f"Chunk synthesis error for '{text[:50]}...': {e}")
+            logger.error("Chunk synthesis error for '%s...': %s", text[:50], e)
 
     async def speak(self, text: str):
         """
@@ -123,48 +190,38 @@ class TTS:
         if not text:
             return
 
-        process = None
         try:
-            # Start ffplay process, configured to read from stdin ('-')
+            audio_bytes = await self.synthesize(text)
+            if not audio_bytes:
+                logger.warning("No audio returned for speak() call")
+                return
+
             process = await asyncio.create_subprocess_exec(
-                'ffplay',
-                '-i', '-',          # Input from stdin
-                '-nodisp',
-                '-autoexit',
-                '-loglevel', 'quiet',
+                "ffplay",
+                "-i",
+                "-",
+                "-nodisp",
+                "-autoexit",
+                "-loglevel",
+                "quiet",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
 
-            # Stream audio from edge-tts directly to the ffplay process
-            communicate = edge_tts.Communicate(text, self.voice)
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio" and process.stdin:
-                    try:
-                        process.stdin.write(chunk["data"])
-                        await process.stdin.drain()
-                    except (BrokenPipeError, ConnectionResetError):
-                        # This can happen if ffplay closes unexpectedly
-                        print("⚠️  TTS stream pipe broke. Playback may have been interrupted.")
-                        break
-
-            # Close stdin to signal that we're done sending audio
             if process.stdin:
+                process.stdin.write(audio_bytes)
+                await process.stdin.drain()
                 process.stdin.close()
-            
-            # Wait for the ffplay process to finish
+
             await process.wait()
-                
+
         except FileNotFoundError:
             print("❌ Error: `ffplay` not found. Please install ffmpeg.")
             print("   On macOS, run: brew install ffmpeg")
             print("   On Debian/Ubuntu, run: sudo apt-get install ffmpeg")
         except Exception as e:
-            print(f"❌ Error in TTS: {e}")
-            if process:
-                process.kill()
-                await process.wait()
+            logger.error("Error in TTS speak(): %s", e)
 
     async def synthesize(self, text: str) -> bytes:
         """Return raw audio bytes for the given *text*.
@@ -176,16 +233,31 @@ class TTS:
         if not text:
             return b""
 
-        audio_data = bytearray()
+        url = f"{self.base_url}/v1/audio/speech"
+        payload = {
+            "input": text,
+            "model": self.model,
+            "voice": self.voice,
+            "speed": self.speed,
+            "response_format": "mp3",
+            "stream": False,
+        }
+
         try:
-            communicate = edge_tts.Communicate(text, self.voice)
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    audio_data.extend(chunk["data"])
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        logger.error("Kokoro TTS synthesis error (%s)", resp.status)
+                        return b""
+                    data_json = await resp.json()
+                    audio_b64 = data_json.get("audio")
+                    if not audio_b64:
+                        logger.warning("No 'audio' key in Kokoro response")
+                        return b""
+                    return base64.b64decode(audio_b64)
         except Exception as e:
-            print(f"❌ Error during TTS synthesis: {e}")
+            logger.error("Error during TTS synthesis: %s", e)
             return b""
-        return bytes(audio_data)
 
     async def synthesize_stream_from_text(self, text: str) -> AsyncGenerator[bytes, None]:
         """

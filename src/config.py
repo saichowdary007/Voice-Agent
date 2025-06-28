@@ -137,4 +137,10 @@ REFRESH_TOKEN_TIMEOUT_DAYS = int(os.getenv("REFRESH_TOKEN_TIMEOUT_DAYS", "30"))
 # environment when you want the browser-only Web-Speech fallback instead.
 USE_REALTIME_STT = os.getenv("USE_REALTIME_STT", "true").lower() == "true"
 # Whisper model size to load when USE_REALTIME_STT is true (tiny, base, small, ...)
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny") 
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny")
+
+# --- Kokoro TTS Configuration ---
+KOKORO_TTS_URL = os.getenv("KOKORO_TTS_URL", "http://localhost:8880")
+KOKORO_TTS_VOICE = os.getenv("KOKORO_TTS_VOICE", "af_bella")
+KOKORO_TTS_MODEL = os.getenv("KOKORO_TTS_MODEL", "kokoro")
+KOKORO_TTS_SPEED = float(os.getenv("KOKORO_TTS_SPEED", "1.0")) 
