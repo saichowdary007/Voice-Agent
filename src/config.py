@@ -7,6 +7,7 @@ load_dotenv()
 # --- API Keys ---
 # It's recommended to set your API key in the .env file for security
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "84a7d0c60019baa83e8fd7b3097ef0a23e104c98")
 
 # --- Supabase Configuration ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -143,4 +144,22 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny")
 KOKORO_TTS_URL = os.getenv("KOKORO_TTS_URL", "http://localhost:8880")
 KOKORO_TTS_VOICE = os.getenv("KOKORO_TTS_VOICE", "af_bella")
 KOKORO_TTS_MODEL = os.getenv("KOKORO_TTS_MODEL", "kokoro")
-KOKORO_TTS_SPEED = float(os.getenv("KOKORO_TTS_SPEED", "1.0")) 
+KOKORO_TTS_SPEED = float(os.getenv("KOKORO_TTS_SPEED", "1.0"))
+
+# --- Gemini TTS Configuration ---
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-native-audio-dialog")
+GEMINI_TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Aoede")
+GEMINI_TTS_SPEAKING_RATE = float(os.getenv("GEMINI_TTS_SPEAKING_RATE", "1.0"))
+
+# --- Deepgram Configuration ---
+# STT Configuration
+DEEPGRAM_STT_MODEL = os.getenv("DEEPGRAM_STT_MODEL", "nova-2")
+DEEPGRAM_STT_LANGUAGE = os.getenv("DEEPGRAM_STT_LANGUAGE", "en-US")
+DEEPGRAM_STT_SMART_FORMAT = os.getenv("DEEPGRAM_STT_SMART_FORMAT", "true").lower() == "true"
+DEEPGRAM_STT_PUNCTUATE = os.getenv("DEEPGRAM_STT_PUNCTUATE", "true").lower() == "true"
+DEEPGRAM_STT_DIARIZE = os.getenv("DEEPGRAM_STT_DIARIZE", "false").lower() == "true"
+
+# TTS Configuration  
+DEEPGRAM_TTS_MODEL = os.getenv("DEEPGRAM_TTS_MODEL", "aura-asteria-en")
+DEEPGRAM_TTS_ENCODING = os.getenv("DEEPGRAM_TTS_ENCODING", "linear16")
+DEEPGRAM_TTS_SAMPLE_RATE = int(os.getenv("DEEPGRAM_TTS_SAMPLE_RATE", "24000")) 

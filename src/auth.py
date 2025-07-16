@@ -243,6 +243,11 @@ class AuthManager:
                             return mock_user
                         except Exception as parse_err:
                             print(f"⚠️ Failed to parse JWT in DEBUG_MODE fallback: {parse_err}")
+                            # If JWT parsing fails, still try to create a mock user from the token
+                            mock_user = MockUser("debug-user@example.com")
+                            mock_user.id = "debug-user"
+                            print(f"🔓 DEBUG_MODE fallback – created mock user for unparseable token")
+                            return mock_user
                 except Exception:
                     # If DEBUG_MODE import fails or disabled, just fall through
                     pass

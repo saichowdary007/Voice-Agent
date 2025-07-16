@@ -1,288 +1,225 @@
 """
-Text-to-Speech (TTS) module backed by the Kokoro FastAPI service.
-
-The implementation keeps the same public interface that the rest of the codebase
-relies on (`stream_synthesize`, `speak`, `synthesize`, etc.) but swaps out the
-underlying engine from Microsoft Edge-TTS to the Kokoro engine that is exposed
-over an OpenAI-compatible HTTP API (see https://github.com/remsky/Kokoro-FastAPI).
-
-Latency-optimised streaming is preserved by issuing the request with
-`stream=true` and yielding the base64-encoded audio chunks as they arrive.
+Text-to-Speech (TTS) module with Deepgram integration.
+Uses Deepgram's Aura models for high-quality, low-latency speech synthesis.
+Falls back to Gemini TTS if Deepgram is not available.
 """
 
 import asyncio
-import base64
-import json
 import logging
-import re
-from typing import AsyncGenerator, AsyncIterator
+from typing import AsyncGenerator
 
-import aiohttp
+# Try to import Deepgram TTS first
+try:
+    from src.tts_deepgram import TTS as DeepgramTTS
+    _DEEPGRAM_AVAILABLE = True
+except ImportError:
+    _DEEPGRAM_AVAILABLE = False
 
-from src.config import (
-    KOKORO_TTS_URL,
-    KOKORO_TTS_VOICE,
-    KOKORO_TTS_MODEL,
-    KOKORO_TTS_SPEED,
-)
+# Fallback imports for Gemini TTS
+if not _DEEPGRAM_AVAILABLE:
+    import base64
+    import json
+    import re
+    import tempfile
+    import os
+    
+    # Google Gen AI SDK for Live API
+    try:
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
+        _GENAI_AVAILABLE = True
+    except ImportError:
+        genai = None  # type: ignore
+        types = None  # type: ignore
+        _GENAI_AVAILABLE = False
+
+    from src.config import (
+        GEMINI_API_KEY,
+        GEMINI_TTS_MODEL,
+        GEMINI_TTS_VOICE,
+        GEMINI_TTS_SPEAKING_RATE,
+    )
 
 logger = logging.getLogger(__name__)
 
-class TTS:
-    """Kokoro-backed Text-to-Speech helper.
 
-    The rest of the application instantiates this class with no arguments, so
-    we take our configuration from environment variables that are surfaced in
-    `src.config`. All parameters are overridable at runtime without code
-    changes.
-    """
+# Use Deepgram TTS if available, otherwise fallback to Gemini
+if _DEEPGRAM_AVAILABLE:
+    logger.info("🚀 Using Deepgram TTS for high-quality speech synthesis")
+    TTS = DeepgramTTS
+else:
+    logger.info("🔄 Deepgram not available, using Gemini TTS fallback")
+    
+    class TTS:
+        """Gemini TTS using Google Gen AI SDK with Live API for native audio generation."""
 
-    def __init__(
-        self,
-        *,
-        base_url: str | None = None,
-        voice: str | None = None,
-        model: str | None = None,
-        speed: float | None = None,
-    ):
-        self.base_url = base_url or KOKORO_TTS_URL.rstrip("/")
-        self.voice = voice or KOKORO_TTS_VOICE
-        self.model = model or KOKORO_TTS_MODEL
-        self.speed = speed or KOKORO_TTS_SPEED
+        def __init__(
+            self,
+            *,
+            api_key: str | None = None,
+            voice: str | None = None,
+            model: str | None = None,
+            speaking_rate: float | None = None,
+        ):
+            if not _GENAI_AVAILABLE:
+                raise ImportError(
+                    "google-genai package is required for TTS. "
+                    "Install it with: pip install 'google-genai>=0.3.0'"
+                )
 
-        # Buffer used by stream_synthesize to accumulate partial sentences.
-        self._sentence_buffer = ""
-        
-    def _split_into_speech_chunks(self, text: str) -> list:
-        """Split text into speakable chunks (sentences or clauses)."""
-        # Split on sentence endings, keeping the punctuation
-        chunks = re.split(r'([.!?]+)', text)
-        
-        # Recombine with punctuation and filter out empty chunks
-        speech_chunks = []
-        for i in range(0, len(chunks) - 1, 2):
-            chunk = chunks[i].strip()
-            punct = chunks[i + 1] if i + 1 < len(chunks) else ""
-            if chunk:
-                speech_chunks.append(chunk + punct)
-        
-        # If no sentence endings found, split on long clauses
-        if not speech_chunks and text.strip():
-            # Split on commas for long phrases
-            clause_chunks = [chunk.strip() for chunk in text.split(',') if chunk.strip()]
-            if len(clause_chunks) > 1:
-                speech_chunks = [chunk + ',' for chunk in clause_chunks[:-1]] + [clause_chunks[-1]]
-            else:
-                speech_chunks = [text.strip()]
-                
-        return speech_chunks
+            self.api_key = api_key or GEMINI_API_KEY
+            self.voice = voice or GEMINI_TTS_VOICE
+            self.model = model or "gemini-2.0-flash-live-001"  # Use stable live model
+            self.speaking_rate = speaking_rate or GEMINI_TTS_SPEAKING_RATE
 
-    async def stream_synthesize(self, text_stream: AsyncIterator[str]) -> AsyncGenerator[bytes, None]:
-        """
-        Stream TTS synthesis from a stream of text chunks.
-        Starts generating audio as soon as complete sentences are available.
-        
-        Args:
-            text_stream: Async iterator yielding text chunks from LLM
-            
-        Yields:
-            Audio bytes as they become available
-        """
-        try:
-            async for text_chunk in text_stream:
-                if not text_chunk:
-                    continue
-                    
-                # Add to buffer
-                self._sentence_buffer += text_chunk
-                
-                # Extract complete sentences from buffer
-                speech_chunks = self._split_into_speech_chunks(self._sentence_buffer)
-                
-                # If we have complete sentences, synthesize them
-                if len(speech_chunks) > 1:
-                    # Keep the last incomplete chunk in buffer
-                    complete_chunks = speech_chunks[:-1]
-                    self._sentence_buffer = speech_chunks[-1]
-                    
-                    # Synthesize complete chunks
-                    for chunk in complete_chunks:
-                        if chunk.strip():
-                            async for audio_bytes in self._synthesize_chunk(chunk):
-                                yield audio_bytes
-                                
-                # If buffer is getting long, force synthesis
-                elif len(self._sentence_buffer) > 100:
-                    chunk_to_synthesize = self._sentence_buffer
-                    self._sentence_buffer = ""
-                    
-                    if chunk_to_synthesize.strip():
-                        async for audio_bytes in self._synthesize_chunk(chunk_to_synthesize):
-                            yield audio_bytes
-            
-            # Synthesize any remaining text in buffer
-            if self._sentence_buffer.strip():
-                async for audio_bytes in self._synthesize_chunk(self._sentence_buffer):
-                    yield audio_bytes
-                self._sentence_buffer = ""
-                
-        except Exception as e:
-            logger.error(f"Stream synthesis error: {e}")
-            # Fallback: synthesize any buffered text
-            if self._sentence_buffer.strip():
-                async for audio_bytes in self._synthesize_chunk(self._sentence_buffer):
-                    yield audio_bytes
+            if not self.api_key:
+                raise ValueError("GEMINI_API_KEY is required for TTS")
 
-    async def _synthesize_chunk(self, text: str) -> AsyncGenerator[bytes, None]:
-        """Synthesize a single text chunk and yield audio bytes."""
-        if not text.strip():
-            return
-            
-        url = f"{self.base_url}/v1/audio/speech"
-        payload = {
-            "input": text.strip(),
-            "model": self.model,
-            "voice": self.voice,
-            "speed": self.speed,
-            "response_format": "mp3",
-            "stream": True,
-        }
+            # Initialize the client
+            self._client = genai.Client(api_key=self.api_key)  # type: ignore
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload) as resp:
-                    if resp.status != 200:
-                        err_text = await resp.text()
-                        logger.error(
-                            "Kokoro TTS error (%s): %s", resp.status, err_text[:200]
+        async def _synthesize_with_live_api(self, text: str) -> bytes:
+            """Synthesize speech using Gemini Live API for native audio generation."""
+            if not text.strip():
+                return b""
+
+            try:
+                # Configure Live API for audio generation
+                config = types.LiveConnectConfig(  # type: ignore
+                    response_modalities=[types.Modality.AUDIO],  # type: ignore
+                    temperature=0.1,  # Low temperature for consistent speech
+                )
+
+                # Collect audio chunks
+                audio_chunks = []
+
+                async with self._client.aio.live.connect(  # type: ignore
+                    model=self.model, config=config
+                ) as session:
+                    # Send the text to synthesize
+                    await session.send_client_content(  # type: ignore
+                        turns=types.Content(  # type: ignore
+                            role="user", parts=[types.Part(text=text)]  # type: ignore
                         )
-                        return
+                    )
 
-                    # The Kokoro API streams JSON lines with base64 encoded audio.
-                    buffer = b""
-                    async for chunk_bytes in resp.content.iter_chunked(4096):
-                        if not chunk_bytes:
-                            continue
-                        buffer += chunk_bytes
-                        while b"\n" in buffer:
-                            line, buffer = buffer.split(b"\n", 1)
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                data_json = json.loads(line.decode("utf-8"))
-                                audio_b64 = data_json.get("audio")
-                                if audio_b64:
-                                    yield base64.b64decode(audio_b64)
-                            except json.JSONDecodeError:
-                                # Partial line or keep-alive heartbeat; continue accumulating
-                                continue
-        except Exception as e:
-            logger.error("Chunk synthesis error for '%s...': %s", text[:50], e)
+                    # Collect audio response
+                    async for message in session.receive():  # type: ignore
+                        if message.data:  # Audio data
+                            audio_chunks.append(message.data)
 
-    async def speak(self, text: str):
-        """
-        Synthesizes text and streams it directly to ffplay's stdin for immediate playback.
+                # Concatenate all audio chunks
+                return b"".join(audio_chunks)
 
-        Args:
-            text: The text to be spoken.
-        """
-        if not text:
-            return
+            except Exception as e:
+                logger.error(f"Gemini Live API synthesis failed: {e}")
+                raise
 
-        try:
-            audio_bytes = await self.synthesize(text)
-            if not audio_bytes:
-                logger.warning("No audio returned for speak() call")
+        async def _synthesize_chunk_live(self, text: str) -> AsyncGenerator[bytes, None]:
+            """Stream audio chunks from Live API."""
+            try:
+                audio_data = await self._synthesize_with_live_api(text)
+                if audio_data:
+                    # Yield the complete audio in one chunk for simplicity
+                    yield audio_data
+            except Exception as e:
+                logger.error(f"Live API chunk synthesis failed: {e}")
+                raise
+
+        async def synthesize(self, text: str) -> bytes:
+            """Return raw audio bytes for the given text using Gemini Live API."""
+            if not text:
+                return b""
+
+            try:
+                return await self._synthesize_with_live_api(text)
+            except Exception as e:
+                logger.error(f"TTS synthesis failed: {e}")
+                return b""
+
+        async def stream_synthesize(self, text: str) -> AsyncGenerator[bytes, None]:
+            """Stream synthesized audio chunks for the given text."""
+            if not text:
                 return
 
-            process = await asyncio.create_subprocess_exec(
-                "ffplay",
-                "-i",
-                "-",
-                "-nodisp",
-                "-autoexit",
-                "-loglevel",
-                "quiet",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
+            async for chunk in self._synthesize_chunk_live(text):  # type: ignore[misc]
+                yield chunk
 
-            if process.stdin:
-                process.stdin.write(audio_bytes)
-                await process.stdin.drain()
-                process.stdin.close()
+        async def speak(self, text: str) -> None:
+            """Synthesize and play audio for the given text."""
+            if not text:
+                return
 
-            await process.wait()
+            # Get raw audio data from Gemini Live API
+            audio_bytes = await self.synthesize(text)
+            if not audio_bytes:
+                logger.warning("No audio data generated")
+                return
 
-        except FileNotFoundError:
-            print("❌ Error: `ffplay` not found. Please install ffmpeg.")
-            print("   On macOS, run: brew install ffmpeg")
-            print("   On Debian/Ubuntu, run: sudo apt-get install ffmpeg")
-        except Exception as e:
-            logger.error("Error in TTS speak(): %s", e)
+            try:
+                # Convert raw PCM to WAV format for playback
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+                    import wave
+                    with wave.open(tmp_file.name, 'wb') as wav_file:
+                        wav_file.setnchannels(1)  # Mono
+                        wav_file.setsampwidth(2)  # 16-bit
+                        wav_file.setframerate(24000)  # 24kHz sample rate
+                        wav_file.writeframes(audio_bytes)
+                    tmp_path = tmp_file.name
 
-    async def synthesize(self, text: str) -> bytes:
-        """Return raw audio bytes for the given *text*.
+                # Play the WAV file
+                import subprocess
+                import platform
+                
+                system = platform.system()
+                if system == "Darwin":  # macOS
+                    subprocess.run(["afplay", tmp_path], check=True)
+                elif system == "Linux":
+                    subprocess.run(["aplay", tmp_path], check=True)
+                elif system == "Windows":
+                    subprocess.run(["start", "", tmp_path], shell=True, check=True)
+                else:
+                    logger.warning(f"Audio playback not supported on {system}")
 
-        This is useful when running inside the FastAPI backend so we can ship
-        the audio to the front-end over WebSocket instead of playing it on the
-        server.
-        """
-        if not text:
-            return b""
+            except Exception as e:
+                logger.error(f"Failed to play audio: {e}")
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
-        url = f"{self.base_url}/v1/audio/speech"
-        payload = {
-            "input": text,
-            "model": self.model,
-            "voice": self.voice,
-            "speed": self.speed,
-            "response_format": "mp3",
-            "stream": False,
-        }
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload) as resp:
-                    if resp.status != 200:
-                        logger.error("Kokoro TTS synthesis error (%s)", resp.status)
-                        return b""
-                    data_json = await resp.json()
-                    audio_b64 = data_json.get("audio")
-                    if not audio_b64:
-                        logger.warning("No 'audio' key in Kokoro response")
-                        return b""
-                    return base64.b64decode(audio_b64)
-        except Exception as e:
-            logger.error("Error during TTS synthesis: %s", e)
-            return b""
+# Create a default TTS instance for easy importing
+tts = TTS()
 
-    async def synthesize_stream_from_text(self, text: str) -> AsyncGenerator[bytes, None]:
-        """
-        Synthesize text and yield audio chunks immediately.
-        Useful for converting regular text to streaming audio.
-        """
-        if not text:
-            return
-            
-        # Split text into chunks and synthesize each
-        chunks = self._split_into_speech_chunks(text)
-        for chunk in chunks:
-            if chunk.strip():
-                async for audio_bytes in self._synthesize_chunk(chunk):
-                    yield audio_bytes
 
-# --- Example Usage ---
 async def main():
-    """Example of how to use the TTS module."""
-    tts = TTS()
-    print("--- TTS Module Example ---")
-    text_to_speak = "Hello, this is a test of the refactored text-to-speech engine using Microsoft Edge."
-    print(f"Speaking: '{text_to_speak}'")
-    await tts.speak(text_to_speak)
-    print("--- TTS Example Complete ---")
+    """Test the TTS functionality."""
+    if not _GENAI_AVAILABLE:
+        print("Error: google-genai package not available")
+        return
+
+    try:
+        test_tts = TTS()
+        print("Testing Gemini Live API TTS...")
+        
+        test_text = "Hello! This is a test of Gemini's native audio generation."
+        print(f"Synthesizing: {test_text}")
+        
+        audio_data = await test_tts.synthesize(test_text)
+        
+        if audio_data:
+            print(f"✓ Successfully generated {len(audio_data)} bytes of audio")
+            print("Playing audio...")
+            await test_tts.speak(test_text)
+        else:
+            print("✗ No audio data generated")
+            
+    except Exception as e:
+        print(f"✗ TTS test failed: {e}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

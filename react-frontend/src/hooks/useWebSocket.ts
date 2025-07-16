@@ -24,7 +24,7 @@ interface UseWebSocketOptions {
 
 export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: boolean = false): UseWebSocketReturn => {
   const {
-    url = process.env.REACT_APP_WS_URL || 'ws://localhost:3000',
+    url = process.env.REACT_APP_WS_URL || 'ws://localhost:8000',
     reconnectInterval = 3000,
     maxReconnectAttempts = 5,
     onOpen,
@@ -44,9 +44,10 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isConnectingRef = useRef(false);
   const isConnectedRef = useRef(false);
+  const connectionHealthRef = useRef({ lastPong: 0, missedPongs: 0 });
   
   // Audio playback function
-  const playAudioResponse = useCallback((audioData: string) => {
+  const playAudioResponse = useCallback((audioData: string, mime: string) => {
     try {
       // Convert base64 audio to blob
       const audioBytes = atob(audioData);
@@ -55,7 +56,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
         audioArray[i] = audioBytes.charCodeAt(i);
       }
       
-      const audioBlob = new Blob([audioArray], { type: 'audio/wav' });
+      const audioBlob = new Blob([audioArray], { type: mime });
       const audioUrl = URL.createObjectURL(audioBlob);
       
       // Play the audio
@@ -126,7 +127,8 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           ? url.replace(/^http/, 'ws')
           : url;
 
-        const wsUrl = `${baseUrl}/ws/${encodeURIComponent(token)}`;
+        // Use 127.0.0.1 instead of localhost to avoid potential DNS issues
+        const wsUrl = `${baseUrl.replace('localhost', '127.0.0.1')}/ws/${encodeURIComponent(token)}`;
         console.log('🔗 Attempting WebSocket connection to:', wsUrl);
         console.log('🎫 Using token:', token.substring(0, 20) + '...');
         const newSocket = new WebSocket(wsUrl);
@@ -138,9 +140,30 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
         const startHeartbeat = () => {
           heartbeatId = setInterval(() => {
             if (newSocket.readyState === WebSocket.OPEN) {
-              newSocket.send(JSON.stringify({ type: 'heartbeat' }));
+              try {
+                // Check connection health before sending heartbeat
+                const now = Date.now();
+                if (connectionHealthRef.current.lastPong > 0 && 
+                    now - connectionHealthRef.current.lastPong > 60000) { // 1 minute without pong
+                  connectionHealthRef.current.missedPongs++;
+                  console.warn(`Missed pong #${connectionHealthRef.current.missedPongs}`);
+                  
+                  if (connectionHealthRef.current.missedPongs >= 3) {
+                    console.error('Connection appears dead, forcing reconnect');
+                    newSocket.close(1000, 'Connection health check failed');
+                    return;
+                  }
+                }
+                
+                newSocket.send(JSON.stringify({ type: 'heartbeat', timestamp: now }));
+              } catch (error) {
+                console.error('Failed to send heartbeat:', error);
+                stopHeartbeat();
+              }
+            } else {
+              stopHeartbeat();
             }
-          }, 15000); // 15-second heartbeat to keep connection alive
+          }, 30000); // 30-second heartbeat (less aggressive)
         };
 
         const stopHeartbeat = () => {
@@ -160,6 +183,9 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           setError(null);
           reconnectAttemptsRef.current = 0;
           
+          // Reset connection health tracking
+          connectionHealthRef.current = { lastPong: Date.now(), missedPongs: 0 };
+          
           // Make WebSocket globally available for AudioVisualizer with delay to ensure stability
           setTimeout(() => {
             (window as any).voiceAgentWebSocket = newSocket;
@@ -173,9 +199,17 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           try {
             const message: WebSocketMessage = JSON.parse(event.data);
             
+            // Handle heartbeat responses for connection health monitoring
+            if (message.type === 'heartbeat_ack') {
+              connectionHealthRef.current.lastPong = Date.now();
+              connectionHealthRef.current.missedPongs = 0;
+              return; // Don't process heartbeat acks further
+            }
+            
             // Handle audio response from server
-            if (message.type === 'audio_response' && message.data) {
-              playAudioResponse(message.data);
+            if ((message.type === 'audio_response' || message.type === 'audio_stream' || message.type === 'tts_audio') && message.data) {
+              const mime = message.mime || (message.type === 'audio_stream' || message.type === 'tts_audio' ? 'audio/mp3' : 'audio/wav');
+              playAudioResponse(message.data, mime);
             }
             
             setLastMessage(message);
@@ -190,7 +224,18 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           console.error('WebSocket error:', event);
           console.error('WebSocket readyState:', newSocket.readyState);
           console.error('WebSocket URL:', wsUrl);
-          setError(`WebSocket connection error: ${newSocket.readyState === WebSocket.CLOSED ? 'Connection rejected by server' : 'Network error'}`);
+          
+          // More specific error handling
+          let errorMessage = 'Network error';
+          if (newSocket.readyState === WebSocket.CLOSED) {
+            errorMessage = 'Connection rejected by server';
+          } else if (newSocket.readyState === WebSocket.CLOSING) {
+            errorMessage = 'Connection closing';
+          } else if (newSocket.readyState === WebSocket.CONNECTING) {
+            errorMessage = 'Connection timeout';
+          }
+          
+          setError(`WebSocket connection error: ${errorMessage}`);
           setConnectionStatus('error');
           onError?.(event);
         };
@@ -223,9 +268,12 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
             reconnectAttemptsRef.current += 1;
             console.log(`Attempting to reconnect (${reconnectAttemptsRef.current}/${maxReconnectAttempts})...`);
             
+            // More conservative backoff: 3s, 5s, 8s, 12s, 20s
+            const backoffDelay = Math.min(reconnectInterval + (reconnectAttemptsRef.current * 2000), 20000);
+            
             reconnectTimeoutRef.current = setTimeout(() => {
               connectWebSocket();
-            }, reconnectInterval * Math.pow(2, reconnectAttemptsRef.current - 1)); // Exponential backoff
+            }, backoffDelay);
           } else {
             setError('Max reconnection attempts reached');
             setConnectionStatus('error');

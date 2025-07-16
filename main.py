@@ -252,6 +252,20 @@ if __name__ == "__main__":
             print("Authentication is disabled because Supabase is not configured in your .env file.")
             print("Running in offline mode without user profiles or history.")
             print("Please configure SUPABASE_URL and SUPABASE_KEY in your .env file to enable full functionality.")
+
+            # --- Offline fallback --------------------------------------------------
+            async def _offline_run():
+                """Run the VoiceAgent in a local–only demo mode."""
+                # Force demo mode so AuthManager does not attempt any network calls
+                auth_manager_offline = AuthManager(demo_mode=True)
+                # Use a static user id to satisfy VoiceAgent constructor
+                offline_user_id = "offline_user"
+                agent = VoiceAgent(user_id=offline_user_id, auth_manager=auth_manager_offline)
+                setup_signal_handlers(agent)
+                await agent.run()
+
+            # Execute the offline agent loop
+            asyncio.run(_offline_run())
     except KeyboardInterrupt:
         logger.info("Application terminated by user")
     except Exception as e:

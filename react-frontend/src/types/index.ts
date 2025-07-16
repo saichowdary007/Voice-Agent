@@ -33,11 +33,16 @@ export interface ChatResponse {
 }
 
 export interface WebSocketMessage {
-  type: 'message' | 'audio' | 'status' | 'error' | 'audio_response' | 'vad_status' | 'text_response' | 'audio_processed' | 'listening_started' | 'listening_stopped' | 'heartbeat';
+  type: 'message' | 'audio' | 'status' | 'error' | 'audio_response' | 'audio_stream' | 'tts_audio' | 'vad_status' | 'text_response' | 'audio_processed' | 'listening_started' | 'listening_stopped' | 'heartbeat' | 'heartbeat_ack' | 'pong' | 'stt_result' | 'stt_partial' | 'audio_chunk' | 'ping';
   data?: any;
   text?: string;
   isActive?: boolean;
   timestamp?: string;
+  mime?: string;
+  transcript?: string;
+  is_final?: boolean;
+  sample_rate?: number;
+  monitor_id?: string;
 }
 
 export interface AuthContextType {
