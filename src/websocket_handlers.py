@@ -217,34 +217,10 @@ async def handle_audio_chunk(
         # Add audio chunk to buffer
         websocket._audio_buffer.extend(audio_bytes)
         
-        # Apply server-side noise gate as recommended
-        if len(audio_bytes) >= 640:  # Only process substantial chunks
-            # Calculate RMS and peak for noise gate
-            import numpy as np
-            audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            rms = np.sqrt(np.mean(audio_array ** 2))
-            peak = np.max(np.abs(audio_array))
-            
-            # Cheap noise gate - skip if too quiet
-            if rms < 0.01 and peak < 0.05:
-                logger.debug(f"Server noise gate: RMS={rms:.4f}, peak={peak:.4f} - skipping quiet chunk")
-                return
-        
         logger.debug(f"Audio chunk received: {len(audio_bytes)} bytes, buffer size: {len(websocket._audio_buffer)} bytes, is_final: {is_final}")
 
-        # Apply server-side audio preprocessing with dual-stage VAD
-        if len(audio_bytes) >= 640 and not is_final:  # Process chunks for VAD
-            try:
-                processed_audio, is_speech = await preprocess_audio_chunk(audio_bytes)
-                if not is_speech:
-                    # Server-side VAD rejected this chunk
-                    logger.debug("Server-side VAD: No speech detected, skipping chunk")
-                    return
-                # Replace original audio with processed version
-                audio_bytes = processed_audio
-            except Exception as e:
-                logger.warning(f"Audio preprocessing failed: {e}")
-                # Continue with original audio if preprocessing fails
+        # Simplified processing - remove complex preprocessing that causes issues
+        # Skip server-side preprocessing to avoid audio corruption
 
         latency_tracker = get_latency_tracker(websocket)
         
@@ -263,8 +239,8 @@ async def handle_audio_chunk(
             
             websocket._last_final_time = current_time
             
-            # Apply minimum speech buffer requirement (700ms at 16kHz = 11,200 samples = 22,400 bytes)
-            min_speech_bytes = 16000 * 0.7 * 2  # 0.7s * 16kHz * 2 bytes per sample
+            # Apply minimum speech buffer requirement (300ms at 16kHz = 4,800 samples = 9,600 bytes)
+            min_speech_bytes = 16000 * 0.3 * 2  # 0.3s * 16kHz * 2 bytes per sample
             if len(websocket._audio_buffer) < min_speech_bytes:
                 logger.debug(f"Audio buffer too short: {len(websocket._audio_buffer)} < {min_speech_bytes} bytes - waiting for more")
                 websocket._is_processing = False
@@ -380,10 +356,26 @@ async def handle_heartbeat(websocket: WebSocket, message: dict):
         )
 
 
+async def handle_connection_message(websocket: WebSocket, message: dict):
+    """Handles connection acknowledgment messages from the client."""
+    # This is just an acknowledgment, no response needed
+    logger.debug(f"Connection message received: {message}")
+    # Optionally send back a confirmation
+    await websocket.send_json(
+        {"type": "connection_ack", "message": "Connection acknowledged"}
+    )
+
+
 async def handle_unknown_message(websocket: WebSocket, message: dict):
     """Handles unknown message types."""
+    message_type = message.get('type', 'undefined')
+    # Don't send error for connection messages - they're expected
+    if message_type == 'connection':
+        await handle_connection_message(websocket, message)
+        return
+    
     await websocket.send_json(
-        {"type": "error", "message": f"Unknown message type: {message.get('type', 'undefined')}"}
+        {"type": "error", "message": f"Unknown message type: {message_type}"}
     )
 
 
@@ -415,12 +407,15 @@ async def stream_text_to_audio_pipeline(
         async for token in llm_stream:
             if token:
                 tokens.append(token)
+                logger.debug(f"LLM token received: '{token}'")
         
         full_response = ''.join(tokens).strip()
+        logger.info(f"LLM full response collected: '{full_response}' (length: {len(full_response)})")
         
         latency_tracker.mark("llm_complete")
         
         if not full_response.strip():
+            logger.warning("LLM response was empty, using fallback")
             full_response = "I'm not sure how to respond to that."
         
         latency_tracker.mark("tts_start")

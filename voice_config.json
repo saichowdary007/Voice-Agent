@@ -1,29 +1,29 @@
 {
   "voice_recognition": {
-    "description": "Voice recognition sensitivity settings - calibrated based on measured RMS values",
+    "description": "Voice recognition sensitivity settings - optimized for clean speech recognition",
     "vad_settings": {
-      "silence_threshold": 12,
-      "speech_threshold": 3,
-      "debounce_ms": 300,
-      "hangover_frames": 15,
-      "noise_floor": 50,
-      "voice_threshold": 150,
-      "strong_voice_threshold": 400,
-      "webrtc_vad_mode": 2
+      "silence_threshold": 8,
+      "speech_threshold": 2,
+      "debounce_ms": 200,
+      "hangover_frames": 10,
+      "noise_floor": 30,
+      "voice_threshold": 80,
+      "strong_voice_threshold": 200,
+      "webrtc_vad_mode": 1
     },
     "audio_processing": {
       "sample_rate": 16000,
-      "chunk_size_ms": 500,
-      "min_chunk_size_bytes": 640,
-      "min_speech_buffer_ms": 700,
-      "max_frame_bytes": 100000,
+      "chunk_size_ms": 300,
+      "min_chunk_size_bytes": 320,
+      "min_speech_buffer_ms": 500,
+      "max_frame_bytes": 50000,
       "voice_frequency_range": {
         "min_hz": 300,
         "max_hz": 3400
       },
-      "gain_boost": 2.0,
+      "gain_boost": 1.5,
       "echo_cancellation": true,
-      "noise_suppression": true,
+      "noise_suppression": false,
       "auto_gain_control": false
     },
     "websocket_settings": {

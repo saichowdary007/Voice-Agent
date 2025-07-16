@@ -329,7 +329,7 @@ class STT(DeepgramSTT):
         if is_final and audio_chunk and len(audio_chunk) > 320:
             logger.info(f"🎯 Processing final audio chunk: {len(audio_chunk)} bytes")
             
-            # Check if audio contains actual speech (basic volume check)
+            # Basic audio validation (very permissive)
             import numpy as np
             try:
                 # Convert bytes to numpy array for analysis
@@ -339,10 +339,9 @@ class STT(DeepgramSTT):
                 
                 logger.info(f"🔊 Audio analysis - RMS: {rms_level:.4f}, Max: {max_level:.4f}")
                 
-                # Skip transcription if audio is too quiet (likely silence)
-                # Very relaxed thresholds to allow quiet speech
-                if rms_level < 0.001 and max_level < 0.01:
-                    logger.warning("⚠️ Audio appears to be silence, skipping transcription")
+                # Only skip if audio is completely silent (very permissive threshold)
+                if rms_level < 0.0001 and max_level < 0.001:
+                    logger.warning("⚠️ Audio appears to be complete silence, skipping transcription")
                     return None
                     
             except Exception as analysis_e:
@@ -354,45 +353,8 @@ class STT(DeepgramSTT):
                     logger.info(f"✅ Deepgram transcript: '{transcript}'")
                     return transcript.strip()
                 else:
-                    logger.warning("⚠️ No transcript returned from Deepgram - trying fallback")
-                    
-                    # Fallback to local Whisper if available
-                    try:
-                        # Import the fallback Whisper STT class directly
-                        import speech_recognition as sr
-                        from faster_whisper import WhisperModel
-                        import numpy as np
-                        import asyncio
-                        
-                        logger.info("🔄 Trying Whisper fallback...")
-                        
-                        # Initialize Whisper model
-                        model = WhisperModel("tiny", device="cpu", compute_type="int8")
-                        
-                        # Convert bytes to numpy array (assumes 16-bit PCM)
-                        audio_np = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
-                        
-                        # Run transcription in thread
-                        def _transcribe():
-                            segments, _ = model.transcribe(
-                                audio_np,
-                                language=None,
-                                beam_size=1,
-                                vad_filter=False,  # Disable Whisper VAD - rely on WebRTC/RNNoise instead
-                                condition_on_previous_text=False
-                            )
-                            return " ".join(s.text for s in segments).strip()
-                        
-                        fallback_transcript = await asyncio.to_thread(_transcribe)
-                        
-                        if fallback_transcript and fallback_transcript.strip():
-                            logger.info(f"✅ Whisper fallback transcript: '{fallback_transcript}'")
-                            return fallback_transcript.strip()
-                        else:
-                            logger.warning("⚠️ Whisper fallback also returned empty transcript")
-                            
-                    except Exception as fallback_e:
-                        logger.warning(f"Whisper fallback failed: {fallback_e}")
+                    logger.warning("⚠️ No transcript returned from Deepgram")
+                    return None
                     
             except Exception as e:
                 logger.error(f"❌ Deepgram transcription failed: {e}")

@@ -69,8 +69,8 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
-            autoGainControl: false,  // Disable AGC as recommended
-            sampleRate: 16000,
+            autoGainControl: false,  // Disable AGC to prevent audio distortion
+            sampleRate: { ideal: 16000 },
             channelCount: 1
           } 
         });
@@ -106,7 +106,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         
         // 2. Gain boost (+6dB) to keep RMS in 0.05-0.2 range for Deepgram
         const gainNode = audioContext.createGain();
-        gainNode.gain.value = 2.0; // Start with 2.0x, tune 1.5-3.0 based on meter
+        gainNode.gain.value = 3.0; // Increased gain for better transcription
         
         // Connect the processing chain: source -> highpass -> gain -> analyser
         source.connect(highPassFilter);
@@ -117,6 +117,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         (window as any).audioGainNode = gainNode;
         
         console.log('Audio analysis setup complete');
+        console.log(`🎵 Audio context sample rate: ${audioContext.sampleRate}Hz`);
       } catch (error: any) {
         console.error('Failed to access microphone:', error);
         let errorMessage = 'Failed to access microphone';
@@ -278,114 +279,91 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
       const sound = new THREE.Audio(listener);
       soundRef.current = sound;
 
-      // Two-stage VAD with hang-over as recommended
-      let audioRecordingBuffer: Int16Array[] = [];
+      // Simplified VAD with cleaner logic
+      let audioRecordingBuffer: Float32Array[] = [];
       let isCurrentlyRecording = false;
-      let silenceCounter = 0;
-      let speechCounter = 0;
-      let hangOverCounter = 0; // Keep sending for 300ms after last voiced frame
-      let lastRecordingStateChange = 0;
+      let silenceFrames = 0;
+      let speechFrames = 0;
+      let lastRecordingTime = 0;
       
-      // Calibrated thresholds based on user measurements
-      const SILENCE_THRESHOLD = 12; // ~240ms of silence 
-      const SPEECH_THRESHOLD = 3; // ~60ms of speech before starting
-      const HANGOVER_FRAMES = 15; // 300ms hang-over to prevent consonant clipping
-      const DEBOUNCE_MS = 300; // Debounce for stability
+      // Simplified thresholds based on RMS energy
+      const SPEECH_START_FRAMES = 3;    // ~60ms of speech to start
+      const SILENCE_END_FRAMES = 15;    // ~300ms of silence to stop
+      const MIN_RECORDING_MS = 500;     // Minimum recording duration
+      const DEBOUNCE_MS = 300;          // Prevent rapid on/off
       
-      // Calibrated noise filtering based on measured RMS values and testing
-      // Background RMS: ~7, Quiet speech: ~35, Normal speech: ~106, Loud speech: ~283
-      const noiseFloor = 50;           // Above background noise
-      const voiceThreshold = 150;      // Above quiet speech
-      const strongVoiceThreshold = 400; // Above normal speech
-      
-      let noiseFloorHistory: number[] = [];
-      let adaptiveNoiseFloor = noiseFloor;
+      // Energy thresholds (RMS-based, more reliable than frequency analysis)
+      const NOISE_FLOOR = 0.005;        // Lower background noise level for better sensitivity
+      const SPEECH_THRESHOLD = 0.02;    // Lower minimum speech energy threshold
+      const STRONG_SPEECH_THRESHOLD = 0.06; // Lower clear speech energy threshold
       
       const getAverageFrequency = (): number => {
         if (!analyserRef.current || muted) return 0;
         
-        const bufferLength = analyserRef.current.frequencyBinCount;
-        const dataArray = new Uint8Array(bufferLength);
-        analyserRef.current.getByteFrequencyData(dataArray);
+        // Get time domain data for RMS calculation (more reliable than frequency analysis)
+        const bufferLength = analyserRef.current.fftSize;
+        const timeData = new Float32Array(bufferLength);
+        analyserRef.current.getFloatTimeDomainData(timeData);
         
-        // Focus on human voice frequencies (300Hz - 3400Hz range)
-        const voiceStartBin = Math.floor((300 / (audioContextRef.current!.sampleRate / 2)) * bufferLength);
-        const voiceEndBin = Math.floor((3400 / (audioContextRef.current!.sampleRate / 2)) * bufferLength);
-        const voiceData = dataArray.slice(voiceStartBin, voiceEndBin);
-        const voiceSum = voiceData.reduce((acc, value) => acc + value, 0);
-        const voiceAverage = voiceSum / voiceData.length;
-        
-        // Adaptive noise floor calculation
-        if (noiseFloorHistory.length >= 50) {
-          noiseFloorHistory.shift(); // Remove oldest sample
+        // Calculate RMS (Root Mean Square) energy
+        let rms = 0;
+        for (let i = 0; i < timeData.length; i++) {
+          rms += timeData[i] * timeData[i];
         }
-        noiseFloorHistory.push(voiceAverage);
+        rms = Math.sqrt(rms / timeData.length);
         
-        // Calculate adaptive noise floor (75th percentile of recent history)
-        const sortedHistory = [...noiseFloorHistory].sort((a, b) => a - b);
-        const percentile75Index = Math.floor(sortedHistory.length * 0.75);
-        adaptiveNoiseFloor = Math.max(sortedHistory[percentile75Index] || noiseFloor, noiseFloor);
-        
-        // Use calibrated thresholds instead of adaptive ones
-        const currentVoiceThreshold = voiceThreshold;
-        const currentStrongVoiceThreshold = strongVoiceThreshold;
-        
-        // Determine voice activity with improved logic and hang-over
+        // Determine voice activity based on RMS energy
         let isVoiceActive = false;
         
-        if (voiceAverage > currentStrongVoiceThreshold) {
-          // Strong voice detected
-          speechCounter = Math.min(speechCounter + 3, SPEECH_THRESHOLD * 2);
-          silenceCounter = 0;
-          hangOverCounter = HANGOVER_FRAMES; // Reset hang-over
+        if (rms > STRONG_SPEECH_THRESHOLD) {
+          // Strong speech detected
+          speechFrames = Math.min(speechFrames + 2, SPEECH_START_FRAMES * 2);
+          silenceFrames = 0;
           isVoiceActive = true;
-        } else if (voiceAverage > currentVoiceThreshold) {
-          // Moderate voice detected
-          speechCounter = Math.min(speechCounter + 1, SPEECH_THRESHOLD * 2);
-          silenceCounter = Math.max(silenceCounter - 1, 0);
-          hangOverCounter = HANGOVER_FRAMES; // Reset hang-over
-          isVoiceActive = speechCounter >= SPEECH_THRESHOLD;
-        } else {
-          // Silence or noise - but check hang-over
-          speechCounter = Math.max(speechCounter - 2, 0);
-          silenceCounter = Math.min(silenceCounter + 1, SILENCE_THRESHOLD);
-          
-          // Apply hang-over logic: keep sending for 300ms after last voiced frame
-          if (hangOverCounter > 0) {
-            hangOverCounter--;
-            isVoiceActive = true; // Keep active during hang-over
-          } else {
-            isVoiceActive = speechCounter >= SPEECH_THRESHOLD && silenceCounter < SILENCE_THRESHOLD;
+          console.log(`🔊 Strong speech: RMS=${rms.toFixed(3)}`);
+        } else if (rms > SPEECH_THRESHOLD) {
+          // Moderate speech detected
+          speechFrames = Math.min(speechFrames + 1, SPEECH_START_FRAMES * 2);
+          silenceFrames = Math.max(silenceFrames - 1, 0);
+          isVoiceActive = speechFrames >= SPEECH_START_FRAMES;
+          if (isVoiceActive) {
+            console.log(`🎤 Speech detected: RMS=${rms.toFixed(3)}`);
           }
+        } else {
+          // Silence or noise
+          speechFrames = Math.max(speechFrames - 1, 0);
+          silenceFrames = Math.min(silenceFrames + 1, SILENCE_END_FRAMES);
+          isVoiceActive = speechFrames >= SPEECH_START_FRAMES && silenceFrames < SILENCE_END_FRAMES;
         }
         
         // Handle audio recording and streaming (only if not muted)
         if (!muted) {
-          handleAudioRecording(isVoiceActive, voiceAverage);
+          handleAudioRecording(isVoiceActive, rms);
         }
         
         // Call voice activity callback (only report activity if not muted)
         stableVoiceActivity(!muted && isVoiceActive);
         
-        return voiceAverage;
+        // Return scaled value for visualization (convert RMS to 0-255 range)
+        return Math.min(rms * 2000, 255);
       };
       
       // Audio recording and streaming logic
-      const handleAudioRecording = (isVoiceActive: boolean, audioLevel: number) => {
+      const handleAudioRecording = (isVoiceActive: boolean, rmsLevel: number) => {
         if (!audioContextRef.current || !microphoneRef.current || muted) return;
         
         const now = Date.now();
         
         // Start recording when voice is detected (with debouncing)
-        if (isVoiceActive && !isCurrentlyRecording && (now - lastRecordingStateChange) > DEBOUNCE_MS) {
-          // Additional validation: ensure audio level is significantly above noise floor
-          if (audioLevel > adaptiveNoiseFloor + 20) {
-            console.log('🎙️ Starting voice recording...', { audioLevel, noiseFloor: adaptiveNoiseFloor });
+        if (isVoiceActive && !isCurrentlyRecording && (now - lastRecordingTime) > DEBOUNCE_MS) {
+          // Additional validation: ensure RMS level is significantly above noise floor
+          if (rmsLevel > NOISE_FLOOR * 2) {
+            console.log('🎙️ Starting voice recording...', { rmsLevel, noiseFloor: NOISE_FLOOR });
             isCurrentlyRecording = true;
             audioRecordingBuffer = [];
-            speechCounter = SPEECH_THRESHOLD; // Reset counters
-            silenceCounter = 0;
-            lastRecordingStateChange = now;
+            speechFrames = SPEECH_START_FRAMES; // Reset counters
+            silenceFrames = 0;
+            lastRecordingTime = now;
           }
         }
         
@@ -395,8 +373,8 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
           captureAudioFrame();
           
           // Stop recording after sufficient silence (with debouncing)
-          if (!isVoiceActive && silenceCounter >= SILENCE_THRESHOLD && (now - lastRecordingStateChange) > DEBOUNCE_MS) {
-            console.log('🎙️ Stopping voice recording...', { silenceCounter, audioLevel });
+          if (!isVoiceActive && silenceFrames >= SILENCE_END_FRAMES && (now - lastRecordingTime) > MIN_RECORDING_MS) {
+            console.log('🎙️ Stopping voice recording...', { silenceFrames, rmsLevel });
             isCurrentlyRecording = false;
             
             // Send final audio chunk to backend
@@ -406,9 +384,9 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
             
             // Reset state
             audioRecordingBuffer = [];
-            speechCounter = 0;
-            silenceCounter = 0;
-            lastRecordingStateChange = now;
+            speechFrames = 0;
+            silenceFrames = 0;
+            lastRecordingTime = now;
           }
         }
       };
@@ -422,17 +400,30 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         const dataArray = new Float32Array(bufferLength);
         analyserRef.current.getFloatTimeDomainData(dataArray);
         
-        // Convert to 16-bit PCM for backend processing
-        const pcmData = new Int16Array(dataArray.length);
-        for (let i = 0; i < dataArray.length; i++) {
-          // Convert from [-1, 1] to [-32768, 32767]
-          pcmData[i] = Math.max(-32768, Math.min(32767, dataArray[i] * 32768));
+        // Resample from browser sample rate to 16kHz if needed
+        const browserSampleRate = audioContextRef.current?.sampleRate || 44100;
+        const targetSampleRate = 16000;
+        
+        let resampledData: Float32Array;
+        if (browserSampleRate !== targetSampleRate) {
+          // Simple downsampling by taking every nth sample
+          const ratio = browserSampleRate / targetSampleRate;
+          const resampledLength = Math.floor(dataArray.length / ratio);
+          resampledData = new Float32Array(resampledLength);
+          
+          for (let i = 0; i < resampledLength; i++) {
+            const sourceIndex = Math.floor(i * ratio);
+            resampledData[i] = dataArray[sourceIndex];
+          }
+        } else {
+          resampledData = dataArray;
         }
         
-        audioRecordingBuffer.push(pcmData);
+        // Store the resampled float data directly (simpler and cleaner)
+        audioRecordingBuffer.push(resampledData);
         
-        // Send chunks every ~500ms (avoid overwhelming the backend)
-        if (audioRecordingBuffer.length >= 25) { // ~500ms worth of frames
+        // Send chunks every ~1000ms (more conservative to avoid overwhelming the backend)
+        if (audioRecordingBuffer.length >= 50) { // ~1000ms worth of frames
           sendAudioToBackend(false); // is_final = false
         }
       };
@@ -444,7 +435,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         try {
           // Concatenate all buffered audio frames
           const totalLength = audioRecordingBuffer.reduce((sum, arr) => sum + arr.length, 0);
-          const combinedAudio = new Int16Array(totalLength);
+          const combinedAudio = new Float32Array(totalLength);
           let offset = 0;
           
           for (const frame of audioRecordingBuffer) {
@@ -452,16 +443,24 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
             offset += frame.length;
           }
           
-                     // Convert to bytes for backend processing
-           const audioBytes = new Uint8Array(combinedAudio.buffer);
-           const base64Audio = btoa(String.fromCharCode.apply(null, Array.from(audioBytes)));
+          // Convert Float32 to Int16 PCM for backend processing
+          const pcmData = new Int16Array(combinedAudio.length);
+          for (let i = 0; i < combinedAudio.length; i++) {
+            // Convert from [-1, 1] to [-32768, 32767] with proper clamping
+            const sample = Math.max(-1, Math.min(1, combinedAudio[i]));
+            pcmData[i] = Math.round(sample * 32767);
+          }
+          
+          // Convert to bytes for backend processing
+          const audioBytes = new Uint8Array(pcmData.buffer);
+          const base64Audio = btoa(String.fromCharCode.apply(null, Array.from(audioBytes)));
            
            // Send via WebSocket (note: WebSocket logic will be implemented separately)
            const audioMessage = {
              type: "audio_chunk",
              data: base64Audio,
              is_final: isFinal,
-             sample_rate: 16000,
+             sample_rate: 16000, // Always 16kHz after resampling
              timestamp: Date.now()
            };
            
@@ -469,17 +468,22 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
            const ws = (window as any).voiceAgentWebSocket;
            if (ws && ws.readyState === WebSocket.OPEN) {
              try {
+               console.log(`🎵 Sending audio chunk: ${audioBytes.length} bytes, final: ${isFinal}`);
                ws.send(JSON.stringify(audioMessage));
              } catch (error) {
                console.error('❌ Failed to send audio message:', error);
              }
            } else {
-             console.warn('⚠️ WebSocket not connected, discarding audio chunk');
+             console.warn('⚠️ WebSocket not connected, discarding audio chunk', {
+               wsExists: !!ws,
+               readyState: ws?.readyState,
+               expectedState: WebSocket.OPEN
+             });
            }
           
-          // Clear the buffer for non-final chunks
+          // Clear the buffer for non-final chunks (keep minimal overlap)
           if (!isFinal) {
-            audioRecordingBuffer = audioRecordingBuffer.slice(-2); // Keep last 2 frames for overlap
+            audioRecordingBuffer = audioRecordingBuffer.slice(-1); // Keep only last frame for minimal overlap
           }
           
         } catch (error) {
@@ -499,7 +503,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         // Color changes based on voice activity
         const frequency = uniforms.u_frequency.value;
         
-        if (frequency > voiceThreshold) {
+        if (frequency > 60) { // Use a simple threshold for visualization
           // Active voice - colorful
           uniforms.u_red.value = 0.5 + Math.sin(clock.getElapsedTime() * 2) * 0.5;
           uniforms.u_green.value = 0.5 + Math.sin(clock.getElapsedTime() * 2 + Math.PI / 3) * 0.5;
