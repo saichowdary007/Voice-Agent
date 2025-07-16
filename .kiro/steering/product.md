@@ -7,7 +7,7 @@ Voice Agent is a real-time conversational AI system that enables natural voice i
 ## Core Features
 
 - **Real-time Voice Interaction**: WebSocket-based streaming audio processing with sub-3-second response times
-- **Multi-modal STT/TTS**: Supports multiple speech-to-text engines (Whisper, Deepgram) and text-to-speech services (Edge TTS, Deepgram TTS, Gemini TTS)
+- **Multi-modal STT/TTS**: Uses Deepgram for speech-to-text and supports multiple text-to-speech services (Deepgram TTS, Gemini TTS)
 - **User Authentication**: Supabase-powered user management with JWT tokens
 - **Conversation Memory**: Persistent conversation history and user profile learning
 - **3D Audio Visualization**: Interactive React frontend with real-time audio visualization

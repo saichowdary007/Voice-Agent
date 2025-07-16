@@ -1,69 +1,60 @@
 {
-  "voice_recognition": {
-    "description": "Voice recognition sensitivity settings - optimized for clean speech recognition",
-    "vad_settings": {
-      "silence_threshold": 8,
-      "speech_threshold": 2,
-      "debounce_ms": 200,
-      "hangover_frames": 10,
-      "noise_floor": 30,
-      "voice_threshold": 80,
-      "strong_voice_threshold": 200,
-      "webrtc_vad_mode": 1
-    },
-    "audio_processing": {
-      "sample_rate": 16000,
-      "chunk_size_ms": 300,
-      "min_chunk_size_bytes": 320,
-      "min_speech_buffer_ms": 500,
-      "max_frame_bytes": 50000,
-      "voice_frequency_range": {
-        "min_hz": 300,
-        "max_hz": 3400
-      },
-      "gain_boost": 1.5,
-      "echo_cancellation": true,
-      "noise_suppression": false,
-      "auto_gain_control": false
-    },
-    "websocket_settings": {
-      "heartbeat_interval_ms": 30000,
-      "reconnect_interval_ms": 3000,
-      "max_reconnect_attempts": 5,
-      "connection_timeout_ms": 10000,
-      "health_check_interval_ms": 60000,
-      "max_missed_pongs": 3
-    }
+  "audio": {
+    "sample_rate": 16000,
+    "channels": 1,
+    "chunk_size": 1024,
+    "format": "int16",
+    "gain": 2.0,
+    "noise_reduction": true
   },
-  "tuning_guide": {
-    "too_sensitive": {
-      "description": "If voice recognition is triggering too often (false positives)",
-      "adjustments": [
-        "Increase silence_threshold (25 -> 35)",
-        "Increase speech_threshold (5 -> 8)",
-        "Increase debounce_ms (500 -> 1000)",
-        "Increase voice_threshold_offset (15 -> 25)",
-        "Increase min_chunk_size_bytes (640 -> 1280)"
-      ]
-    },
-    "not_sensitive_enough": {
-      "description": "If voice recognition is missing speech",
-      "adjustments": [
-        "Decrease silence_threshold (25 -> 15)",
-        "Decrease speech_threshold (5 -> 3)",
-        "Decrease voice_threshold_offset (15 -> 10)",
-        "Increase gain_boost (2.5 -> 3.0)",
-        "Decrease min_chunk_size_bytes (640 -> 320)"
-      ]
-    },
-    "connection_issues": {
-      "description": "If WebSocket connections are unstable",
-      "adjustments": [
-        "Increase heartbeat_interval_ms (30000 -> 45000)",
-        "Increase reconnect_interval_ms (3000 -> 5000)",
-        "Increase connection_timeout_ms (10000 -> 15000)",
-        "Decrease chunk_size_ms (500 -> 300)"
-      ]
-    }
+  "stt": {
+    "model": "nova-3",
+    "language": "en-US",
+    "timeout_seconds": 12,
+    "min_audio_length_ms": 300,
+    "silence_timeout_ms": 1200,
+    "sensitivity": "medium",
+    "smart_format": true,
+    "punctuate": true,
+    "profanity_filter": false,
+    "redact": false,
+    "endpointing": 800,
+    "filler_words": true,
+    "numerals": true,
+    "interim_results": true,
+    "utterance_end_ms": 1200,
+    "vad_events": true
+  },
+  "llm": {
+    "max_tokens": 100,
+    "temperature": 0.8,
+    "timeout_seconds": 10,
+    "demo_mode_fallback": true,
+    "response_variety": true
+  },
+  "tts": {
+    "model": "aura-asteria-en",
+    "sample_rate": 24000,
+    "timeout_seconds": 8,
+    "speed": 1.1,
+    "encoding": "linear16"
+  },
+  "performance": {
+    "ultra_fast_mode": true,
+    "target_latency_ms": 2000,
+    "enable_caching": true,
+    "parallel_processing": true,
+    "aggressive_optimization": true
+  },
+  "vad": {
+    "aggressiveness": 1,
+    "frame_ms": 20,
+    "silence_timeout_ms": 1000,
+    "speech_threshold": 0.3,
+    "min_speech_frames": 3,
+    "min_silence_frames": 25,
+    "energy_threshold": 500,
+    "speech_padding_ms": 200,
+    "sensitivity": "medium"
   }
 }

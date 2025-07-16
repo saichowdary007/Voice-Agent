@@ -34,11 +34,11 @@ class LLM:
             print("⚠️ LLM running in DEMO mode - using simulated responses")
         else:
             self.api_url = (
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
                 f"?key={self.api_key}"
             )
             self.stream_api_url = (
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent"
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent"
                 f"?key={self.api_key}"
             )
         
@@ -119,7 +119,7 @@ class LLM:
                 cls._session = None
 
     def _get_demo_response(self, user_text: str, conversation_history: Optional[List[Dict]] = None, user_profile: Optional[List[Dict]] = None) -> str:
-        """Generate a demo response for testing purposes."""
+        """Generate a demo response for testing purposes with varied responses."""
         
         # Simulate personalization if user profile exists
         user_context = ""
@@ -128,44 +128,95 @@ class LLM:
             if facts:
                 user_context = f" (I remember you mentioned {', '.join(facts)})"
         
-        # Simple demo responses based on keywords
+        # Simple demo responses based on keywords with variety
         user_lower = user_text.lower()
         
-        if any(word in user_lower for word in ['hello', 'hi', 'hey']):
-            return f"Hey there!{user_context} Great to see you again. What's on your mind today?"
+        # Import random for varied responses
+        import random
+        
+        if any(word in user_lower for word in ['hello', 'hi', 'hey', 'oh']):
+            responses = [
+                f"Hey there!{user_context} How's your day going?",
+                f"Hi!{user_context} Good to hear from you again. What's up?",
+                f"Hello!{user_context} Ready to chat about whatever's on your mind.",
+                f"Hey!{user_context} What can I help you with today?"
+            ]
+            return random.choice(responses)
+        
+        elif any(word in user_lower for word in ['what', 'name', 'who are you', 'who']):
+            responses = [
+                f"I'm Tara, your AI assistant{user_context}! I'm here to help with questions and conversations.",
+                f"I'm Tara{user_context}! Think of me as your friendly AI companion. What would you like to know?",
+                f"Hey, I'm Tara{user_context}! I can help with all sorts of things. What interests you?",
+                f"I'm Tara, your voice assistant{user_context}! Ready to help however I can."
+            ]
+            return random.choice(responses)
         
         elif any(word in user_lower for word in ['joke', 'funny', 'laugh']):
-            return f"Sure thing!{user_context} Why don't scientists trust atoms? Because they make up everything! 😄 Want another one?"
+            jokes = [
+                f"Sure!{user_context} Why don't scientists trust atoms? Because they make up everything!",
+                f"Here's one{user_context}: Why did the scarecrow win an award? He was outstanding in his field!",
+                f"Okay{user_context}: What do you call a fake noodle? An impasta!",
+                f"How about this{user_context}: Why don't eggs tell jokes? They'd crack each other up!"
+            ]
+            return random.choice(jokes)
         
         elif any(word in user_lower for word in ['weather', 'temperature']):
-            return f"I'd love to help with weather info{user_context}, but I don't have access to current weather data in demo mode. Try asking me something else!"
-        
-        elif any(word in user_lower for word in ['name', 'who are you']):
-            return f"I'm Tara, your voice-first AI assistant{user_context}! I'm here to help with questions, have conversations, and maybe crack a joke or two. What would you like to chat about?"
+            return f"I'd love to help with weather info{user_context}, but I don't have access to current weather data. Try asking me something else!"
         
         elif any(word in user_lower for word in ['help', 'support']):
-            return f"Absolutely!{user_context} I can help with general questions, have conversations, tell jokes, or just chat. What specific thing can I assist you with?"
+            responses = [
+                f"Absolutely!{user_context} I can help with questions, conversations, or just chat. What do you need?",
+                f"Of course!{user_context} I'm here to help however I can. What's on your mind?",
+                f"Sure thing!{user_context} I can assist with all sorts of things. What would you like help with?",
+                f"Happy to help!{user_context} Just let me know what you're looking for."
+            ]
+            return random.choice(responses)
         
         elif any(word in user_lower for word in ['test', 'testing']):
-            return f"Great!{user_context} I'm working perfectly in demo mode. All systems are green and ready for conversation! What would you like to try out?"
+            return f"Great!{user_context} Everything's working perfectly. I'm ready for whatever you want to try!"
+        
+        elif any(word in user_lower for word in ['took', 'take']):
+            responses = [
+                f"I heard 'took' - could you tell me more about what you meant{user_context}?",
+                f"It sounds like you said something about taking something{user_context}. Can you elaborate?",
+                f"I caught that word{user_context}, but I'd love to hear the full thought. What were you saying?"
+            ]
+            return random.choice(responses)
         
         elif len(user_text.strip()) < 10:
-            return f"I hear you{user_context}! Could you tell me a bit more about what you're thinking? I'd love to help."
+            responses = [
+                f"I hear you{user_context}! Could you tell me a bit more?",
+                f"Got it{user_context}! What else is on your mind?",
+                f"I'm listening{user_context}! Feel free to share more.",
+                f"Interesting{user_context}! What would you like to talk about?"
+            ]
+            return random.choice(responses)
         
         else:
-            return f"That's interesting{user_context}! While I'm running in demo mode, I can still chat with you. Try asking me about jokes, introductions, or how I can help you today!"
+            responses = [
+                f"That's interesting{user_context}! Tell me more about what you're thinking.",
+                f"I see{user_context}! What else would you like to discuss?",
+                f"Fascinating{user_context}! I'd love to hear more about that.",
+                f"Good point{user_context}! What other thoughts do you have?",
+                f"I understand{user_context}! What else is on your mind today?"
+            ]
+            return random.choice(responses)
 
     async def _stream_demo_response(self, user_text: str, conversation_history: Optional[List[Dict]] = None, user_profile: Optional[List[Dict]] = None) -> AsyncGenerator[str, None]:
         """Stream demo response sentence by sentence for testing."""
         full_response = self._get_demo_response(user_text, conversation_history, user_profile)
         
-        # Split by sentences and yield with small delays
-        sentences = re.split(r'[.!?]+', full_response)
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if sentence:
-                yield sentence + ". "
-                await asyncio.sleep(0.1)  # Simulate streaming delay
+        # For ultra-fast mode, yield the entire response at once
+        yield full_response
+        
+        # Optional: Split by sentences for more realistic streaming (disabled for speed)
+        # sentences = re.split(r'[.!?]+', full_response)
+        # for sentence in sentences:
+        #     sentence = sentence.strip()
+        #     if sentence:
+        #         yield sentence + ". "
+        #         await asyncio.sleep(0.05)  # Reduced delay for faster response
 
     async def generate_stream(self, user_text: str, conversation_history: Optional[List[Dict]] = None, user_profile: Optional[List[Dict]] = None) -> AsyncGenerator[str, None]:
         """
@@ -185,7 +236,7 @@ class LLM:
 
         print(f"🤖 LLM generate_stream called with: '{user_text}', demo_mode: {self.demo_mode}")
 
-        # Use demo mode streaming if no valid API key
+        # Use demo mode streaming if no valid API key or quota exceeded
         if self.demo_mode:
             print("🎭 Using demo mode streaming")
             async for chunk in self._stream_demo_response(user_text, conversation_history, user_profile):
@@ -219,11 +270,20 @@ class LLM:
                 print(f"📡 Gemini streaming API response status: {resp.status}")
                 if resp.status == 200:
                     token_count = 0
-                    async for line in resp.content:
-                        line_text = line.decode('utf-8').strip()
-                        if line_text.startswith('data: '):
-                            try:
-                                json_data = json.loads(line_text[6:])
+                    buffer = ""
+                    
+                    # Collect the entire response first
+                    async for chunk in resp.content.iter_chunked(1024):
+                        buffer += chunk.decode('utf-8')
+                    
+                    print(f"🔍 Raw response buffer: {repr(buffer[:200])}...")
+                    
+                    try:
+                        # Parse as a complete JSON array
+                        json_array = json.loads(buffer)
+                        
+                        if isinstance(json_array, list):
+                            for json_data in json_array:
                                 if 'candidates' in json_data:
                                     for candidate in json_data['candidates']:
                                         if 'content' in candidate and 'parts' in candidate['content']:
@@ -232,9 +292,21 @@ class LLM:
                                                     token_count += 1
                                                     print(f"🎯 Token {token_count}: '{part['text']}'")
                                                     yield part['text']
-                            except json.JSONDecodeError as e:
-                                print(f"❌ JSON decode error: {e}")
-                                continue
+                        else:
+                            # Single object response
+                            if 'candidates' in json_array:
+                                for candidate in json_array['candidates']:
+                                    if 'content' in candidate and 'parts' in candidate['content']:
+                                        for part in candidate['content']['parts']:
+                                            if 'text' in part:
+                                                token_count += 1
+                                                print(f"🎯 Token {token_count}: '{part['text']}'")
+                                                yield part['text']
+                                                
+                    except json.JSONDecodeError as e:
+                        print(f"❌ JSON decode error: {e}")
+                        print(f"❌ Buffer content: {repr(buffer)}")
+                    
                     print(f"✅ Streaming complete, total tokens: {token_count}")
                     
                     # If no tokens received, fall back to demo mode

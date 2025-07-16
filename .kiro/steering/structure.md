@@ -30,7 +30,7 @@ src/
 ├── llm.py                        # Large Language Model interface
 ├── stt.py                        # Speech-to-Text engines
 ├── stt_deepgram.py              # Deepgram STT implementation
-├── stt_whisper.py               # Whisper STT implementation
+
 ├── tts.py                        # Text-to-Speech engines
 ├── tts_deepgram.py              # Deepgram TTS implementation
 ├── vad.py                        # Voice Activity Detection
@@ -80,7 +80,7 @@ react-frontend/
 - **`src/websocket_handlers.py`**: WebSocket message routing and processing
 - **`src/conversation.py`**: Persistent conversation history and user profile learning
 - **`src/llm.py`**: LLM interface with context management and fact extraction
-- **`src/stt.py`**: Multi-engine STT with Whisper/Deepgram support
+- **`src/stt.py`**: Deepgram STT integration for high-accuracy transcription
 - **`src/tts.py`**: Multi-engine TTS with Edge/Deepgram/Gemini support
 - **`src/vad.py`**: Voice Activity Detection for speech segmentation
 
@@ -143,7 +143,7 @@ react-frontend/
 ### Backend Imports
 ```python
 # Relative imports within src/
-from src.config import USE_SUPABASE, WHISPER_MODEL
+from src.config import USE_SUPABASE, DEEPGRAM_STT_MODEL
 from src.stt import STT
 from src.llm import LLM
 

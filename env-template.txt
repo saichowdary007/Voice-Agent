@@ -25,7 +25,9 @@ GEMINI_API_KEY=your_gemini_api_key_here
 
 # STT Configuration
 USE_REALTIME_STT=true
-WHISPER_MODEL=tiny
+DEEPGRAM_STT_MODEL=nova-3
+DEEPGRAM_STT_LANGUAGE=en-US
+DEEPGRAM_STT_ENDPOINTING=300
 
 # Frontend URLs (adjust ports if needed)
 REACT_APP_API_URL=http://localhost:8080

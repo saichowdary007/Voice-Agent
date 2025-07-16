@@ -187,7 +187,7 @@ async def handle_audio_chunk(
     tts_engine: TTS,
     vad_instance: VAD,
 ):
-    """Handles an audio chunk from the client."""
+    """Handles an audio chunk from the client with enhanced speech boundary detection."""
     if not stt_instance:
         await websocket.send_json(
             {"type": "error", "message": "STT service not available"}
@@ -203,11 +203,17 @@ async def handle_audio_chunk(
 
         audio_bytes = base64.b64decode(encoded_audio)
 
-        # Initialize audio buffer and processing state for this websocket if not exists
+        # Initialize enhanced audio processing state for this websocket
         if not hasattr(websocket, "_audio_buffer"):
             websocket._audio_buffer = bytearray()
             websocket._is_processing = False
             websocket._last_final_time = 0
+            websocket._speech_detected = False
+            websocket._silence_start_time = None
+            websocket._total_audio_duration = 0
+            # Configure VAD sensitivity from voice config
+            if vad_instance and hasattr(vad_instance, 'configure_sensitivity'):
+                vad_instance.configure_sensitivity("medium")
 
         # Prevent duplicate processing
         if is_final and websocket._is_processing:
@@ -217,54 +223,128 @@ async def handle_audio_chunk(
         # Add audio chunk to buffer
         websocket._audio_buffer.extend(audio_bytes)
         
-        logger.debug(f"Audio chunk received: {len(audio_bytes)} bytes, buffer size: {len(websocket._audio_buffer)} bytes, is_final: {is_final}")
-
-        # Simplified processing - remove complex preprocessing that causes issues
-        # Skip server-side preprocessing to avoid audio corruption
+        # Track total audio duration (assuming 16kHz, 16-bit mono)
+        chunk_duration_ms = (len(audio_bytes) / 2) / 16000 * 1000
+        websocket._total_audio_duration += chunk_duration_ms
+        
+        logger.debug(f"Audio chunk: {len(audio_bytes)} bytes, buffer: {len(websocket._audio_buffer)} bytes, "
+                    f"duration: {websocket._total_audio_duration:.1f}ms, is_final: {is_final}")
 
         latency_tracker = get_latency_tracker(websocket)
         
-        # Only process transcription when we have final audio or a substantial buffer
+        # Enhanced speech boundary detection using VAD
+        if len(websocket._audio_buffer) >= 640:  # Minimum for VAD analysis
+            try:
+                # Use enhanced VAD to analyze speech boundaries
+                has_speech, speech_ended, confidence = vad_instance.analyze_speech_boundaries(
+                    bytes(websocket._audio_buffer[-3200:])  # Analyze last 100ms for real-time detection
+                )
+                
+                if has_speech and not websocket._speech_detected:
+                    websocket._speech_detected = True
+                    websocket._silence_start_time = None
+                    logger.info(f"🎤 Speech detected (confidence: {confidence:.2f})")
+                    
+                    # Send speech detection feedback to client
+                    await websocket.send_json({
+                        "type": "speech_detected",
+                        "confidence": confidence,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                
+                elif not has_speech and websocket._speech_detected:
+                    if websocket._silence_start_time is None:
+                        websocket._silence_start_time = time.time()
+                    
+                    # Check if we should end speech based on silence duration
+                    silence_duration = time.time() - websocket._silence_start_time
+                    if speech_ended or silence_duration > 1.2:  # 1.2 second silence timeout
+                        logger.info(f"🔇 Speech ended after {silence_duration:.2f}s silence")
+                        is_final = True  # Force final processing
+                        
+            except Exception as vad_error:
+                logger.warning(f"VAD analysis failed: {vad_error}")
+                # Continue without VAD analysis
+        
+        # Process transcription with improved logic
         user_text = None
-        if is_final and len(websocket._audio_buffer) > 0:
+        should_process = False
+        
+        if is_final:
             # Set processing flag to prevent duplicates
             websocket._is_processing = True
             current_time = time.time()
             
-            # Prevent processing if we just processed recently (debounce)
-            if current_time - websocket._last_final_time < 2.0:  # 2 second debounce (more conservative)
+            # Reduced debounce time for better responsiveness
+            if current_time - websocket._last_final_time < 0.3:
                 logger.debug("Skipping duplicate final processing due to debounce")
                 websocket._is_processing = False
                 return
             
             websocket._last_final_time = current_time
             
-            # Apply minimum speech buffer requirement (300ms at 16kHz = 4,800 samples = 9,600 bytes)
-            min_speech_bytes = 16000 * 0.3 * 2  # 0.3s * 16kHz * 2 bytes per sample
+            # More intelligent minimum audio length based on speech detection
+            if websocket._speech_detected:
+                # If speech was detected, use shorter minimum (200ms)
+                min_speech_bytes = 16000 * 0.2 * 2  # 200ms
+            else:
+                # If no speech detected, require longer audio (500ms) to avoid false positives
+                min_speech_bytes = 16000 * 0.5 * 2  # 500ms
+            
             if len(websocket._audio_buffer) < min_speech_bytes:
-                logger.debug(f"Audio buffer too short: {len(websocket._audio_buffer)} < {min_speech_bytes} bytes - waiting for more")
+                logger.debug(f"Audio buffer too short: {len(websocket._audio_buffer)} < {min_speech_bytes} bytes")
                 websocket._is_processing = False
+                # Reset speech detection state
+                websocket._speech_detected = False
+                websocket._silence_start_time = None
                 return
             
-            logger.info(f"Processing final audio buffer: {len(websocket._audio_buffer)} bytes")
-            user_text = await handle_streaming_stt_chunk(
-                websocket=websocket,
-                audio_chunk=bytes(websocket._audio_buffer),
-                is_final=True,
-                stt_instance=stt_instance,
-                latency_tracker=latency_tracker,
-            )
-            # Clear buffer after final processing
+            # Additional validation using VAD
+            if vad_instance and hasattr(vad_instance, 'should_process_audio'):
+                should_process = vad_instance.should_process_audio(
+                    bytes(websocket._audio_buffer), 
+                    force_final=True
+                )
+            else:
+                should_process = True
+            
+            if should_process:
+                logger.info(f"Processing final audio: {len(websocket._audio_buffer)} bytes "
+                           f"({websocket._total_audio_duration:.1f}ms)")
+                
+                # Start latency tracking
+                latency_tracker.mark("audio_received")
+                
+                user_text = await handle_streaming_stt_chunk(
+                    websocket=websocket,
+                    audio_chunk=bytes(websocket._audio_buffer),
+                    is_final=True,
+                    stt_instance=stt_instance,
+                    latency_tracker=latency_tracker,
+                )
+            else:
+                logger.info("VAD determined audio should not be processed (likely silence)")
+            
+            # Reset state after processing
             websocket._audio_buffer = bytearray()
             websocket._is_processing = False
+            websocket._speech_detected = False
+            websocket._silence_start_time = None
+            websocket._total_audio_duration = 0
+            
+            # Reset VAD state for next speech segment
+            if vad_instance and hasattr(vad_instance, 'reset_state'):
+                vad_instance.reset_state()
             
             # Reset STT state to prevent "stuck in silence" issue
             if hasattr(stt_instance, '_reset_state'):
                 await stt_instance._reset_state()
 
+        # Handle final processing results
         if is_final and not websocket._is_processing:
             if user_text and user_text.strip():
                 language = message.get("language", "en")
+                logger.info(f"✅ Processing user speech: '{user_text}'")
                 await _process_and_respond(
                     websocket,
                     user_text,
@@ -274,32 +354,37 @@ async def handle_audio_chunk(
                     tts_engine,
                 )
             else:
-                # Send a response even when no transcript is detected (only once)
-                logger.info("No transcript detected, sending fallback response")
+                # Send helpful feedback when no speech is detected
+                logger.info("No transcript detected, providing user feedback")
                 await websocket.send_json({
                     "type": "stt_result",
                     "transcript": "",
                     "is_final": True,
-                    "message": "No speech detected - try speaking louder or closer to the microphone"
+                    "message": "No clear speech detected. Try speaking louder or closer to the microphone."
                 })
                 
-                # Also send a helpful AI response
+                # Send a helpful AI response
                 await websocket.send_json({
                     "type": "text_response",
-                    "text": "I didn't catch that. Could you please speak a bit louder or closer to your microphone?",
+                    "text": "I didn't catch that clearly. Could you please try speaking a bit louder or closer to your microphone?",
                     "language": "en",
                     "timestamp": datetime.utcnow().isoformat(),
                 })
         elif not is_final:
-            await websocket.send_json(
-                {
+            # Send periodic feedback for ongoing audio
+            if len(websocket._audio_buffer) % 8192 == 0:  # Every ~0.5 seconds
+                await websocket.send_json({
                     "type": "audio_processed",
                     "status": "receiving",
-                    "message": "Audio chunk received",
-                }
-            )
+                    "buffer_size": len(websocket._audio_buffer),
+                    "duration_ms": websocket._total_audio_duration,
+                    "speech_detected": websocket._speech_detected
+                })
+                
     except Exception as e:
         logger.error(f"Audio processing error: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         await websocket.send_json(
             {"type": "error", "message": f"Audio processing failed: {str(e)}"}
         )
