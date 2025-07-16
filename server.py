@@ -767,6 +767,7 @@ from src.websocket_handlers import (
     handle_start_listening,
     handle_stop_listening,
     handle_heartbeat,
+    handle_connection_message,
     handle_unknown_message,
 )
 
@@ -868,6 +869,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                 "start_listening": handle_start_listening,
                 "stop_listening": handle_stop_listening,
                 "heartbeat": handle_heartbeat,
+                "connection": handle_connection_message,
             }
             
             while True:

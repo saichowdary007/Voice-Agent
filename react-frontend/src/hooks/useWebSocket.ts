@@ -186,12 +186,28 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           // Reset connection health tracking
           connectionHealthRef.current = { lastPong: Date.now(), missedPongs: 0 };
           
-          // Make WebSocket globally available for AudioVisualizer with delay to ensure stability
-          setTimeout(() => {
-            (window as any).voiceAgentWebSocket = newSocket;
-          }, 100);
+          // Make WebSocket globally available for AudioVisualizer immediately
+          (window as any).voiceAgentWebSocket = newSocket;
+          console.log('🌐 WebSocket globally available for audio streaming');
           
-          startHeartbeat();
+          // Send initial connection message to establish the session
+          try {
+            newSocket.send(JSON.stringify({
+              type: 'connection',
+              message: 'Voice Agent client connected',
+              timestamp: Date.now()
+            }));
+          } catch (error) {
+            console.warn('Failed to send initial connection message:', error);
+          }
+          
+          // Add a small delay before starting heartbeat to ensure connection is stable
+          setTimeout(() => {
+            if (newSocket.readyState === WebSocket.OPEN) {
+              startHeartbeat();
+            }
+          }, 1000);
+          
           onOpen?.();
         };
 

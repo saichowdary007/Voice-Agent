@@ -183,8 +183,11 @@ class LLM:
             yield "I'm sorry, I didn't hear anything."
             return
 
+        print(f"🤖 LLM generate_stream called with: '{user_text}', demo_mode: {self.demo_mode}")
+
         # Use demo mode streaming if no valid API key
         if self.demo_mode:
+            print("🎭 Using demo mode streaming")
             async for chunk in self._stream_demo_response(user_text, conversation_history, user_profile):
                 yield chunk
             return
@@ -208,10 +211,14 @@ class LLM:
             "system_instruction": system_instruction
         }
 
+        print(f"🌐 Making streaming API call to Gemini with {len(contents)} messages")
+
         try:
             session = await self.get_session()
             async with session.post(self.stream_api_url, json=body) as resp:
+                print(f"📡 Gemini streaming API response status: {resp.status}")
                 if resp.status == 200:
+                    token_count = 0
                     async for line in resp.content:
                         line_text = line.decode('utf-8').strip()
                         if line_text.startswith('data: '):
@@ -222,15 +229,35 @@ class LLM:
                                         if 'content' in candidate and 'parts' in candidate['content']:
                                             for part in candidate['content']['parts']:
                                                 if 'text' in part:
+                                                    token_count += 1
+                                                    print(f"🎯 Token {token_count}: '{part['text']}'")
                                                     yield part['text']
-                            except json.JSONDecodeError:
+                            except json.JSONDecodeError as e:
+                                print(f"❌ JSON decode error: {e}")
                                 continue
+                    print(f"✅ Streaming complete, total tokens: {token_count}")
+                    
+                    # If no tokens received, fall back to demo mode
+                    if token_count == 0:
+                        print("⚠️ No tokens received from Gemini API, falling back to demo mode")
+                        async for chunk in self._stream_demo_response(user_text, conversation_history, user_profile):
+                            yield chunk
+                elif resp.status == 429:
+                    error_text = await resp.text()
+                    print(f"⚠️ Gemini API quota exceeded (429): {error_text}")
+                    print("🎭 Falling back to demo mode due to quota limits")
+                    async for chunk in self._stream_demo_response(user_text, conversation_history, user_profile):
+                        yield chunk
                 else:
-                    # Fallback to non-streaming
+                    error_text = await resp.text()
+                    print(f"❌ Gemini streaming API error {resp.status}: {error_text}")
+                    # Fallback to demo mode for any other errors
                     async for chunk in self._stream_demo_response(user_text, conversation_history, user_profile):
                         yield chunk
         except Exception as e:
-            print(f"Streaming generation error: {e}")
+            print(f"❌ Streaming generation error: {e}")
+            import traceback
+            print(f"❌ Traceback: {traceback.format_exc()}")
             # Fallback to demo streaming
             async for chunk in self._stream_demo_response(user_text, conversation_history, user_profile):
                 yield chunk
@@ -283,10 +310,15 @@ class LLM:
                     result = await resp.json()
                     # Safely access the response text
                     return result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "I'm not sure how to respond to that.")
+                elif resp.status == 429:
+                    error_text = await resp.text()
+                    print(f"⚠️ Gemini API quota exceeded (429): {error_text}")
+                    print("🎭 Falling back to demo mode due to quota limits")
+                    return self._get_demo_response(user_text, conversation_history, user_profile)
                 else:
                     error_text = await resp.text()
                     print(f"❌ Gemini API Error: {resp.status} - {error_text}")
-                    return "I'm having trouble connecting to my brain right now."
+                    return self._get_demo_response(user_text, conversation_history, user_profile)
         except aiohttp.ClientConnectorError as e:
             print(f"❌ Network Error: Could not connect to Gemini API. {e}")
             return "It seems I can't connect to the internet. Please check your connection."
