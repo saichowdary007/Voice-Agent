@@ -43,12 +43,12 @@ logger = logging.getLogger(__name__)
 try:
     from src.config import USE_REALTIME_STT, WHISPER_MODEL
     if USE_REALTIME_STT:
-        logger.info(f"🚀 Server-side STT enabled (faster-whisper, model='{WHISPER_MODEL}')")
+        logger.info(f"🚀 Server-side STT enabled")
         try:
             from src.stt import STT
-            # Use the same Whisper model name from config (default: 'tiny')
+            # Initialize STT (will use Deepgram if available, otherwise Whisper)
             stt_instance = STT(model_size=WHISPER_MODEL, device="auto")
-            logger.info(f"✅ Faster-whisper STT initialized with model '{WHISPER_MODEL}'")
+            logger.info(f"✅ STT initialized successfully")
         except Exception as e:
             logger.error(f"❌ Failed to load faster-whisper STT: {e}")
             USE_REALTIME_STT = False
@@ -131,8 +131,8 @@ async def lifespan(app: FastAPI):
 
     # Initialize VAD
     global vad_instance
-    vad_instance = VAD(sample_rate=16000, mode=2)
-    logger.info("✅ VAD initialized (WebRTC mode 2)")
+    vad_instance = VAD(sample_rate=16000, mode=1)  # Browser-side uses mode 1, server uses mode 2 via preprocessor
+    logger.info("✅ VAD initialized (WebRTC mode 1 for browser compatibility)")
     
     yield
     
@@ -329,6 +329,30 @@ class ConnectionManager:
             return False
         except Exception as e:
             logger.error(f"Failed to send message to websocket: {e}")
+            self.disconnect(websocket)
+            return False
+
+    async def send_to_websocket(self, websocket: WebSocket, message: dict):
+        """Send a JSON message to a specific websocket."""
+        try:
+            # Check if websocket is still connected before sending
+            if websocket.client_state != WebSocketState.CONNECTED:
+                logger.warning("Attempted to send message to disconnected websocket")
+                return False
+                
+            await websocket.send_json(message)
+            logger.debug(f"Successfully sent JSON message to websocket")
+            return True
+        except ConnectionClosedError:
+            logger.warning("WebSocket connection closed while sending message")
+            self.disconnect(websocket)
+            return False
+        except WebSocketDisconnect:
+            logger.warning("WebSocket disconnected while sending message")
+            self.disconnect(websocket)
+            return False
+        except Exception as e:
+            logger.error(f"Failed to send JSON message to websocket: {e}")
             self.disconnect(websocket)
             return False
 
@@ -797,7 +821,15 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                     return
 
         # -----------------------------------
-        # Send a lightweight welcome message **before** heavy initialization
+        # Register the connection first
+        # -----------------------------------
+        await connection_manager.connect(websocket, user_id)
+        
+        # Small delay to ensure connection is fully established
+        await asyncio.sleep(0.1)
+        
+        # -----------------------------------
+        # Send welcome message using connection manager for better reliability
         # -----------------------------------
         welcome_message = {
             "type": "connection",
@@ -810,19 +842,13 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
             },
         }
 
-        try:
-            await websocket.send_json(welcome_message)
+        welcome_sent = await connection_manager.send_to_websocket(websocket, welcome_message)
+        if welcome_sent:
             logger.info(f"📨 Welcome message sent to user_id: {user_id}")
-        except ConnectionClosedError:
-            logger.warning(
-                f"Failed to send welcome message to user_id: {user_id} (connection closed)"
-            )
+        else:
+            logger.warning(f"Failed to send welcome message to user_id: {user_id} (connection closed)")
             return
 
-        # -----------------------------------
-        # Register the connection (may trigger heavier operations like model load)
-        # -----------------------------------
-        await connection_manager.connect(websocket, user_id)
         logger.info(f"✅ WebSocket connected successfully for user_id: {user_id}")
         
         try:

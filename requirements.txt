@@ -3,9 +3,9 @@ aiohttp>=3.9.0,<4.0.0
 python-dotenv>=1.0.0
 SpeechRecognition>=3.10.0
 PyAudio>=0.2.11
-edge-tts>=6.1.0
 pydub>=0.25.1
 simpleaudio>=1.0.4
+soundfile>=0.12.1
 
 # Faster multilingual STT
 faster-whisper==1.1.1
@@ -29,6 +29,8 @@ requests>=2.31.0
 email-validator>=2.1.0
 python-jose[cryptography]>=3.3.0
 pydantic>=2.4.0
+cryptography>=41.0.0
+pyjwt==2.8.0
 
 # Development Tools (only in development)
 watchdog>=3.0.0
@@ -40,10 +42,16 @@ RealtimeSTT>=0.3.104
 torch>=2.0.0,<3.0.0
 transformers>=4.35.0
 
-# Additional Security Dependencies
-cryptography>=41.0.0
-pyjwt==2.8.0
-
-# Voice Activity Detection
+# Voice Activity Detection & Audio Processing
 webrtcvad>=2.0.10
-python-dotenv
+scipy>=1.10.0
+matplotlib>=3.5.0
+
+# Google Gemini SDK for native TTS support
+google-genai>=0.3.0
+
+# OpenAI dependencies
+openai>=1.0.0
+
+# Deepgram SDK for STT and TTS
+deepgram-sdk>=3.0.0

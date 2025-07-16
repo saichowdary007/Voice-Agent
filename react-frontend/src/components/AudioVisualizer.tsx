@@ -51,6 +51,10 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
   useEffect(() => {
     // Prevent multiple initializations
     if (!containerRef.current || initializedRef.current) return;
+    
+    // Additional check to prevent React strict mode double initialization
+    if (containerRef.current.children.length > 0) return;
+    
     initializedRef.current = true;
 
     console.log('🎤 Initializing AudioVisualizer...');
@@ -60,13 +64,14 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
       try {
         console.log('Requesting microphone access...');
         
-        // Request microphone permission
+        // Request microphone permission with optimized settings for voice
         const stream = await navigator.mediaDevices.getUserMedia({ 
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
-            autoGainControl: true,
-            sampleRate: 16000
+            autoGainControl: false,  // Disable AGC as recommended
+            sampleRate: 16000,
+            channelCount: 1
           } 
         });
         
@@ -91,9 +96,25 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         analyser.maxDecibels = -10;
         analyserRef.current = analyser;
 
-        // Connect microphone to analyser
+        // Create audio processing chain as recommended
         const source = audioContext.createMediaStreamSource(stream);
-        source.connect(analyser);
+        
+        // 1. High-pass filter to kill HVAC rumble (120Hz cutoff)
+        const highPassFilter = audioContext.createBiquadFilter();
+        highPassFilter.type = 'highpass';
+        highPassFilter.frequency.value = 120; // Hz
+        
+        // 2. Gain boost (+6dB) to keep RMS in 0.05-0.2 range for Deepgram
+        const gainNode = audioContext.createGain();
+        gainNode.gain.value = 2.0; // Start with 2.0x, tune 1.5-3.0 based on meter
+        
+        // Connect the processing chain: source -> highpass -> gain -> analyser
+        source.connect(highPassFilter);
+        highPassFilter.connect(gainNode);
+        gainNode.connect(analyser);
+        
+        // Store gain node reference for potential adjustment
+        (window as any).audioGainNode = gainNode;
         
         console.log('Audio analysis setup complete');
       } catch (error: any) {
@@ -257,14 +278,28 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
       const sound = new THREE.Audio(listener);
       soundRef.current = sound;
 
-      // Advanced VAD with proper audio processing
+      // Two-stage VAD with hang-over as recommended
       let audioRecordingBuffer: Int16Array[] = [];
       let isCurrentlyRecording = false;
       let silenceCounter = 0;
       let speechCounter = 0;
-      const SILENCE_THRESHOLD = 15; // ~300ms of silence before stopping (doubled for stability)
-      const SPEECH_THRESHOLD = 6; // ~120ms of speech before starting (doubled to reduce false positives)
-      const VAD_FRAME_SIZE = 320; // 20ms at 16kHz
+      let hangOverCounter = 0; // Keep sending for 300ms after last voiced frame
+      let lastRecordingStateChange = 0;
+      
+      // Calibrated thresholds based on user measurements
+      const SILENCE_THRESHOLD = 12; // ~240ms of silence 
+      const SPEECH_THRESHOLD = 3; // ~60ms of speech before starting
+      const HANGOVER_FRAMES = 15; // 300ms hang-over to prevent consonant clipping
+      const DEBOUNCE_MS = 300; // Debounce for stability
+      
+      // Calibrated noise filtering based on measured RMS values and testing
+      // Background RMS: ~7, Quiet speech: ~35, Normal speech: ~106, Loud speech: ~283
+      const noiseFloor = 50;           // Above background noise
+      const voiceThreshold = 150;      // Above quiet speech
+      const strongVoiceThreshold = 400; // Above normal speech
+      
+      let noiseFloorHistory: number[] = [];
+      let adaptiveNoiseFloor = noiseFloor;
       
       const getAverageFrequency = (): number => {
         if (!analyserRef.current || muted) return 0;
@@ -273,58 +308,85 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         const dataArray = new Uint8Array(bufferLength);
         analyserRef.current.getByteFrequencyData(dataArray);
         
-        // More sophisticated voice activity detection
-        const voiceRange = Math.floor(bufferLength * 0.4); // Focus on human voice frequencies
-        const sum = dataArray.slice(0, voiceRange).reduce((acc, value) => acc + value, 0);
-        const average = sum / voiceRange;
+        // Focus on human voice frequencies (300Hz - 3400Hz range)
+        const voiceStartBin = Math.floor((300 / (audioContextRef.current!.sampleRate / 2)) * bufferLength);
+        const voiceEndBin = Math.floor((3400 / (audioContextRef.current!.sampleRate / 2)) * bufferLength);
+        const voiceData = dataArray.slice(voiceStartBin, voiceEndBin);
+        const voiceSum = voiceData.reduce((acc, value) => acc + value, 0);
+        const voiceAverage = voiceSum / voiceData.length;
         
-        // Enhanced VAD logic with higher thresholds to reduce sensitivity
-        const noiseFloor = 15; // Increased minimum background noise level
-        const voiceThreshold = 45; // Significantly higher threshold to avoid false positives
-        const strongVoiceThreshold = 65; // Much higher threshold for strong voice activity
+        // Adaptive noise floor calculation
+        if (noiseFloorHistory.length >= 50) {
+          noiseFloorHistory.shift(); // Remove oldest sample
+        }
+        noiseFloorHistory.push(voiceAverage);
         
-        // Determine voice activity with better logic
+        // Calculate adaptive noise floor (75th percentile of recent history)
+        const sortedHistory = [...noiseFloorHistory].sort((a, b) => a - b);
+        const percentile75Index = Math.floor(sortedHistory.length * 0.75);
+        adaptiveNoiseFloor = Math.max(sortedHistory[percentile75Index] || noiseFloor, noiseFloor);
+        
+        // Use calibrated thresholds instead of adaptive ones
+        const currentVoiceThreshold = voiceThreshold;
+        const currentStrongVoiceThreshold = strongVoiceThreshold;
+        
+        // Determine voice activity with improved logic and hang-over
         let isVoiceActive = false;
         
-        if (average > strongVoiceThreshold) {
+        if (voiceAverage > currentStrongVoiceThreshold) {
           // Strong voice detected
-          speechCounter = Math.min(speechCounter + 2, SPEECH_THRESHOLD);
+          speechCounter = Math.min(speechCounter + 3, SPEECH_THRESHOLD * 2);
           silenceCounter = 0;
+          hangOverCounter = HANGOVER_FRAMES; // Reset hang-over
           isVoiceActive = true;
-        } else if (average > voiceThreshold && average > noiseFloor * 3) {
-          // Moderate voice detected (increased noise floor multiplier)
-          speechCounter = Math.min(speechCounter + 1, SPEECH_THRESHOLD);
+        } else if (voiceAverage > currentVoiceThreshold) {
+          // Moderate voice detected
+          speechCounter = Math.min(speechCounter + 1, SPEECH_THRESHOLD * 2);
           silenceCounter = Math.max(silenceCounter - 1, 0);
+          hangOverCounter = HANGOVER_FRAMES; // Reset hang-over
           isVoiceActive = speechCounter >= SPEECH_THRESHOLD;
         } else {
-          // Silence or noise
-          speechCounter = Math.max(speechCounter - 1, 0);
+          // Silence or noise - but check hang-over
+          speechCounter = Math.max(speechCounter - 2, 0);
           silenceCounter = Math.min(silenceCounter + 1, SILENCE_THRESHOLD);
-          isVoiceActive = speechCounter >= SPEECH_THRESHOLD && silenceCounter < SILENCE_THRESHOLD;
+          
+          // Apply hang-over logic: keep sending for 300ms after last voiced frame
+          if (hangOverCounter > 0) {
+            hangOverCounter--;
+            isVoiceActive = true; // Keep active during hang-over
+          } else {
+            isVoiceActive = speechCounter >= SPEECH_THRESHOLD && silenceCounter < SILENCE_THRESHOLD;
+          }
         }
         
         // Handle audio recording and streaming (only if not muted)
         if (!muted) {
-          handleAudioRecording(isVoiceActive, average);
+          handleAudioRecording(isVoiceActive, voiceAverage);
         }
         
         // Call voice activity callback (only report activity if not muted)
         stableVoiceActivity(!muted && isVoiceActive);
         
-        return average;
+        return voiceAverage;
       };
       
       // Audio recording and streaming logic
       const handleAudioRecording = (isVoiceActive: boolean, audioLevel: number) => {
         if (!audioContextRef.current || !microphoneRef.current || muted) return;
         
-        // Start recording when voice is detected
-        if (isVoiceActive && !isCurrentlyRecording) {
-          console.log('🎙️ Starting voice recording...');
-          isCurrentlyRecording = true;
-          audioRecordingBuffer = [];
-          speechCounter = SPEECH_THRESHOLD; // Reset counters
-          silenceCounter = 0;
+        const now = Date.now();
+        
+        // Start recording when voice is detected (with debouncing)
+        if (isVoiceActive && !isCurrentlyRecording && (now - lastRecordingStateChange) > DEBOUNCE_MS) {
+          // Additional validation: ensure audio level is significantly above noise floor
+          if (audioLevel > adaptiveNoiseFloor + 20) {
+            console.log('🎙️ Starting voice recording...', { audioLevel, noiseFloor: adaptiveNoiseFloor });
+            isCurrentlyRecording = true;
+            audioRecordingBuffer = [];
+            speechCounter = SPEECH_THRESHOLD; // Reset counters
+            silenceCounter = 0;
+            lastRecordingStateChange = now;
+          }
         }
         
         // Continue recording while voice is active or during short silence
@@ -332,9 +394,9 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
           // Capture current audio frame
           captureAudioFrame();
           
-          // Stop recording after sufficient silence
-          if (!isVoiceActive && silenceCounter >= SILENCE_THRESHOLD) {
-            console.log('🎙️ Stopping voice recording...');
+          // Stop recording after sufficient silence (with debouncing)
+          if (!isVoiceActive && silenceCounter >= SILENCE_THRESHOLD && (now - lastRecordingStateChange) > DEBOUNCE_MS) {
+            console.log('🎙️ Stopping voice recording...', { silenceCounter, audioLevel });
             isCurrentlyRecording = false;
             
             // Send final audio chunk to backend
@@ -346,6 +408,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
             audioRecordingBuffer = [];
             speechCounter = 0;
             silenceCounter = 0;
+            lastRecordingStateChange = now;
           }
         }
       };
@@ -368,8 +431,8 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         
         audioRecordingBuffer.push(pcmData);
         
-        // Send chunks every ~200ms (avoid overwhelming the backend)
-        if (audioRecordingBuffer.length >= 10) { // ~200ms worth of frames
+        // Send chunks every ~500ms (avoid overwhelming the backend)
+        if (audioRecordingBuffer.length >= 25) { // ~500ms worth of frames
           sendAudioToBackend(false); // is_final = false
         }
       };
@@ -435,7 +498,8 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
 
         // Color changes based on voice activity
         const frequency = uniforms.u_frequency.value;
-        if (frequency > 45) { // Match the updated voice threshold
+        
+        if (frequency > voiceThreshold) {
           // Active voice - colorful
           uniforms.u_red.value = 0.5 + Math.sin(clock.getElapsedTime() * 2) * 0.5;
           uniforms.u_green.value = 0.5 + Math.sin(clock.getElapsedTime() * 2 + Math.PI / 3) * 0.5;

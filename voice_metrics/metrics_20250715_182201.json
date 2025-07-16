@@ -1,0 +1,743 @@
+{
+  "timestamp": "2025-07-15T18:22:01.933296",
+  "stats": {
+    "runtime_seconds": 0.002664804458618164,
+    "total_chunks": 100,
+    "speech_rate": 0.61,
+    "vad_accuracy": 0.94,
+    "transcription_success_rate": 0.9016393442622951,
+    "connection_drops": 1,
+    "rms_statistics": {
+      "mean": 0.08700945982615861,
+      "std": 0.0635123622823815,
+      "min": 0.001,
+      "max": 0.32055059622269666,
+      "percentile_25": 0.038926035235202175,
+      "percentile_75": 0.12859957587036125
+    },
+    "raw_stats": {
+      "total_audio_chunks": 100,
+      "speech_chunks": 61,
+      "silence_chunks": 39,
+      "successful_transcriptions": 55,
+      "failed_transcriptions": 0,
+      "connection_drops": 1,
+      "false_positives": 6,
+      "missed_speech": 0
+    }
+  },
+  "rms_history": [
+    {
+      "timestamp": 1752621721.931242,
+      "rms": 0.0014810909697649756,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931246,
+      "rms": 0.01261645234825878,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.9312482,
+      "rms": 0.0019267092632048277,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.9312499,
+      "rms": 0.004592100872615348,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931251,
+      "rms": 0.009373451432307738,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931252,
+      "rms": 0.002191574881564785,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931252,
+      "rms": 0.0125762038028831,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931253,
+      "rms": 0.005447490934732035,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931254,
+      "rms": 0.01280003752300128,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931255,
+      "rms": 0.002108725515588095,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931256,
+      "rms": 0.019913549282474772,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931257,
+      "rms": 0.009518670561626393,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931257,
+      "rms": 0.013051893575902253,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.9312582,
+      "rms": 0.007448575996865713,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931259,
+      "rms": 0.018468897946151086,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.9312599,
+      "rms": 0.005325075871917979,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.9312608,
+      "rms": 0.009733711484604633,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.9312608,
+      "rms": 0.0062972903152993046,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931262,
+      "rms": 0.0014114222060441818,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931263,
+      "rms": 0.01195151500448237,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931294,
+      "rms": 0.13528703358624536,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 20"
+    },
+    {
+      "timestamp": 1752621721.931296,
+      "rms": 0.11992893721535812,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 21"
+    },
+    {
+      "timestamp": 1752621721.931297,
+      "rms": 0.32055059622269666,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 22"
+    },
+    {
+      "timestamp": 1752621721.931299,
+      "rms": 0.130800588871407,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 23"
+    },
+    {
+      "timestamp": 1752621721.9313002,
+      "rms": 0.11317379894957261,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 24"
+    },
+    {
+      "timestamp": 1752621721.931301,
+      "rms": 0.11839643112792271,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 25"
+    },
+    {
+      "timestamp": 1752621721.9313018,
+      "rms": 0.05586481301696502,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 26"
+    },
+    {
+      "timestamp": 1752621721.931303,
+      "rms": 0.0929047608389327,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 27"
+    },
+    {
+      "timestamp": 1752621721.931305,
+      "rms": 0.03562326421470395,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 28"
+    },
+    {
+      "timestamp": 1752621721.931306,
+      "rms": 0.17639672660461794,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 29"
+    },
+    {
+      "timestamp": 1752621721.931307,
+      "rms": 0.12840545335834777,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 30"
+    },
+    {
+      "timestamp": 1752621721.931309,
+      "rms": 0.17534475763176144,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 31"
+    },
+    {
+      "timestamp": 1752621721.9313111,
+      "rms": 0.17738533819477853,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 32"
+    },
+    {
+      "timestamp": 1752621721.9313128,
+      "rms": 0.08186275871685374,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 33"
+    },
+    {
+      "timestamp": 1752621721.931314,
+      "rms": 0.10353321588366296,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 34"
+    },
+    {
+      "timestamp": 1752621721.931315,
+      "rms": 0.060937142255818824,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 35"
+    },
+    {
+      "timestamp": 1752621721.931316,
+      "rms": 0.10762658508662704,
+      "is_speech": true,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931317,
+      "rms": 0.16773945582308966,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 37"
+    },
+    {
+      "timestamp": 1752621721.931319,
+      "rms": 0.15061447941944894,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 38"
+    },
+    {
+      "timestamp": 1752621721.93132,
+      "rms": 0.17827369938711052,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 39"
+    },
+    {
+      "timestamp": 1752621721.9313211,
+      "rms": 0.11791520469091865,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 40"
+    },
+    {
+      "timestamp": 1752621721.931322,
+      "rms": 0.1876695563396614,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 41"
+    },
+    {
+      "timestamp": 1752621721.9313228,
+      "rms": 0.27572411681385284,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 42"
+    },
+    {
+      "timestamp": 1752621721.931324,
+      "rms": 0.18106814171981836,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 43"
+    },
+    {
+      "timestamp": 1752621721.931325,
+      "rms": 0.08802558977558092,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 44"
+    },
+    {
+      "timestamp": 1752621721.9313269,
+      "rms": 0.14925038611531308,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 45"
+    },
+    {
+      "timestamp": 1752621721.931328,
+      "rms": 0.14523886447824164,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 46"
+    },
+    {
+      "timestamp": 1752621721.931329,
+      "rms": 0.10197723037974671,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 47"
+    },
+    {
+      "timestamp": 1752621721.93133,
+      "rms": 0.08360708829457392,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 48"
+    },
+    {
+      "timestamp": 1752621721.9313312,
+      "rms": 0.17131758797954078,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 49"
+    },
+    {
+      "timestamp": 1752621721.931332,
+      "rms": 0.14163894037839614,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 50"
+    },
+    {
+      "timestamp": 1752621721.931333,
+      "rms": 0.1464100282775783,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 51"
+    },
+    {
+      "timestamp": 1752621721.9313338,
+      "rms": 0.15626802279516036,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 52"
+    },
+    {
+      "timestamp": 1752621721.931336,
+      "rms": 0.15445917249133057,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 53"
+    },
+    {
+      "timestamp": 1752621721.9313369,
+      "rms": 0.07096274141484818,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 54"
+    },
+    {
+      "timestamp": 1752621721.931338,
+      "rms": 0.16035468523875912,
+      "is_speech": true,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931339,
+      "rms": 0.1495713811453243,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 56"
+    },
+    {
+      "timestamp": 1752621721.93134,
+      "rms": 0.1956434312766171,
+      "is_speech": true,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931343,
+      "rms": 0.21516096895978473,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 58"
+    },
+    {
+      "timestamp": 1752621721.931345,
+      "rms": 0.001,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 59"
+    },
+    {
+      "timestamp": 1752621721.931346,
+      "rms": 0.09096987578438875,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931348,
+      "rms": 0.0634438168260855,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.93135,
+      "rms": 0.09910770433356965,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 62"
+    },
+    {
+      "timestamp": 1752621721.931351,
+      "rms": 0.1392359193272846,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 63"
+    },
+    {
+      "timestamp": 1752621721.931353,
+      "rms": 0.049264882507772625,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 64"
+    },
+    {
+      "timestamp": 1752621721.931354,
+      "rms": 0.0783625383327976,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.9313548,
+      "rms": 0.04243524842835281,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931356,
+      "rms": 0.12251493877232794,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.9313579,
+      "rms": 0.0783910136224977,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 68"
+    },
+    {
+      "timestamp": 1752621721.931359,
+      "rms": 0.09977913574242941,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.93136,
+      "rms": 0.08646321075117362,
+      "is_speech": true,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.9313622,
+      "rms": 0.1253600781429776,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 71"
+    },
+    {
+      "timestamp": 1752621721.931363,
+      "rms": 0.022721192621709053,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 72"
+    },
+    {
+      "timestamp": 1752621721.931365,
+      "rms": 0.09966906966862438,
+      "is_speech": true,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931366,
+      "rms": 0.06656073185753247,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.9313679,
+      "rms": 0.10274583876847675,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 75"
+    },
+    {
+      "timestamp": 1752621721.93137,
+      "rms": 0.0391128847189275,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 76"
+    },
+    {
+      "timestamp": 1752621721.931371,
+      "rms": 0.08937489896200726,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 77"
+    },
+    {
+      "timestamp": 1752621721.9313731,
+      "rms": 0.06374942341085013,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 78"
+    },
+    {
+      "timestamp": 1752621721.931374,
+      "rms": 0.04450927577513188,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931375,
+      "rms": 0.03836548678402621,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 80"
+    },
+    {
+      "timestamp": 1752621721.931377,
+      "rms": 0.030285600560373688,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 81"
+    },
+    {
+      "timestamp": 1752621721.931378,
+      "rms": 0.05125200166983043,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.9313788,
+      "rms": 0.12918194340640174,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.93138,
+      "rms": 0.08789589980605374,
+      "is_speech": true,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931382,
+      "rms": 0.06138490070082359,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 85"
+    },
+    {
+      "timestamp": 1752621721.9313831,
+      "rms": 0.06116707501244519,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931384,
+      "rms": 0.06405278811635583,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931385,
+      "rms": 0.056583385559420184,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 88"
+    },
+    {
+      "timestamp": 1752621721.931386,
+      "rms": 0.0690823183234147,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931387,
+      "rms": 0.09005977187018223,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931388,
+      "rms": 0.06899595117017514,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.93139,
+      "rms": 0.12026051961500167,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 92"
+    },
+    {
+      "timestamp": 1752621721.931391,
+      "rms": 0.0778815185687629,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.931392,
+      "rms": 0.09687714188038195,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 94"
+    },
+    {
+      "timestamp": 1752621721.931394,
+      "rms": 0.04930691854509192,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 95"
+    },
+    {
+      "timestamp": 1752621721.931395,
+      "rms": 0.06503694390185089,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.9313972,
+      "rms": 0.05015973765203533,
+      "is_speech": true,
+      "has_transcript": true,
+      "transcript": "Test transcript 97"
+    },
+    {
+      "timestamp": 1752621721.931398,
+      "rms": 0.0754235603293698,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    },
+    {
+      "timestamp": 1752621721.9313989,
+      "rms": 0.06177342602868837,
+      "is_speech": false,
+      "has_transcript": false,
+      "transcript": ""
+    }
+  ],
+  "connection_events": [
+    {
+      "timestamp": 1752621721.931308,
+      "event": "disconnect",
+      "details": "Network timeout"
+    },
+    {
+      "timestamp": 1752621721.9313102,
+      "event": "reconnect",
+      "details": "Connection restored"
+    }
+  ]
+}

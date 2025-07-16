@@ -16,6 +16,7 @@ from src.llm import LLM
 from src.stt import STT
 from src.tts import TTS
 from src.vad import VAD
+from src.audio_preprocessor import preprocess_audio_chunk
 
 logger = logging.getLogger(__name__)
 
@@ -202,37 +203,117 @@ async def handle_audio_chunk(
 
         audio_bytes = base64.b64decode(encoded_audio)
 
-        # Skip VAD check for small chunks to prevent excessive filtering
-        if vad_instance and len(audio_bytes) >= 640 and not vad_instance.is_speech(audio_bytes) and not is_final:
-            await websocket.send_json(
-                {
-                    "type": "vad_status",
-                    "isActive": False,
-                    "timestamp": datetime.utcnow().isoformat(),
-                }
-            )
+        # Initialize audio buffer and processing state for this websocket if not exists
+        if not hasattr(websocket, "_audio_buffer"):
+            websocket._audio_buffer = bytearray()
+            websocket._is_processing = False
+            websocket._last_final_time = 0
+
+        # Prevent duplicate processing
+        if is_final and websocket._is_processing:
+            logger.debug("Skipping duplicate final audio processing")
             return
 
+        # Add audio chunk to buffer
+        websocket._audio_buffer.extend(audio_bytes)
+        
+        # Apply server-side noise gate as recommended
+        if len(audio_bytes) >= 640:  # Only process substantial chunks
+            # Calculate RMS and peak for noise gate
+            import numpy as np
+            audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            rms = np.sqrt(np.mean(audio_array ** 2))
+            peak = np.max(np.abs(audio_array))
+            
+            # Cheap noise gate - skip if too quiet
+            if rms < 0.01 and peak < 0.05:
+                logger.debug(f"Server noise gate: RMS={rms:.4f}, peak={peak:.4f} - skipping quiet chunk")
+                return
+        
+        logger.debug(f"Audio chunk received: {len(audio_bytes)} bytes, buffer size: {len(websocket._audio_buffer)} bytes, is_final: {is_final}")
+
+        # Apply server-side audio preprocessing with dual-stage VAD
+        if len(audio_bytes) >= 640 and not is_final:  # Process chunks for VAD
+            try:
+                processed_audio, is_speech = await preprocess_audio_chunk(audio_bytes)
+                if not is_speech:
+                    # Server-side VAD rejected this chunk
+                    logger.debug("Server-side VAD: No speech detected, skipping chunk")
+                    return
+                # Replace original audio with processed version
+                audio_bytes = processed_audio
+            except Exception as e:
+                logger.warning(f"Audio preprocessing failed: {e}")
+                # Continue with original audio if preprocessing fails
+
         latency_tracker = get_latency_tracker(websocket)
-        user_text = await handle_streaming_stt_chunk(
-            websocket=websocket,
-            audio_chunk=audio_bytes,
-            is_final=is_final,
-            stt_instance=stt_instance,
-            latency_tracker=latency_tracker,
-        )
-
-        if user_text and is_final:
-            language = message.get("language", "en")
-
-            await _process_and_respond(
-                websocket,
-                user_text,
-                language,
-                conversation_mgr,
-                llm_interface,
-                tts_engine,
+        
+        # Only process transcription when we have final audio or a substantial buffer
+        user_text = None
+        if is_final and len(websocket._audio_buffer) > 0:
+            # Set processing flag to prevent duplicates
+            websocket._is_processing = True
+            current_time = time.time()
+            
+            # Prevent processing if we just processed recently (debounce)
+            if current_time - websocket._last_final_time < 2.0:  # 2 second debounce (more conservative)
+                logger.debug("Skipping duplicate final processing due to debounce")
+                websocket._is_processing = False
+                return
+            
+            websocket._last_final_time = current_time
+            
+            # Apply minimum speech buffer requirement (700ms at 16kHz = 11,200 samples = 22,400 bytes)
+            min_speech_bytes = 16000 * 0.7 * 2  # 0.7s * 16kHz * 2 bytes per sample
+            if len(websocket._audio_buffer) < min_speech_bytes:
+                logger.debug(f"Audio buffer too short: {len(websocket._audio_buffer)} < {min_speech_bytes} bytes - waiting for more")
+                websocket._is_processing = False
+                return
+            
+            logger.info(f"Processing final audio buffer: {len(websocket._audio_buffer)} bytes")
+            user_text = await handle_streaming_stt_chunk(
+                websocket=websocket,
+                audio_chunk=bytes(websocket._audio_buffer),
+                is_final=True,
+                stt_instance=stt_instance,
+                latency_tracker=latency_tracker,
             )
+            # Clear buffer after final processing
+            websocket._audio_buffer = bytearray()
+            websocket._is_processing = False
+            
+            # Reset STT state to prevent "stuck in silence" issue
+            if hasattr(stt_instance, '_reset_state'):
+                await stt_instance._reset_state()
+
+        if is_final and not websocket._is_processing:
+            if user_text and user_text.strip():
+                language = message.get("language", "en")
+                await _process_and_respond(
+                    websocket,
+                    user_text,
+                    language,
+                    conversation_mgr,
+                    llm_interface,
+                    tts_engine,
+                )
+            else:
+                # Send a response even when no transcript is detected (only once)
+                logger.info("No transcript detected, sending fallback response")
+                await websocket.send_json({
+                    "type": "stt_result",
+                    "transcript": "",
+                    "is_final": True,
+                    "message": "No speech detected - try speaking louder or closer to the microphone"
+                })
+                
+                # Also send a helpful AI response
+                await websocket.send_json({
+                    "type": "text_response",
+                    "text": "I didn't catch that. Could you please speak a bit louder or closer to your microphone?",
+                    "language": "en",
+                    "timestamp": datetime.utcnow().isoformat(),
+                })
         elif not is_final:
             await websocket.send_json(
                 {
@@ -291,9 +372,12 @@ async def handle_stop_listening(websocket: WebSocket, message: dict):
 
 async def handle_heartbeat(websocket: WebSocket, message: dict):
     """Handles a heartbeat message from the client."""
-    await websocket.send_json(
-        {"type": "heartbeat_ack", "timestamp": datetime.utcnow().isoformat()}
-    )
+    # Check connection state before sending
+    from starlette.websockets import WebSocketState
+    if websocket.client_state == WebSocketState.CONNECTED:
+        await websocket.send_json(
+            {"type": "heartbeat_ack", "timestamp": datetime.utcnow().isoformat()}
+        )
 
 
 async def handle_unknown_message(websocket: WebSocket, message: dict):
@@ -314,43 +398,47 @@ async def stream_text_to_audio_pipeline(
 ) -> str:
     """
     Stream the entire LLM->TTS pipeline for ultra-low latency.
-    Starts TTS as soon as LLM begins producing tokens.
+    Collects LLM tokens and synthesizes audio when complete.
     """
     try:
         latency_tracker.mark("llm_start")
         
-        # Stream LLM response and feed directly to TTS
+        # Stream LLM response and collect tokens
         llm_stream = llm_interface.generate_stream(
             user_text=user_text,
             conversation_history=history,
             user_profile=profile_facts
         )
         
+        # Collect the full response from the stream (fix async generator bug)
+        tokens = []
+        async for token in llm_stream:
+            if token:
+                tokens.append(token)
+        
+        full_response = ''.join(tokens).strip()
+        
+        latency_tracker.mark("llm_complete")
+        
+        if not full_response.strip():
+            full_response = "I'm not sure how to respond to that."
+        
         latency_tracker.mark("tts_start")
         
-        # Stream TTS synthesis from LLM stream
-        audio_stream = tts_engine.stream_synthesize(llm_stream)
+        # Now synthesize the complete response
+        audio_bytes = await tts_engine.synthesize(full_response)
         
-        first_audio_sent = False
-        full_response = ""
-        
-        async for audio_chunk in audio_stream:
-            if audio_chunk:
-                if not first_audio_sent:
-                    latency_tracker.mark("first_audio_sent")
-                    first_audio_sent = True
-                
-                # Send audio chunk to client immediately
-                await websocket.send_json({
-                    "type": "audio_stream",
-                    "data": base64.b64encode(audio_chunk).decode("ascii"),
-                    "mime": "audio/mp3"
-                })
-        
-        latency_tracker.mark("tts_complete")
-        
-        # Collect full response for conversation history (re-generate for now)
-        full_response = await llm_interface.generate_response(user_text, history, profile_facts)
+        if audio_bytes:
+            latency_tracker.mark("tts_complete")
+            
+            # Send audio to client
+            await websocket.send_json({
+                "type": "tts_audio",
+                "data": base64.b64encode(audio_bytes).decode("ascii"),
+                "mime": "audio/mp3"
+            })
+            
+            latency_tracker.mark("audio_sent")
         
         latency_tracker.mark("pipeline_complete")
         latency_tracker.log_summary()
@@ -389,14 +477,17 @@ async def handle_streaming_stt_chunk(
             latency_tracker.mark("audio_received")
         
         # Validate audio chunk before processing
-        if not audio_chunk or len(audio_chunk) < 320:  # Skip very small chunks
+        if not audio_chunk or len(audio_chunk) < 640:  # Skip small chunks (increased threshold for stability)
             logger.debug(f"Skipping small audio chunk: {len(audio_chunk)} bytes")
             return None
+        
+        logger.debug(f"Processing audio chunk: {len(audio_chunk)} bytes, is_final: {is_final}")
         
         # Process with streaming STT
         transcript = await stt_instance.stream_transcribe_chunk(audio_chunk, is_final=is_final)
         
         if transcript and transcript.strip():
+            logger.info(f"STT transcript received: '{transcript}' (final: {is_final})")
             if is_final:
                 latency_tracker.mark("stt_complete")
                 # Send final transcription result
@@ -413,9 +504,13 @@ async def handle_streaming_stt_chunk(
                     "transcript": transcript,
                     "is_final": False
                 })
+        else:
+            logger.debug(f"No transcript from STT (is_final: {is_final})")
         
         return None
         
     except Exception as e:
         logger.error(f"STT chunk processing error: {e}")
+        import traceback
+        logger.error(f"STT error traceback: {traceback.format_exc()}")
         return None

@@ -9,13 +9,13 @@ class VAD:
     chunk before STT to skip leading / trailing silence.
     """
 
-    def __init__(self, sample_rate: int = 16000, mode: int = 2):
+    def __init__(self, sample_rate: int = 16000, mode: int = 1):
         """Create a new VAD instance.
 
         Args:
             sample_rate: PCM sample-rate of incoming audio. 16 kHz is the sweet-spot for Whisper.
             mode: Aggressiveness (0-3). 0 = least aggressive (more speech detected),
-                  3 = most aggressive (less speech, lower false positives).
+                  1 = less aggressive (better for quiet speech), 3 = most aggressive.
         """
         self.sample_rate = sample_rate
         self._vad = webrtcvad.Vad(mode)
