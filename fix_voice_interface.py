@@ -276,7 +276,7 @@ async def main():
     logger.info("   - Adjust audio gain if levels are too low")
     
     logger.info("\n4. 🔧 Backend Settings:")
-    logger.info("   - Whisper fallback is now enabled")
+    logger.info("   - Deepgram STT is now optimized")
     logger.info("   - Audio buffering has been improved")
     logger.info("   - Silence detection prevents empty transcriptions")
     

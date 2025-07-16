@@ -28,26 +28,18 @@ ENERGY_THRESHOLD = 150  # Reduced from 300 to 150 for better sensitivity
 # Seconds of non-speaking audio before a phrase is considered complete
 PAUSE_THRESHOLD = 0.8  # Increased from 0.4 to 0.8 for better phrase detection
 
-# --- RealtimeSTT Configuration ---
-# Whisper model size for RealtimeSTT (tiny, base, small, medium, large)
-REALTIME_STT_MODEL = os.getenv("REALTIME_STT_MODEL", "base")
+# --- Deepgram STT Configuration ---
 # Voice activity detection sensitivity (0.0 to 1.0)
-REALTIME_STT_VAD_SENSITIVITY = float(os.getenv("REALTIME_STT_VAD_SENSITIVITY", "0.6"))
-# Wake words for voice activation (comma-separated)
-REALTIME_STT_WAKE_WORDS = os.getenv("REALTIME_STT_WAKE_WORDS", "")
-# Wake word detection sensitivity (0.0 to 1.0)
-REALTIME_STT_WAKE_WORD_SENSITIVITY = float(os.getenv("REALTIME_STT_WAKE_WORD_SENSITIVITY", "0.6"))
+DEEPGRAM_STT_VAD_SENSITIVITY = float(os.getenv("DEEPGRAM_STT_VAD_SENSITIVITY", "0.6"))
 # Enable real-time transcription updates
-REALTIME_STT_ENABLE_REALTIME = os.getenv("REALTIME_STT_ENABLE_REALTIME", "true").lower() == "true"
-# Language for speech recognition
-REALTIME_STT_LANGUAGE = os.getenv("REALTIME_STT_LANGUAGE", "en")
+DEEPGRAM_STT_ENABLE_REALTIME = os.getenv("DEEPGRAM_STT_ENABLE_REALTIME", "true").lower() == "true"
 
 # --- Ultra-Fast Performance Configuration ---
 # Ultra-fast mode settings for ~500ms latency target
 ULTRA_FAST_MODE = os.getenv("ULTRA_FAST_MODE", "false").lower() == "true"
 
 # STT Ultra-Fast Settings
-ULTRA_FAST_STT_MODEL = "tiny"  # Fastest Whisper model
+ULTRA_FAST_STT_MODEL = "nova-3"  # Fastest Deepgram model
 ULTRA_FAST_VAD_SENSITIVITY = 0.3  # Aggressive VAD for instant detection
 ULTRA_FAST_PAUSE_THRESHOLD = 0.4  # Shorter pause for faster cutoff
 ULTRA_FAST_MIN_PHRASE_LENGTH = 0.3  # Minimum phrase length in seconds
@@ -93,8 +85,8 @@ OUTPUT_CHANNELS = 1
 OUTPUT_FORMAT = "int16"
 
 # --- Models ---
-# STT
-WHISPER_MODEL = "tiny" if ULTRA_FAST_MODE else "base"  # Use tiny model in ultra-fast mode
+# STT - Using Deepgram models only
+DEEPGRAM_STT_MODEL_FAST = "nova-3" if ULTRA_FAST_MODE else "nova-3"  # Always use nova-3 for best performance
 
 # TTS
 PIPER_VOICE = "en_US-libritts-high" # As per PRD
@@ -137,8 +129,6 @@ REFRESH_TOKEN_TIMEOUT_DAYS = int(os.getenv("REFRESH_TOKEN_TIMEOUT_DAYS", "30"))
 # Enable server-side STT by default. Set USE_REALTIME_STT=false in the
 # environment when you want the browser-only Web-Speech fallback instead.
 USE_REALTIME_STT = os.getenv("USE_REALTIME_STT", "true").lower() == "true"
-# Whisper model size to load when USE_REALTIME_STT is true (tiny, base, small, ...)
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny")
 
 # --- Kokoro TTS Configuration ---
 KOKORO_TTS_URL = os.getenv("KOKORO_TTS_URL", "http://localhost:8880")
@@ -152,12 +142,16 @@ GEMINI_TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Aoede")
 GEMINI_TTS_SPEAKING_RATE = float(os.getenv("GEMINI_TTS_SPEAKING_RATE", "1.0"))
 
 # --- Deepgram Configuration ---
-# STT Configuration
-DEEPGRAM_STT_MODEL = os.getenv("DEEPGRAM_STT_MODEL", "nova-2")
+# STT Configuration - Optimized for better speech recognition
+DEEPGRAM_STT_MODEL = os.getenv("DEEPGRAM_STT_MODEL", "nova-3")
 DEEPGRAM_STT_LANGUAGE = os.getenv("DEEPGRAM_STT_LANGUAGE", "en-US")
 DEEPGRAM_STT_SMART_FORMAT = os.getenv("DEEPGRAM_STT_SMART_FORMAT", "true").lower() == "true"
 DEEPGRAM_STT_PUNCTUATE = os.getenv("DEEPGRAM_STT_PUNCTUATE", "true").lower() == "true"
 DEEPGRAM_STT_DIARIZE = os.getenv("DEEPGRAM_STT_DIARIZE", "false").lower() == "true"
+# Additional STT parameters for better recognition
+DEEPGRAM_STT_FILLER_WORDS = os.getenv("DEEPGRAM_STT_FILLER_WORDS", "true").lower() == "true"
+DEEPGRAM_STT_NUMERALS = os.getenv("DEEPGRAM_STT_NUMERALS", "true").lower() == "true"
+DEEPGRAM_STT_ENDPOINTING = int(os.getenv("DEEPGRAM_STT_ENDPOINTING", "300"))  # 300ms silence detection
 
 # TTS Configuration  
 DEEPGRAM_TTS_MODEL = os.getenv("DEEPGRAM_TTS_MODEL", "aura-asteria-en")

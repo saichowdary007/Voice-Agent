@@ -57,6 +57,8 @@ class DeepgramTTS:
             return b""
 
         try:
+            logger.info(f"🎤 Synthesizing text: '{text[:50]}...' with model: {self.model}")
+            
             # Configure synthesis options
             options = SpeakOptions(
                 model=self.model,
@@ -70,16 +72,28 @@ class DeepgramTTS:
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
                     filename = tmp_file.name
                 
-                # Save to file using the working API
-                response = self.client.speak.v("1").save(filename, {"text": text}, options)
-                
-                # Read file content
-                with open(filename, 'rb') as f:
-                    audio_data = f.read()
-                
-                # Clean up
-                os.unlink(filename)
-                return audio_data
+                try:
+                    # Save to file using the working API
+                    logger.debug(f"Saving TTS audio to: {filename}")
+                    response = self.client.speak.v("1").save(filename, {"text": text}, options)
+                    logger.debug(f"Deepgram TTS response: {response}")
+                    
+                    # Read file content
+                    with open(filename, 'rb') as f:
+                        audio_data = f.read()
+                    
+                    logger.info(f"✅ Generated {len(audio_data)} bytes of audio")
+                    return audio_data
+                    
+                except Exception as e:
+                    logger.error(f"Deepgram TTS API error: {e}")
+                    raise
+                finally:
+                    # Clean up
+                    try:
+                        os.unlink(filename)
+                    except Exception:
+                        pass
             
             # Run in thread to avoid blocking
             return await asyncio.to_thread(_synthesize)

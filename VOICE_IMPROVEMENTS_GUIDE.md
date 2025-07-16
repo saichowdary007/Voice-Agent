@@ -227,7 +227,7 @@ Ensure these are set for optimal performance:
 ```bash
 # Deepgram configuration
 DEEPGRAM_API_KEY=your_key_here
-DEEPGRAM_STT_MODEL=nova-2
+DEEPGRAM_STT_MODEL=nova-3
 
 # Audio processing
 AUDIO_SAMPLE_RATE=16000

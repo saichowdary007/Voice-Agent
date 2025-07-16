@@ -7,8 +7,7 @@ pydub>=0.25.1
 simpleaudio>=1.0.4
 soundfile>=0.12.1
 
-# Faster multilingual STT
-faster-whisper==1.1.1
+# Audio processing utilities
 ffmpeg-python==0.2.0
 
 # For Conversation History & ML

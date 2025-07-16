@@ -1,6 +1,6 @@
 """
 Deepgram Speech-to-Text (STT) module for real-time and batch transcription.
-Provides both streaming and batch transcription capabilities using Deepgram's Nova-2 model.
+Provides both streaming and batch transcription capabilities using Deepgram's nova-3 model.
 """
 
 import asyncio
@@ -26,6 +26,9 @@ from src.config import (
     DEEPGRAM_STT_SMART_FORMAT,
     DEEPGRAM_STT_PUNCTUATE,
     DEEPGRAM_STT_DIARIZE,
+    DEEPGRAM_STT_FILLER_WORDS,
+    DEEPGRAM_STT_NUMERALS,
+    DEEPGRAM_STT_ENDPOINTING,
 )
 
 logger = logging.getLogger(__name__)
@@ -129,7 +132,7 @@ class DeepgramSTT:
         try:
             logger.info(f"🔄 Starting Deepgram streaming with model: {DEEPGRAM_STT_MODEL}")
             
-            # Configure live transcription options
+            # Configure live transcription options with enhanced speech boundary detection
             options = LiveOptions(
                 model=DEEPGRAM_STT_MODEL,
                 language=DEEPGRAM_STT_LANGUAGE,
@@ -139,9 +142,19 @@ class DeepgramSTT:
                 sample_rate=sample_rate,
                 channels=1,
                 encoding="linear16",
+                # Enhanced settings for better speech boundary detection
                 interim_results=True,
-                utterance_end_ms="1000",
+                endpointing=800,  # Increased from 300ms to 800ms for better speech boundaries
+                utterance_end_ms="1200",  # Increased to 1.2 seconds to prevent cutoffs
                 vad_events=True,
+                # Additional parameters for improved recognition
+                filler_words=DEEPGRAM_STT_FILLER_WORDS,  # Detect "uh", "um" etc.
+                numerals=DEEPGRAM_STT_NUMERALS,  # Convert numbers to digits
+                profanity_filter=False,  # Don't filter profanity for accuracy
+                # Enhanced speech detection parameters
+                no_delay=False,  # Allow slight delay for better accuracy
+                multichannel=False,  # Single channel processing
+                alternatives=1,  # Single best alternative for speed
             )
 
             # Create live transcription connection
@@ -278,22 +291,22 @@ class DeepgramSTT:
 class STT(DeepgramSTT):
     """Compatibility wrapper for existing STT interface."""
     
-    def __init__(self, model_size="nova-2", device="auto"):
+    def __init__(self, model_size="nova-3", device="auto"):
         # Map model_size to Deepgram models
         model_map = {
-            "tiny": "nova-2",
-            "base": "nova-2", 
-            "small": "nova-2",
-            "medium": "nova-2",
-            "large": "nova-2",
-            "nova-2": "nova-2",
+            "tiny": "nova-3",
+            "base": "nova-3", 
+            "small": "nova-3",
+            "medium": "nova-3",
+            "large": "nova-3",
+            "nova-3": "nova-3",
             "nova": "nova",
             "enhanced": "enhanced",
         }
         
         # Override config with mapped model
         import src.config as config
-        config.DEEPGRAM_STT_MODEL = model_map.get(model_size, "nova-2")
+        config.DEEPGRAM_STT_MODEL = model_map.get(model_size, "nova-3")
         
         super().__init__()
         logger.info(f"✅ Deepgram STT initialized with model: {config.DEEPGRAM_STT_MODEL}")
@@ -315,7 +328,7 @@ class STT(DeepgramSTT):
 
     async def stream_transcribe_chunk(self, audio_chunk: bytes, is_final: bool = False) -> Optional[str]:
         """
-        Stream transcription compatibility method.
+        Stream transcription compatibility method with optimized processing.
         
         Args:
             audio_chunk: Audio bytes to transcribe
@@ -324,44 +337,51 @@ class STT(DeepgramSTT):
         Returns:
             Transcript text or None
         """
-        # For now, use batch transcription for reliability
-        # TODO: Fix streaming implementation later
-        if is_final and audio_chunk and len(audio_chunk) > 320:
-            logger.info(f"🎯 Processing final audio chunk: {len(audio_chunk)} bytes")
+        # Only process final chunks to avoid unnecessary processing
+        if not is_final or not audio_chunk or len(audio_chunk) < 320:
+            return None
             
-            # Basic audio validation (very permissive)
-            import numpy as np
-            try:
-                # Convert bytes to numpy array for analysis
-                audio_np = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
-                rms_level = np.sqrt(np.mean(audio_np**2))
-                max_level = np.max(np.abs(audio_np))
-                
-                logger.info(f"🔊 Audio analysis - RMS: {rms_level:.4f}, Max: {max_level:.4f}")
-                
-                # Only skip if audio is completely silent (very permissive threshold)
-                if rms_level < 0.0001 and max_level < 0.001:
-                    logger.warning("⚠️ Audio appears to be complete silence, skipping transcription")
-                    return None
-                    
-            except Exception as analysis_e:
-                logger.warning(f"Audio analysis failed: {analysis_e}")
-            
-            try:
-                transcript = await self.transcribe_bytes(audio_chunk)
-                if transcript and transcript.strip():
-                    logger.info(f"✅ Deepgram transcript: '{transcript}'")
-                    return transcript.strip()
-                else:
-                    logger.warning("⚠️ No transcript returned from Deepgram")
-                    return None
-                    
-            except Exception as e:
-                logger.error(f"❌ Deepgram transcription failed: {e}")
-                return None
+        logger.info(f"🎯 Processing final audio chunk: {len(audio_chunk)} bytes")
         
-        # For non-final chunks, just return None (no partial transcripts for now)
-        return None
+        # Quick audio validation (optimized for speed)
+        try:
+            import numpy as np
+            # Convert bytes to numpy array for analysis
+            audio_np = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+            rms_level = np.sqrt(np.mean(audio_np**2))
+            max_level = np.max(np.abs(audio_np))
+            
+            logger.info(f"🔊 Audio analysis - RMS: {rms_level:.4f}, Max: {max_level:.4f}")
+            
+            # Very permissive silence detection - only skip completely silent audio
+            if rms_level < 0.001 and max_level < 0.01:
+                logger.warning("⚠️ Audio appears to be silence, skipping transcription")
+                return None
+                
+        except Exception as analysis_e:
+            logger.warning(f"Audio analysis failed: {analysis_e}, proceeding with transcription")
+        
+        # Use optimized transcription with reduced timeout
+        try:
+            # Reduced timeout to prevent hanging - 5 seconds max
+            transcript = await asyncio.wait_for(
+                self.transcribe_bytes(audio_chunk), 
+                timeout=5.0  # 5 second timeout for faster response
+            )
+            
+            if transcript and transcript.strip():
+                logger.info(f"✅ Deepgram transcript: '{transcript}'")
+                return transcript.strip()
+            else:
+                logger.warning("⚠️ No transcript returned from Deepgram")
+                return None
+                
+        except asyncio.TimeoutError:
+            logger.error("❌ Deepgram transcription timed out after 5 seconds")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Deepgram transcription failed: {e}")
+            return None
 
     def listen_and_transcribe(self, timeout: int = None, phrase_time_limit: int = None) -> str:
         """

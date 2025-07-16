@@ -93,7 +93,7 @@ async def transcribe_bytes(self, audio_bytes: bytes, sr: int = 16000)
 ## Architecture Validation
 
 ### STT Layer ✅
-- **Primary**: Deepgram Nova-2 (cloud-based, high accuracy)
+- **Primary**: Deepgram nova-3 (cloud-based, high accuracy)
 - **Fallback**: Whisper Tiny (local, fast processing)
 - **Format**: 16kHz, 16-bit PCM, mono
 - **Latency**: ~1 second for 2-3 second audio clips

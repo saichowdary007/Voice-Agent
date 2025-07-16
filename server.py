@@ -41,16 +41,16 @@ logger = logging.getLogger(__name__)
 
 # Import Voice Agent modules
 try:
-    from src.config import USE_REALTIME_STT, WHISPER_MODEL
+    from src.config import USE_REALTIME_STT
     if USE_REALTIME_STT:
-        logger.info(f"🚀 Server-side STT enabled")
+        logger.info(f"🚀 Server-side STT enabled with Deepgram")
         try:
             from src.stt import STT
-            # Initialize STT (will use Deepgram if available, otherwise Whisper)
-            stt_instance = STT(model_size=WHISPER_MODEL, device="auto")
-            logger.info(f"✅ STT initialized successfully")
+            # Initialize Deepgram STT
+            stt_instance = STT(model_size="nova-3", device="auto")
+            logger.info(f"✅ Deepgram STT initialized successfully")
         except Exception as e:
-            logger.error(f"❌ Failed to load faster-whisper STT: {e}")
+            logger.error(f"❌ Failed to load Deepgram STT: {e}")
             USE_REALTIME_STT = False
             stt_instance = None
     else:

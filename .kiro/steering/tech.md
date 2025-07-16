@@ -21,8 +21,7 @@
 ## AI/ML Components
 
 - **Speech-to-Text**: 
-  - Primary: Faster-Whisper (tiny/base models for speed)
-  - Alternative: Deepgram API
+  - Primary: Deepgram API (nova-3 model for accuracy and speed)
   - Fallback: Browser Web Speech API
 - **Large Language Model**: Google Gemini via official SDK
 - **Text-to-Speech**:
@@ -45,7 +44,7 @@
 fastapi>=0.104.0          # Web framework
 uvicorn[standard]>=0.24.0 # ASGI server
 websockets>=11.0.0        # WebSocket support
-faster-whisper==1.1.1     # STT engine
+deepgram-sdk>=3.0.0       # Primary STT engine
 supabase>=2.0.0           # Database & auth
 deepgram-sdk>=3.0.0       # Alternative STT/TTS
 google-genai>=0.3.0       # Gemini LLM
@@ -134,7 +133,7 @@ docker-compose logs -f frontend
 ## Performance Optimization
 
 - **Ultra-fast Mode**: `ULTRA_FAST_MODE=true` for ~500ms latency
-- **Model Selection**: Configurable Whisper model sizes (tiny/base/small)
+- **Model Selection**: Configurable Deepgram models (nova-3/enhanced/base)
 - **Concurrent Processing**: Async/await throughout the pipeline
 - **Connection Pooling**: WebSocket connection management
 - **Resource Monitoring**: Built-in performance tracking and diagnostics
