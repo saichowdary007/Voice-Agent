@@ -131,7 +131,10 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
         const wsUrl = `${baseUrl.replace('localhost', '127.0.0.1')}/ws/${encodeURIComponent(token)}`;
         console.log('🔗 Attempting WebSocket connection to:', wsUrl);
         console.log('🎫 Using token:', token.substring(0, 20) + '...');
-        const newSocket = new WebSocket(wsUrl);
+        
+        // Support both "binary" and "stream-audio" protocols for compatibility
+        const supportedProtocols = ['binary', 'stream-audio'];
+        const newSocket = new WebSocket(wsUrl, supportedProtocols);
         currentSocket = newSocket;
 
         // Heartbeat timer id
@@ -175,6 +178,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
 
         newSocket.onopen = () => {
           console.log('WebSocket connected');
+          console.log('🔗 Negotiated protocol:', newSocket.protocol || 'none');
           isConnectedRef.current = true;
           isConnectingRef.current = false;
           setIsConnected(true);
@@ -211,6 +215,25 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           onOpen?.();
         };
 
+        // Handle automatic pong responses to server pings
+        newSocket.addEventListener('ping', (event) => {
+          console.log('📡 Received ping from server, sending pong');
+          try {
+            // Browser automatically sends pong, but we track it for health monitoring
+            connectionHealthRef.current.lastPong = Date.now();
+            connectionHealthRef.current.missedPongs = 0;
+          } catch (error) {
+            console.error('Failed to handle ping:', error);
+          }
+        });
+
+        // Handle pong responses (for our custom heartbeat)
+        newSocket.addEventListener('pong', (event) => {
+          console.log('📡 Received pong from server');
+          connectionHealthRef.current.lastPong = Date.now();
+          connectionHealthRef.current.missedPongs = 0;
+        });
+
         newSocket.onmessage = (event) => {
           try {
             const message: WebSocketMessage = JSON.parse(event.data);
@@ -219,7 +242,24 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
             if (message.type === 'heartbeat_ack') {
               connectionHealthRef.current.lastPong = Date.now();
               connectionHealthRef.current.missedPongs = 0;
+              console.log('💓 Heartbeat acknowledged by server');
               return; // Don't process heartbeat acks further
+            }
+            
+            // Handle ping messages from server (respond with pong)
+            if (message.type === 'ping') {
+              console.log('📡 Received ping message, sending pong response');
+              try {
+                newSocket.send(JSON.stringify({ 
+                  type: 'pong', 
+                  timestamp: message.timestamp || Date.now() 
+                }));
+                connectionHealthRef.current.lastPong = Date.now();
+                connectionHealthRef.current.missedPongs = 0;
+              } catch (error) {
+                console.error('Failed to send pong response:', error);
+              }
+              return; // Don't process ping messages further
             }
             
             // Handle audio response from server
@@ -284,8 +324,9 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
             reconnectAttemptsRef.current += 1;
             console.log(`Attempting to reconnect (${reconnectAttemptsRef.current}/${maxReconnectAttempts})...`);
             
-            // More conservative backoff: 3s, 5s, 8s, 12s, 20s
-            const backoffDelay = Math.min(reconnectInterval + (reconnectAttemptsRef.current * 2000), 20000);
+            // Exponential backoff: 3s, 5s, 8s, 12s, 20s as per forensic analysis
+            const backoffDelays = [3000, 5000, 8000, 12000, 20000];
+            const backoffDelay = backoffDelays[Math.min(reconnectAttemptsRef.current - 1, backoffDelays.length - 1)];
             
             reconnectTimeoutRef.current = setTimeout(() => {
               connectWebSocket();

@@ -781,9 +781,27 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
     try:
         logger.info(f"🔌 New WebSocket connection attempt with token: {token[:20]}...")
         
-        # CRITICAL: Accept the WebSocket connection FIRST before any other operations
-        await websocket.accept()
-        logger.info("✅ WebSocket connection accepted")
+        # Protocol negotiation - support both "binary" and "stream-audio" for compatibility
+        supported_protocols = ["binary", "stream-audio"]
+        client_protocol = websocket.headers.get("sec-websocket-protocol", "")
+        
+        # Check if client requested a supported protocol
+        negotiated_protocol = None
+        if client_protocol:
+            requested_protocols = [p.strip() for p in client_protocol.split(",")]
+            for protocol in requested_protocols:
+                if protocol in supported_protocols:
+                    negotiated_protocol = protocol
+                    break
+        
+        # Accept connection with negotiated protocol
+        if negotiated_protocol:
+            await websocket.accept(subprotocol=negotiated_protocol)
+            logger.info(f"✅ WebSocket connection accepted with protocol: {negotiated_protocol}")
+        else:
+            # Accept without specific protocol for backward compatibility
+            await websocket.accept()
+            logger.info("✅ WebSocket connection accepted (no specific protocol)")
         
         # -----------------------------------
         # Authenticate user (token path param)

@@ -7,7 +7,7 @@ import json
 import logging
 import time
 from datetime import datetime
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Dict
 
 from fastapi import WebSocket
 
@@ -19,6 +19,175 @@ from src.vad import VAD
 from src.audio_preprocessor import preprocess_audio_chunk
 
 logger = logging.getLogger(__name__)
+
+
+class WebSocketSessionManager:
+    """Manages WebSocket sessions and their associated VAD instances."""
+    
+    def __init__(self):
+        self.active_sessions: Dict[str, Dict] = {}
+        self.session_lock = asyncio.Lock()
+    
+    async def create_session(self, websocket: WebSocket) -> str:
+        """Create a new session for a WebSocket connection."""
+        session_id = f"session_{id(websocket)}_{int(time.time())}"
+        
+        async with self.session_lock:
+            # Initialize VAD instance for this session
+            vad_instance = VAD(sample_rate=16000, mode=1)
+            
+            # Initialize streaming audio processor
+            from src.audio_preprocessor import StreamingAudioProcessor
+            audio_processor = StreamingAudioProcessor(sample_rate=16000)
+            
+            self.active_sessions[session_id] = {
+                'websocket': websocket,
+                'vad_instance': vad_instance,
+                'audio_processor': audio_processor,
+                'created_at': time.time(),
+                'last_activity': time.time(),
+                'speech_state': {
+                    'is_speaking': False,
+                    'speech_start_time': None,
+                    'silence_start_time': None,
+                    'total_audio_duration': 0.0,
+                    'chunk_count': 0
+                }
+            }
+            
+            logger.info(f"✅ Created WebSocket session: {session_id}")
+            return session_id
+    
+    async def get_session(self, session_id: str) -> Optional[Dict]:
+        """Get session data by session ID."""
+        async with self.session_lock:
+            session = self.active_sessions.get(session_id)
+            if session:
+                session['last_activity'] = time.time()
+            return session
+    
+    async def get_session_by_websocket(self, websocket: WebSocket) -> Optional[Dict]:
+        """Get session data by WebSocket instance."""
+        async with self.session_lock:
+            for session_id, session_data in self.active_sessions.items():
+                if session_data['websocket'] == websocket:
+                    session_data['last_activity'] = time.time()
+                    return session_data
+            return None
+    
+    async def cleanup_session(self, session_id: str) -> None:
+        """Clean up a session and its resources."""
+        async with self.session_lock:
+            session = self.active_sessions.pop(session_id, None)
+            if session:
+                # Clean up audio processor
+                if 'audio_processor' in session:
+                    await session['audio_processor'].cleanup_ffmpeg_process()
+                
+                # Reset VAD state
+                if 'vad_instance' in session:
+                    session['vad_instance'].reset_state()
+                
+                logger.info(f"🧹 Cleaned up WebSocket session: {session_id}")
+    
+    async def cleanup_session_by_websocket(self, websocket: WebSocket) -> None:
+        """Clean up session by WebSocket instance."""
+        session_id = None
+        async with self.session_lock:
+            for sid, session_data in self.active_sessions.items():
+                if session_data['websocket'] == websocket:
+                    session_id = sid
+                    break
+        
+        if session_id:
+            await self.cleanup_session(session_id)
+    
+    async def cleanup_inactive_sessions(self, max_idle_time: float = 3600) -> None:
+        """Clean up sessions that have been inactive for too long."""
+        current_time = time.time()
+        inactive_sessions = []
+        
+        async with self.session_lock:
+            for session_id, session_data in self.active_sessions.items():
+                if current_time - session_data['last_activity'] > max_idle_time:
+                    inactive_sessions.append(session_id)
+        
+        for session_id in inactive_sessions:
+            await self.cleanup_session(session_id)
+            logger.info(f"🧹 Cleaned up inactive session: {session_id}")
+
+
+# Global session manager instance
+session_manager = WebSocketSessionManager()
+
+
+class WebSocketErrorHandler:
+    """Handles WebSocket error classification and recovery strategies."""
+    
+    ERROR_CODES = {
+        1000: "Normal closure",
+        1001: "Going away",
+        1002: "Protocol error", 
+        1003: "Unsupported data",
+        1006: "Connection lost",
+        1007: "Invalid frame payload data",
+        1008: "Authentication failed",
+        1009: "Message too big",
+        1010: "Mandatory extension",
+        1011: "Unexpected server condition",
+        1015: "TLS handshake failure"
+    }
+    
+    @classmethod
+    async def handle_connection_error(cls, error_code: int, websocket: WebSocket, reason: str = "") -> None:
+        """Handle connection errors with appropriate recovery strategies."""
+        error_description = cls.ERROR_CODES.get(error_code, f"Unknown error code: {error_code}")
+        logger.error(f"WebSocket error {error_code}: {error_description} - {reason}")
+        
+        # Clean up session resources
+        await session_manager.cleanup_session_by_websocket(websocket)
+        
+        # Log specific error handling
+        if error_code == 1011:
+            logger.error("1011 error detected - likely ping timeout or server overload")
+        elif error_code == 1008:
+            logger.error("Authentication failed - token may be expired")
+        elif error_code == 1006:
+            logger.error("Connection lost - network issue or server restart")
+    
+    @classmethod
+    def should_attempt_reconnect(cls, error_code: int) -> bool:
+        """Determine if reconnection should be attempted based on error code."""
+        # Don't reconnect for authentication failures or protocol errors
+        no_reconnect_codes = {1008, 1002, 1003, 1007}
+        return error_code not in no_reconnect_codes
+    
+    @classmethod
+    async def cleanup_failed_connection(cls, websocket: WebSocket) -> None:
+        """Clean up resources for a failed connection."""
+        try:
+            await session_manager.cleanup_session_by_websocket(websocket)
+            logger.info("✅ Cleaned up failed connection resources")
+        except Exception as e:
+            logger.error(f"❌ Error cleaning up failed connection: {e}")
+
+
+def get_websocket_protocol(websocket: WebSocket) -> Optional[str]:
+    """Get the negotiated WebSocket sub-protocol."""
+    # In FastAPI, the negotiated protocol is available via the websocket object
+    return getattr(websocket, 'subprotocol', None)
+
+
+def is_binary_protocol(websocket: WebSocket) -> bool:
+    """Check if the WebSocket is using binary protocol."""
+    protocol = get_websocket_protocol(websocket)
+    return protocol == "binary"
+
+
+def is_stream_audio_protocol(websocket: WebSocket) -> bool:
+    """Check if the WebSocket is using stream-audio protocol."""
+    protocol = get_websocket_protocol(websocket)
+    return protocol == "stream-audio"
 
 
 class LatencyTracker:
