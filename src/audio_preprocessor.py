@@ -11,6 +11,7 @@ import webrtcvad
 from scipy import signal
 import asyncio
 import time
+import subprocess
 from collections import deque
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,159 @@ class CommandWordMatcher:
         return best_match
 
 
+class StreamingAudioProcessor:
+    """
+    Streaming ffmpeg processor that maintains persistent ffmpeg process per WebSocket connection.
+    Addresses the CPU spike issue from spawning new processes for every blob.
+    """
+    
+    def __init__(self, sample_rate: int = 16000):
+        self.sample_rate = sample_rate
+        self.ffmpeg_process: Optional[subprocess.Popen] = None
+        self.audio_buffer = bytearray()
+        self.is_initialized = False
+        self.process_lock = asyncio.Lock()
+        
+        # Performance monitoring
+        self.performance_metrics = {
+            'total_chunks_processed': 0,
+            'total_processing_time': 0.0,
+            'avg_processing_time': 0.0,
+            'max_processing_time': 0.0,
+            'ffmpeg_restarts': 0,
+            'processing_errors': 0,
+            'last_processing_time': 0.0,
+            'cpu_usage_samples': deque(maxlen=100),
+            'memory_usage_samples': deque(maxlen=100),
+            'throughput_samples': deque(maxlen=100)
+        }
+        
+        logger.info(f"🚀 StreamingAudioProcessor initialized for {sample_rate}Hz")
+    
+    async def initialize_streaming_ffmpeg(self) -> None:
+        """Initialize persistent ffmpeg process for streaming audio conversion."""
+        if self.is_initialized and self.ffmpeg_process and self.ffmpeg_process.poll() is None:
+            return  # Already initialized and running
+        
+        try:
+            # ffmpeg command for streaming WebM/Opus to 16kHz mono PCM
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-f', 'webm',           # Input format
+                '-i', 'pipe:0',         # Read from stdin
+                '-f', 's16le',          # Output format: signed 16-bit little-endian
+                '-acodec', 'pcm_s16le', # Audio codec
+                '-ar', str(self.sample_rate),  # Sample rate
+                '-ac', '1',             # Mono channel
+                '-loglevel', 'error',   # Reduce logging
+                'pipe:1'                # Write to stdout
+            ]
+            
+            self.ffmpeg_process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0  # Unbuffered for real-time processing
+            )
+            
+            self.is_initialized = True
+            logger.info("✅ Streaming ffmpeg process initialized")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize streaming ffmpeg: {e}")
+            self.is_initialized = False
+            raise
+    
+    async def process_audio_stream(self, audio_chunk: bytes) -> bytes:
+        """Process audio chunk through streaming ffmpeg."""
+        processing_start = time.perf_counter()
+        
+        async with self.process_lock:
+            if not self.is_initialized:
+                await self.initialize_streaming_ffmpeg()
+            
+            if not self.ffmpeg_process or self.ffmpeg_process.poll() is not None:
+                logger.warning("ffmpeg process died, reinitializing...")
+                self.performance_metrics['ffmpeg_restarts'] += 1
+                await self.initialize_streaming_ffmpeg()
+            
+            try:
+                # Write audio chunk to ffmpeg stdin
+                self.ffmpeg_process.stdin.write(audio_chunk)
+                self.ffmpeg_process.stdin.flush()
+                
+                # Read processed audio from ffmpeg stdout
+                # Use non-blocking read with timeout
+                processed_audio = b''
+                start_time = time.perf_counter()
+                timeout = 1.0  # 1 second timeout
+                
+                while time.perf_counter() - start_time < timeout:
+                    if self.ffmpeg_process.stdout.readable():
+                        chunk = self.ffmpeg_process.stdout.read(4096)
+                        if chunk:
+                            processed_audio += chunk
+                        else:
+                            break
+                    await asyncio.sleep(0.001)  # Small delay to prevent busy waiting
+                
+                # Update performance metrics
+                processing_time = (time.perf_counter() - processing_start) * 1000
+                self.performance_metrics['total_chunks_processed'] += 1
+                self.performance_metrics['total_processing_time'] += processing_time
+                self.performance_metrics['last_processing_time'] = processing_time
+                self.performance_metrics['avg_processing_time'] = (
+                    self.performance_metrics['total_processing_time'] / 
+                    self.performance_metrics['total_chunks_processed']
+                )
+                self.performance_metrics['max_processing_time'] = max(
+                    self.performance_metrics['max_processing_time'], 
+                    processing_time
+                )
+                
+                # Track throughput (bytes per second)
+                if processing_time > 0:
+                    throughput = len(audio_chunk) / (processing_time / 1000)
+                    self.performance_metrics['throughput_samples'].append(throughput)
+                
+                # Log performance warning if processing is too slow
+                if processing_time > 100:  # 100ms threshold
+                    logger.warning(f"⚠️ Slow audio processing: {processing_time:.1f}ms for {len(audio_chunk)} bytes")
+                
+                return processed_audio
+                
+            except Exception as e:
+                logger.error(f"❌ Error processing audio stream: {e}")
+                self.performance_metrics['processing_errors'] += 1
+                # Try to restart ffmpeg process
+                await self.cleanup_ffmpeg_process()
+                return b''
+    
+    async def cleanup_ffmpeg_process(self) -> None:
+        """Clean up ffmpeg process."""
+        if self.ffmpeg_process:
+            try:
+                self.ffmpeg_process.stdin.close()
+                self.ffmpeg_process.stdout.close()
+                self.ffmpeg_process.stderr.close()
+                self.ffmpeg_process.terminate()
+                
+                # Wait for process to terminate with timeout
+                try:
+                    self.ffmpeg_process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    self.ffmpeg_process.kill()
+                    self.ffmpeg_process.wait()
+                
+                logger.info("🧹 ffmpeg process cleaned up")
+            except Exception as e:
+                logger.error(f"❌ Error cleaning up ffmpeg process: {e}")
+            finally:
+                self.ffmpeg_process = None
+                self.is_initialized = False
+
+
 class AudioPreprocessor:
     """
     Nova-3 optimized audio preprocessor for single-word command recognition.
@@ -172,6 +326,9 @@ class AudioPreprocessor:
             'false_positives': 0,
             'processing_times': deque(maxlen=100)
         }
+        
+        # Streaming audio processor
+        self.streaming_processor = StreamingAudioProcessor(sample_rate)
         
         logger.info(f"✅ Nova-3 AudioPreprocessor initialized ({sample_rate}Hz, 200ms pre-roll)")
     

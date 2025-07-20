@@ -70,14 +70,115 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: false,  // Disable AGC to prevent audio distortion
-            sampleRate: { ideal: 16000 },
-            channelCount: 1
+            sampleRate: { ideal: 16000 },  // 16kHz as required by forensic analysis
+            channelCount: { exact: 1 }     // Mono channel as required
           } 
         });
         
         console.log('Microphone access granted');
         microphoneRef.current = stream;
         stableMicrophonePermission(true);
+
+        // Initialize MediaRecorder with correct format as per forensic analysis
+        let mediaRecorder: MediaRecorder | null = null;
+        try {
+          const mediaRecorderOptions = {
+            mimeType: "audio/webm;codecs=opus",
+            audioBitsPerSecond: 128000, // 128kbps for voice
+          };
+          
+          mediaRecorder = new MediaRecorder(stream, mediaRecorderOptions);
+          console.log('✅ MediaRecorder initialized with:', mediaRecorderOptions);
+          
+          // Store MediaRecorder globally for potential use
+          (window as any).voiceAgentMediaRecorder = mediaRecorder;
+          
+          // Audio format validation utility
+          const validateAudioFormat = (blob: Blob): { isValid: boolean; error?: string } => {
+            // Check MIME type
+            if (!blob.type.includes('webm') || !blob.type.includes('opus')) {
+              return { isValid: false, error: `Invalid MIME type: ${blob.type}, expected audio/webm;codecs=opus` };
+            }
+            
+            // Check chunk size (should be approximately 4KB for 250ms at 16kHz mono)
+            const expectedMinSize = 2000; // ~2KB minimum
+            const expectedMaxSize = 8000; // ~8KB maximum
+            
+            if (blob.size < expectedMinSize) {
+              return { isValid: false, error: `Chunk too small: ${blob.size} bytes, expected ${expectedMinSize}-${expectedMaxSize} bytes` };
+            }
+            
+            if (blob.size > expectedMaxSize) {
+              return { isValid: false, error: `Chunk too large: ${blob.size} bytes, expected ${expectedMinSize}-${expectedMaxSize} bytes` };
+            }
+            
+            return { isValid: true };
+          };
+
+          // Set up MediaRecorder event handlers
+          mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) {
+              console.log(`📦 MediaRecorder chunk: ${event.data.size} bytes`);
+              
+              // Validate audio format
+              const validation = validateAudioFormat(event.data);
+              if (!validation.isValid) {
+                console.warn('⚠️ Audio format validation failed:', validation.error);
+                // Continue processing but log the issue
+              } else {
+                console.log('✅ Audio format validation passed');
+              }
+              
+              // Convert blob to base64 and send via WebSocket
+              const reader = new FileReader();
+              reader.onload = () => {
+                const arrayBuffer = reader.result as ArrayBuffer;
+                const base64Audio = btoa(String.fromCharCode.apply(null, Array.from(new Uint8Array(arrayBuffer))));
+                
+                const audioMessage = {
+                  type: "audio_chunk",
+                  data: base64Audio,
+                  is_final: false,
+                  format: "webm_opus",
+                  sample_rate: 16000,
+                  channels: 1,
+                  chunk_size: event.data.size,
+                  timestamp: Date.now(),
+                  validation: validation
+                };
+                
+                const ws = (window as any).voiceAgentWebSocket;
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                  try {
+                    ws.send(JSON.stringify(audioMessage));
+                    console.log('📡 Audio chunk sent successfully');
+                  } catch (error) {
+                    console.error('❌ Failed to send audio chunk:', error);
+                  }
+                } else {
+                  console.warn('⚠️ WebSocket not connected, discarding audio chunk');
+                }
+              };
+              
+              reader.onerror = () => {
+                console.error('❌ Failed to read audio blob');
+              };
+              
+              reader.readAsArrayBuffer(event.data);
+            }
+          };
+          
+          mediaRecorder.onstop = () => {
+            console.log('📦 MediaRecorder stopped');
+          };
+          
+          // Start recording with 250ms chunks as per forensic analysis
+          mediaRecorder.start(250); // 250ms chunks
+          console.log('🎙️ MediaRecorder started with 250ms chunks');
+          
+        } catch (error) {
+          console.warn('⚠️ MediaRecorder not supported, falling back to direct audio processing:', error);
+        }
 
         // Create audio context and analyser
         const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
