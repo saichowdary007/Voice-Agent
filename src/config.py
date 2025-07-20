@@ -144,6 +144,9 @@ GEMINI_TTS_SPEAKING_RATE = float(os.getenv("GEMINI_TTS_SPEAKING_RATE", "1.0"))
 # --- Deepgram Configuration ---
 # STT Configuration - Optimized for better speech recognition
 DEEPGRAM_STT_MODEL = os.getenv("DEEPGRAM_STT_MODEL", "nova-3")
+# Force nova-3 for Nova-3 optimization
+if DEEPGRAM_STT_MODEL != "nova-3":
+    DEEPGRAM_STT_MODEL = "nova-3"
 DEEPGRAM_STT_LANGUAGE = os.getenv("DEEPGRAM_STT_LANGUAGE", "en-US")
 DEEPGRAM_STT_SMART_FORMAT = os.getenv("DEEPGRAM_STT_SMART_FORMAT", "true").lower() == "true"
 DEEPGRAM_STT_PUNCTUATE = os.getenv("DEEPGRAM_STT_PUNCTUATE", "true").lower() == "true"

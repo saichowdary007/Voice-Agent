@@ -1,0 +1,130 @@
+{
+  "test_duration_seconds": 8.76826810836792,
+  "preprocessing": {
+    "commands_tested": 5,
+    "preprocessing_times": [
+      0.7357079884968698,
+      0.6531669932883233,
+      0.6239590002223849,
+      0.6102079933043569,
+      0.7399579917546362
+    ],
+    "speech_detection_accuracy": 0,
+    "preroll_injections": 5,
+    "normalization_effectiveness": [
+      "3.0403562",
+      "3.0317385",
+      "2.8889015",
+      "3.5631535",
+      "3.417901"
+    ],
+    "speech_detection_rate": 0.0,
+    "preroll_success_rate": 100.0,
+    "avg_processing_time": 0.6725999934133142
+  },
+  "stt_integration": {
+    "commands_tested": 5,
+    "successful_transcriptions": 0,
+    "transcription_times": [
+      676.7555420228746,
+      472.2296670079231,
+      493.7274160038214,
+      669.8435840080492,
+      616.660999978194
+    ],
+    "accuracy_matches": 0,
+    "fuzzy_matches": 0,
+    "transcription_success_rate": 0.0,
+    "accuracy_rate": 0.0,
+    "fuzzy_match_rate": 0.0,
+    "avg_transcription_time": 585.8434418041725
+  },
+  "end_to_end_latency": {
+    "total_tests": 10,
+    "latency_measurements": [
+      510.3485829895362,
+      534.3127499800175,
+      590.9038749814499,
+      692.3649579985067,
+      448.10700000380166,
+      496.91170899313875,
+      465.91066700057127,
+      449.5384159963578,
+      613.0652920110151,
+      515.7794590049889
+    ],
+    "target_met": 4,
+    "breakdown": {
+      "preprocessing": [
+        1.5825410082470626,
+        1.387084019370377,
+        0.659500015899539,
+        1.3853329874109477,
+        0.8420830126851797,
+        0.748124992242083,
+        0.6940829916857183,
+        0.759749993449077,
+        0.9782079723663628,
+        0.7075000030454248
+      ],
+      "stt": [
+        508.11887500458397,
+        531.8572920223232,
+        589.0508339798544,
+        690.4150420159567,
+        446.9497909885831,
+        495.87616699864157,
+        464.8913750133943,
+        448.4330000123009,
+        611.5005419997033,
+        514.7811250062659
+      ],
+      "command_matching": [
+        0.0899170117918402,
+        0.018291990272700787,
+        0.01433398574590683,
+        0.010166026186197996,
+        0.008834002073854208,
+        0.00825000461190939,
+        0.008292001439258456,
+        0.024208013201132417,
+        0.00837500556372106,
+        0.012208009138703346
+      ]
+    },
+    "avg_total_latency": 531.7242708959384,
+    "avg_preprocessing": 0.9744206996401772,
+    "avg_stt": 530.1874043041607,
+    "avg_matching": 0.02028760500252247,
+    "target_success_rate": 40.0
+  },
+  "system_metrics": {
+    "speech_started_events": 0,
+    "speech_final_events": 0,
+    "false_positives": 0,
+    "avg_processing_time_ms": 1.029881348949857,
+    "max_processing_time_ms": 2.5083330110646784,
+    "speech_active": false,
+    "hangover_frames_remaining": 0
+  },
+  "summary": {
+    "overall_status": "FAIL",
+    "key_metrics": {
+      "preprocessing_time_ms": 0.6725999934133142,
+      "speech_detection_rate_pct": 0.0,
+      "stt_success_rate_pct": 0.0,
+      "end_to_end_latency_ms": 531.7242708959384,
+      "target_success_rate_pct": 40.0
+    },
+    "recommendations": [
+      "Tune VAD thresholds for better speech detection",
+      "Optimize STT configuration for faster response"
+    ],
+    "issues": [
+      "Low speech detection rate",
+      "Low STT success rate",
+      "Latency exceeds target",
+      "Low target success rate"
+    ]
+  }
+}

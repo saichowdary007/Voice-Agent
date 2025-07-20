@@ -132,29 +132,31 @@ class DeepgramSTT:
         try:
             logger.info(f"🔄 Starting Deepgram streaming with model: {DEEPGRAM_STT_MODEL}")
             
-            # Configure live transcription options with enhanced speech boundary detection
+            # Nova-3 optimized configuration for single-word command recognition
             options = LiveOptions(
-                model=DEEPGRAM_STT_MODEL,
+                model="nova-3",  # Force nova-3 for optimal single-word accuracy
+                tier="enhanced",  # Enhanced tier for better accuracy
                 language=DEEPGRAM_STT_LANGUAGE,
                 smart_format=DEEPGRAM_STT_SMART_FORMAT,
                 punctuate=DEEPGRAM_STT_PUNCTUATE,
-                diarize=DEEPGRAM_STT_DIARIZE,
+                diarize=False,  # Disable diarization for single-word commands
                 sample_rate=sample_rate,
                 channels=1,
                 encoding="linear16",
-                # Enhanced settings for better speech boundary detection
-                interim_results=True,
-                endpointing=800,  # Increased from 300ms to 800ms for better speech boundaries
-                utterance_end_ms="1200",  # Increased to 1.2 seconds to prevent cutoffs
-                vad_events=True,
-                # Additional parameters for improved recognition
-                filler_words=DEEPGRAM_STT_FILLER_WORDS,  # Detect "uh", "um" etc.
-                numerals=DEEPGRAM_STT_NUMERALS,  # Convert numbers to digits
-                profanity_filter=False,  # Don't filter profanity for accuracy
-                # Enhanced speech detection parameters
-                no_delay=False,  # Allow slight delay for better accuracy
-                multichannel=False,  # Single channel processing
-                alternatives=1,  # Single best alternative for speed
+                # Nova-3 single-word optimization settings
+                vad_events=True,  # Enable server-side VAD events
+                endpointing=300,  # 300ms for optimal single-word detection
+                utterance_end_ms=700,  # 700ms utterance timeout
+                interim_results=True,  # Enable interim results for faster feedback
+                alternatives=3,  # N-best alternatives for fuzzy matching
+                # Command word boosting with keyterms
+                keywords="yes:1.5,no:1.5,stop:1.5,start:1.5,go:1.5,pause:1.5,play:1.5,next:1.5,back:1.5,up:1.5,down:1.5,left:1.5,right:1.5,ok:1.5,cancel:1.5,help:1.5,menu:1.5,home:1.5",
+                # Additional optimization parameters
+                filler_words=False,  # Disable for command recognition
+                numerals=DEEPGRAM_STT_NUMERALS,
+                profanity_filter=False,  # Don't filter for accuracy
+                no_delay=True,  # Minimize delay for real-time commands
+                multichannel=False,
             )
 
             # Create live transcription connection
@@ -328,7 +330,7 @@ class STT(DeepgramSTT):
 
     async def stream_transcribe_chunk(self, audio_chunk: bytes, is_final: bool = False) -> Optional[str]:
         """
-        Stream transcription compatibility method with optimized processing.
+        Stream transcription compatibility method with enhanced audio validation.
         
         Args:
             audio_chunk: Audio bytes to transcribe
@@ -343,7 +345,7 @@ class STT(DeepgramSTT):
             
         logger.info(f"🎯 Processing final audio chunk: {len(audio_chunk)} bytes")
         
-        # Quick audio validation (optimized for speed)
+        # Enhanced audio validation with speech detection
         try:
             import numpy as np
             # Convert bytes to numpy array for analysis
@@ -353,31 +355,55 @@ class STT(DeepgramSTT):
             
             logger.info(f"🔊 Audio analysis - RMS: {rms_level:.4f}, Max: {max_level:.4f}")
             
-            # Very permissive silence detection - only skip completely silent audio
-            if rms_level < 0.001 and max_level < 0.01:
-                logger.warning("⚠️ Audio appears to be silence, skipping transcription")
+            # Enhanced silence detection - more strict to avoid empty transcripts
+            if rms_level < 0.005 or max_level < 0.02:
+                logger.warning("⚠️ Audio appears to be silence or very quiet, skipping transcription")
                 return None
+            
+            # Check for speech-like characteristics
+            if len(audio_np) >= 1600:  # At least 100ms of audio
+                # Calculate zero crossing rate
+                zero_crossings = np.sum(np.diff(np.sign(audio_np)) != 0)
+                zcr = zero_crossings / len(audio_np)
+                
+                # Check for spectral characteristics
+                # Simple frequency domain check
+                if len(audio_np) >= 512:
+                    fft = np.fft.fft(audio_np[:512])
+                    magnitude = np.abs(fft)
+                    # Check if there's energy in speech frequency range (roughly 85-255 Hz for fundamental)
+                    speech_band_energy = np.sum(magnitude[4:12])  # Rough speech band
+                    total_energy = np.sum(magnitude[1:256])
+                    
+                    if total_energy > 0:
+                        speech_ratio = speech_band_energy / total_energy
+                        logger.debug(f"Speech characteristics - ZCR: {zcr:.3f}, Speech ratio: {speech_ratio:.3f}")
+                        
+                        # If it looks like pure noise or tone, skip
+                        if zcr > 0.5 or speech_ratio < 0.05:
+                            logger.warning("⚠️ Audio doesn't appear to contain speech, skipping transcription")
+                            return None
                 
         except Exception as analysis_e:
             logger.warning(f"Audio analysis failed: {analysis_e}, proceeding with transcription")
         
         # Use optimized transcription with reduced timeout
         try:
-            # Reduced timeout to prevent hanging - 5 seconds max
+            # Reduced timeout to prevent hanging - 3 seconds max for faster response
             transcript = await asyncio.wait_for(
                 self.transcribe_bytes(audio_chunk), 
-                timeout=5.0  # 5 second timeout for faster response
+                timeout=3.0  # 3 second timeout for faster response
             )
             
             if transcript and transcript.strip():
                 logger.info(f"✅ Deepgram transcript: '{transcript}'")
                 return transcript.strip()
             else:
-                logger.warning("⚠️ No transcript returned from Deepgram")
+                logger.info("ℹ️ No speech detected in audio chunk")
                 return None
                 
         except asyncio.TimeoutError:
-            logger.error("❌ Deepgram transcription timed out after 5 seconds")
+            logger.error("❌ Deepgram transcription timed out after 3 seconds")
             return None
         except Exception as e:
             logger.error(f"❌ Deepgram transcription failed: {e}")

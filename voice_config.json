@@ -9,21 +9,25 @@
   },
   "stt": {
     "model": "nova-3",
+    "tier": "enhanced",
     "language": "en-US",
-    "timeout_seconds": 12,
-    "min_audio_length_ms": 300,
-    "silence_timeout_ms": 1200,
-    "sensitivity": "medium",
+    "timeout_seconds": 5,
+    "min_audio_length_ms": 200,
+    "silence_timeout_ms": 700,
+    "sensitivity": "high",
     "smart_format": true,
     "punctuate": true,
     "profanity_filter": false,
     "redact": false,
-    "endpointing": 800,
-    "filler_words": true,
+    "endpointing": 300,
+    "filler_words": false,
     "numerals": true,
     "interim_results": true,
-    "utterance_end_ms": 1200,
-    "vad_events": true
+    "utterance_end_ms": 700,
+    "vad_events": true,
+    "alternatives": 3,
+    "keyterms": "yes:1.5,no:1.5,stop:1.5,start:1.5,go:1.5,pause:1.5,play:1.5,next:1.5,back:1.5,up:1.5,down:1.5,left:1.5,right:1.5,ok:1.5,cancel:1.5,help:1.5,menu:1.5,home:1.5",
+    "no_delay": true
   },
   "llm": {
     "max_tokens": 100,
@@ -41,20 +45,25 @@
   },
   "performance": {
     "ultra_fast_mode": true,
-    "target_latency_ms": 2000,
+    "target_latency_ms": 500,
     "enable_caching": true,
     "parallel_processing": true,
-    "aggressive_optimization": true
+    "aggressive_optimization": true,
+    "preroll_buffer_ms": 200,
+    "max_buffer_size_kb": 256,
+    "frame_timing_optimization": true
   },
   "vad": {
-    "aggressiveness": 1,
+    "aggressiveness": 2,
     "frame_ms": 20,
-    "silence_timeout_ms": 1000,
+    "silence_timeout_ms": 700,
     "speech_threshold": 0.3,
-    "min_speech_frames": 3,
-    "min_silence_frames": 25,
-    "energy_threshold": 500,
+    "min_speech_frames": 2,
+    "min_silence_frames": 10,
+    "energy_threshold": 30,
     "speech_padding_ms": 200,
-    "sensitivity": "medium"
+    "sensitivity": "high",
+    "hangover_frames": 5,
+    "webrtc_mode": 2
   }
 }

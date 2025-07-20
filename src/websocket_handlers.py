@@ -203,7 +203,7 @@ async def handle_audio_chunk(
 
         audio_bytes = base64.b64decode(encoded_audio)
 
-        # Initialize enhanced audio processing state for this websocket
+        # Initialize Nova-3 optimized audio processing state
         if not hasattr(websocket, "_audio_buffer"):
             websocket._audio_buffer = bytearray()
             websocket._is_processing = False
@@ -211,60 +211,74 @@ async def handle_audio_chunk(
             websocket._speech_detected = False
             websocket._silence_start_time = None
             websocket._total_audio_duration = 0
-            # Configure VAD sensitivity from voice config
-            if vad_instance and hasattr(vad_instance, 'configure_sensitivity'):
-                vad_instance.configure_sensitivity("medium")
+            websocket._speech_started_time = None
+            websocket._frame_count = 0
+            # Initialize Nova-3 optimized preprocessor
+            from src.audio_preprocessor import get_audio_preprocessor
+            websocket._preprocessor = get_audio_preprocessor()
+            websocket._preprocessor.configure_for_ultra_fast_mode()
+            logger.info("🚀 Nova-3 audio processing initialized for WebSocket")
 
         # Prevent duplicate processing
         if is_final and websocket._is_processing:
             logger.debug("Skipping duplicate final audio processing")
             return
 
-        # Add audio chunk to buffer
-        websocket._audio_buffer.extend(audio_bytes)
+        # Process audio chunk with Nova-3 optimized preprocessor
+        websocket._frame_count += 1
+        inject_preroll = websocket._speech_detected and not is_final  # Inject pre-roll when speech starts
+        
+        processed_audio, metadata = websocket._preprocessor.preprocess_audio_chunk(
+            audio_bytes, inject_preroll=inject_preroll
+        )
+        
+        # Add processed audio to buffer
+        websocket._audio_buffer.extend(processed_audio)
         
         # Track total audio duration (assuming 16kHz, 16-bit mono)
         chunk_duration_ms = (len(audio_bytes) / 2) / 16000 * 1000
         websocket._total_audio_duration += chunk_duration_ms
         
-        logger.debug(f"Audio chunk: {len(audio_bytes)} bytes, buffer: {len(websocket._audio_buffer)} bytes, "
-                    f"duration: {websocket._total_audio_duration:.1f}ms, is_final: {is_final}")
+        # Update speech detection state from preprocessor
+        current_speech_detected = metadata.get('is_speech', False)
+        confidence = metadata.get('confidence', 0.0)
+        
+        logger.debug(f"Audio chunk: {len(audio_bytes)} bytes, processed: {len(processed_audio)} bytes, "
+                    f"buffer: {len(websocket._audio_buffer)} bytes, duration: {websocket._total_audio_duration:.1f}ms, "
+                    f"speech: {current_speech_detected}, confidence: {confidence:.2f}, is_final: {is_final}")
 
         latency_tracker = get_latency_tracker(websocket)
         
-        # Enhanced speech boundary detection using VAD
-        if len(websocket._audio_buffer) >= 640:  # Minimum for VAD analysis
-            try:
-                # Use enhanced VAD to analyze speech boundaries
-                has_speech, speech_ended, confidence = vad_instance.analyze_speech_boundaries(
-                    bytes(websocket._audio_buffer[-3200:])  # Analyze last 100ms for real-time detection
-                )
+        # Enhanced speech boundary detection using Nova-3 preprocessor
+        if current_speech_detected and not websocket._speech_detected:
+            websocket._speech_detected = True
+            websocket._speech_started_time = time.time()
+            websocket._silence_start_time = None
+            logger.info(f"🎤 Speech started (Nova-3 VAD, confidence: {confidence:.2f})")
+            
+            # Send speech_started event to client
+            await websocket.send_json({
+                "type": "speech_started",
+                "confidence": confidence,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+        
+        elif not current_speech_detected and websocket._speech_detected:
+            if websocket._silence_start_time is None:
+                websocket._silence_start_time = time.time()
+            
+            # Check if we should end speech based on silence duration
+            silence_duration = time.time() - websocket._silence_start_time
+            if silence_duration > 0.7:  # 700ms silence timeout (matching Nova-3 utterance_end_ms)
+                logger.info(f"🔇 Speech ended after {silence_duration:.2f}s silence")
+                is_final = True  # Force final processing
                 
-                if has_speech and not websocket._speech_detected:
-                    websocket._speech_detected = True
-                    websocket._silence_start_time = None
-                    logger.info(f"🎤 Speech detected (confidence: {confidence:.2f})")
-                    
-                    # Send speech detection feedback to client
-                    await websocket.send_json({
-                        "type": "speech_detected",
-                        "confidence": confidence,
-                        "timestamp": datetime.utcnow().isoformat()
-                    })
-                
-                elif not has_speech and websocket._speech_detected:
-                    if websocket._silence_start_time is None:
-                        websocket._silence_start_time = time.time()
-                    
-                    # Check if we should end speech based on silence duration
-                    silence_duration = time.time() - websocket._silence_start_time
-                    if speech_ended or silence_duration > 1.2:  # 1.2 second silence timeout
-                        logger.info(f"🔇 Speech ended after {silence_duration:.2f}s silence")
-                        is_final = True  # Force final processing
-                        
-            except Exception as vad_error:
-                logger.warning(f"VAD analysis failed: {vad_error}")
-                # Continue without VAD analysis
+                # Send speech_final event to client
+                await websocket.send_json({
+                    "type": "speech_final",
+                    "silence_duration_ms": silence_duration * 1000,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
         
         # Process transcription with improved logic
         user_text = None
@@ -356,19 +370,26 @@ async def handle_audio_chunk(
             else:
                 # Send helpful feedback when no speech is detected
                 logger.info("No transcript detected, providing user feedback")
+                
+                # Determine the most likely cause based on audio characteristics
+                feedback_message = "No clear speech detected."
+                if websocket._total_audio_duration < 500:
+                    feedback_message = "Audio too short. Try speaking for at least 1 second."
+                elif not websocket._speech_detected:
+                    feedback_message = "No speech activity detected. Try speaking louder or closer to the microphone."
+                else:
+                    feedback_message = "Speech detected but not clear enough to transcribe. Try speaking more clearly."
+                
                 await websocket.send_json({
                     "type": "stt_result",
                     "transcript": "",
                     "is_final": True,
-                    "message": "No clear speech detected. Try speaking louder or closer to the microphone."
-                })
-                
-                # Send a helpful AI response
-                await websocket.send_json({
-                    "type": "text_response",
-                    "text": "I didn't catch that clearly. Could you please try speaking a bit louder or closer to your microphone?",
-                    "language": "en",
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "message": feedback_message,
+                    "debug_info": {
+                        "audio_duration_ms": websocket._total_audio_duration,
+                        "speech_detected": websocket._speech_detected,
+                        "buffer_size": len(websocket._audio_buffer) if hasattr(websocket, '_audio_buffer') else 0
+                    }
                 })
         elif not is_final:
             # Send periodic feedback for ongoing audio
