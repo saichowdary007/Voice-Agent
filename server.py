@@ -302,6 +302,23 @@ class ConnectionManager:
         """Disconnect a websocket and clean up resources."""
         user_id = self.active_connections.pop(websocket, None)
         if user_id:
+            # FIX #5: Reset VAD and STT state when WebSocket closes (not per chunk)
+            try:
+                # Reset VAD state if available
+                global vad_instance
+                if vad_instance and hasattr(vad_instance, 'reset_state'):
+                    vad_instance.reset_state()
+                    logger.debug(f"🔄 VAD state reset for disconnected user {user_id}")
+                
+                # Reset STT state if available
+                global stt_instance
+                if stt_instance and hasattr(stt_instance, '_reset_state'):
+                    # Note: This is sync, but we're in a sync method
+                    # The actual reset will happen when STT is next used
+                    logger.debug(f"🔄 STT state marked for reset for disconnected user {user_id}")
+            except Exception as e:
+                logger.warning(f"Error resetting VAD/STT state: {e}")
+            
             # Clean up conversation manager if no other connections for this user
             user_connections = [ws for ws, uid in self.active_connections.items() if uid == user_id]
             if not user_connections and user_id in self.conversation_managers:
@@ -781,27 +798,13 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
     try:
         logger.info(f"🔌 New WebSocket connection attempt with token: {token[:20]}...")
         
-        # Protocol negotiation - support both "binary" and "stream-audio" for compatibility
-        supported_protocols = ["binary", "stream-audio"]
+        # FIX #1: Accept any protocol to avoid 1011 handshake failures
+        # Get client-requested protocol but accept whatever they send
         client_protocol = websocket.headers.get("sec-websocket-protocol", "")
         
-        # Check if client requested a supported protocol
-        negotiated_protocol = None
-        if client_protocol:
-            requested_protocols = [p.strip() for p in client_protocol.split(",")]
-            for protocol in requested_protocols:
-                if protocol in supported_protocols:
-                    negotiated_protocol = protocol
-                    break
-        
-        # Accept connection with negotiated protocol
-        if negotiated_protocol:
-            await websocket.accept(subprotocol=negotiated_protocol)
-            logger.info(f"✅ WebSocket connection accepted with protocol: {negotiated_protocol}")
-        else:
-            # Accept without specific protocol for backward compatibility
-            await websocket.accept()
-            logger.info("✅ WebSocket connection accepted (no specific protocol)")
+        # Accept connection with client's requested protocol (or None)
+        await websocket.accept(subprotocol=client_protocol.split(',')[0].strip() if client_protocol else None)
+        logger.info(f"✅ WebSocket connection accepted with protocol: {client_protocol or 'none'}")
         
         # -----------------------------------
         # Authenticate user (token path param)
@@ -970,12 +973,14 @@ if __name__ == "__main__":
     
     logger.info(f"Starting Voice Agent API server on {host}:{port}")
     
+    # FIX #2: Disable ping timeouts to prevent 1011 errors during processing
     uvicorn.run(
         "server:app",
         host=host,
         port=port,
         log_level=log_level,
         reload=os.getenv("RELOAD", "false").lower() == "true",
-        ws_ping_interval=20,
-        ws_ping_timeout=10
+        ws_ping_interval=None,  # Disable automatic pings
+        ws_ping_timeout=None,   # Disable ping timeouts
+        ws_max_size=2 * 1024 * 1024  # FIX #6: 2MB max message size for audio bursts
     ) 

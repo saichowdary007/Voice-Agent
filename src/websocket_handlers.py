@@ -404,9 +404,17 @@ async def handle_audio_chunk(
         # Add processed audio to buffer
         websocket._audio_buffer.extend(processed_audio)
         
-        # Track total audio duration (assuming 16kHz, 16-bit mono)
-        chunk_duration_ms = (len(audio_bytes) / 2) / 16000 * 1000
+        # Get sample rate from message or default to 16kHz
+        sample_rate = message.get("sample_rate", 16000)
+        
+        # Track total audio duration based on actual sample rate
+        chunk_duration_ms = (len(audio_bytes) / 2) / sample_rate * 1000
         websocket._total_audio_duration += chunk_duration_ms
+        
+        # Store sample rate for duration calculations
+        if not hasattr(websocket, "_sample_rate"):
+            websocket._sample_rate = sample_rate
+            logger.info(f"🎵 Audio sample rate detected: {sample_rate}Hz")
         
         # Update speech detection state from preprocessor
         current_speech_detected = metadata.get('is_speech', False)
@@ -466,13 +474,18 @@ async def handle_audio_chunk(
             
             websocket._last_final_time = current_time
             
-            # More intelligent minimum audio length based on speech detection
+            # More intelligent minimum audio length based on speech detection and actual sample rate
+            effective_sample_rate = getattr(websocket, "_sample_rate", 16000)
+            
             if websocket._speech_detected:
                 # If speech was detected, use shorter minimum (200ms)
-                min_speech_bytes = 16000 * 0.2 * 2  # 200ms
+                min_speech_bytes = int(effective_sample_rate * 0.2 * 2)  # 200ms at actual sample rate
             else:
                 # If no speech detected, require longer audio (500ms) to avoid false positives
-                min_speech_bytes = 16000 * 0.5 * 2  # 500ms
+                min_speech_bytes = int(effective_sample_rate * 0.5 * 2)  # 500ms at actual sample rate
+            
+            logger.debug(f"Minimum audio check: buffer={len(websocket._audio_buffer)} bytes, "
+                        f"required={min_speech_bytes} bytes, sample_rate={effective_sample_rate}Hz")
             
             if len(websocket._audio_buffer) < min_speech_bytes:
                 logger.debug(f"Audio buffer too short: {len(websocket._audio_buffer)} < {min_speech_bytes} bytes")
@@ -508,20 +521,15 @@ async def handle_audio_chunk(
             else:
                 logger.info("VAD determined audio should not be processed (likely silence)")
             
-            # Reset state after processing
+            # FIX #5: Reset state after processing but DON'T reset VAD/STT per chunk
             websocket._audio_buffer = bytearray()
             websocket._is_processing = False
             websocket._speech_detected = False
             websocket._silence_start_time = None
             websocket._total_audio_duration = 0
             
-            # Reset VAD state for next speech segment
-            if vad_instance and hasattr(vad_instance, 'reset_state'):
-                vad_instance.reset_state()
-            
-            # Reset STT state to prevent "stuck in silence" issue
-            if hasattr(stt_instance, '_reset_state'):
-                await stt_instance._reset_state()
+            # FIX #5: Remove per-chunk VAD/STT resets to prevent init→silence→reset loop
+            # VAD and STT state should only be reset when WebSocket closes, not per chunk
 
         # Handle final processing results
         if is_final and not websocket._is_processing:
@@ -542,6 +550,8 @@ async def handle_audio_chunk(
                 
                 # Determine the most likely cause based on audio characteristics
                 feedback_message = "No clear speech detected."
+                effective_sample_rate = getattr(websocket, "_sample_rate", 16000)
+                
                 if websocket._total_audio_duration < 500:
                     feedback_message = "Audio too short. Try speaking for at least 1 second."
                 elif not websocket._speech_detected:
@@ -549,16 +559,23 @@ async def handle_audio_chunk(
                 else:
                     feedback_message = "Speech detected but not clear enough to transcribe. Try speaking more clearly."
                 
+                # Add debug information to help troubleshoot
+                debug_info = {
+                    "buffer_bytes": len(websocket._audio_buffer),
+                    "duration_ms": websocket._total_audio_duration,
+                    "sample_rate": effective_sample_rate,
+                    "speech_detected": websocket._speech_detected,
+                    "frame_count": websocket._frame_count
+                }
+                
+                logger.info(f"Audio processing debug: {debug_info}")
+                
                 await websocket.send_json({
                     "type": "stt_result",
                     "transcript": "",
                     "is_final": True,
                     "message": feedback_message,
-                    "debug_info": {
-                        "audio_duration_ms": websocket._total_audio_duration,
-                        "speech_detected": websocket._speech_detected,
-                        "buffer_size": len(websocket._audio_buffer) if hasattr(websocket, '_audio_buffer') else 0
-                    }
+                    "debug_info": debug_info
                 })
         elif not is_final:
             # Send periodic feedback for ongoing audio

@@ -141,7 +141,7 @@ class CommandWordMatcher:
 
 class StreamingAudioProcessor:
     """
-    Streaming ffmpeg processor that maintains persistent ffmpeg process per WebSocket connection.
+    FIX #4: Streaming ffmpeg processor that maintains persistent ffmpeg process per WebSocket connection.
     Addresses the CPU spike issue from spawning new processes for every blob.
     """
     
@@ -169,12 +169,12 @@ class StreamingAudioProcessor:
         logger.info(f"🚀 StreamingAudioProcessor initialized for {sample_rate}Hz")
     
     async def initialize_streaming_ffmpeg(self) -> None:
-        """Initialize persistent ffmpeg process for streaming audio conversion."""
+        """FIX #4: Initialize persistent ffmpeg process for streaming audio conversion."""
         if self.is_initialized and self.ffmpeg_process and self.ffmpeg_process.poll() is None:
             return  # Already initialized and running
         
         try:
-            # ffmpeg command for streaming WebM/Opus to 16kHz mono PCM
+            # FIX #4: Single persistent ffmpeg process for WebM/Opus to 16kHz mono PCM
             ffmpeg_cmd = [
                 'ffmpeg',
                 '-f', 'webm',           # Input format
@@ -184,6 +184,8 @@ class StreamingAudioProcessor:
                 '-ar', str(self.sample_rate),  # Sample rate
                 '-ac', '1',             # Mono channel
                 '-loglevel', 'error',   # Reduce logging
+                '-fflags', '+nobuffer', # FIX #4: Disable buffering for real-time
+                '-flags', 'low_delay',  # FIX #4: Low delay mode
                 'pipe:1'                # Write to stdout
             ]
             
@@ -196,7 +198,7 @@ class StreamingAudioProcessor:
             )
             
             self.is_initialized = True
-            logger.info("✅ Streaming ffmpeg process initialized")
+            logger.info("✅ FIX #4: Persistent streaming ffmpeg process initialized")
             
         except Exception as e:
             logger.error(f"❌ Failed to initialize streaming ffmpeg: {e}")
@@ -204,7 +206,7 @@ class StreamingAudioProcessor:
             raise
     
     async def process_audio_stream(self, audio_chunk: bytes) -> bytes:
-        """Process audio chunk through streaming ffmpeg."""
+        """FIX #4: Process audio chunk through persistent streaming ffmpeg."""
         processing_start = time.perf_counter()
         
         async with self.process_lock:
@@ -217,15 +219,14 @@ class StreamingAudioProcessor:
                 await self.initialize_streaming_ffmpeg()
             
             try:
-                # Write audio chunk to ffmpeg stdin
+                # FIX #4: Stream audio chunk to persistent ffmpeg stdin
                 self.ffmpeg_process.stdin.write(audio_chunk)
                 self.ffmpeg_process.stdin.flush()
                 
-                # Read processed audio from ffmpeg stdout
-                # Use non-blocking read with timeout
+                # FIX #4: Read processed audio from persistent ffmpeg stdout
                 processed_audio = b''
                 start_time = time.perf_counter()
-                timeout = 1.0  # 1 second timeout
+                timeout = 0.5  # Reduced timeout for faster processing
                 
                 while time.perf_counter() - start_time < timeout:
                     if self.ffmpeg_process.stdout.readable():
@@ -255,8 +256,10 @@ class StreamingAudioProcessor:
                     throughput = len(audio_chunk) / (processing_time / 1000)
                     self.performance_metrics['throughput_samples'].append(throughput)
                 
-                # Log performance warning if processing is too slow
-                if processing_time > 100:  # 100ms threshold
+                # Log performance improvement
+                if processing_time < 50:  # Good performance
+                    logger.debug(f"✅ Fast audio processing: {processing_time:.1f}ms for {len(audio_chunk)} bytes")
+                elif processing_time > 100:  # Still slow
                     logger.warning(f"⚠️ Slow audio processing: {processing_time:.1f}ms for {len(audio_chunk)} bytes")
                 
                 return processed_audio
@@ -269,7 +272,7 @@ class StreamingAudioProcessor:
                 return b''
     
     async def cleanup_ffmpeg_process(self) -> None:
-        """Clean up ffmpeg process."""
+        """FIX #4: Clean up persistent ffmpeg process."""
         if self.ffmpeg_process:
             try:
                 self.ffmpeg_process.stdin.close()
@@ -284,7 +287,7 @@ class StreamingAudioProcessor:
                     self.ffmpeg_process.kill()
                     self.ffmpeg_process.wait()
                 
-                logger.info("🧹 ffmpeg process cleaned up")
+                logger.info("🧹 FIX #4: Persistent ffmpeg process cleaned up")
             except Exception as e:
                 logger.error(f"❌ Error cleaning up ffmpeg process: {e}")
             finally:

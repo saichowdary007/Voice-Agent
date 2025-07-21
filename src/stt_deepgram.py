@@ -377,12 +377,16 @@ class STT(DeepgramSTT):
                     
                     if total_energy > 0:
                         speech_ratio = speech_band_energy / total_energy
-                        logger.debug(f"Speech characteristics - ZCR: {zcr:.3f}, Speech ratio: {speech_ratio:.3f}")
+                        logger.info(f"🔍 Speech characteristics - ZCR: {zcr:.3f}, Speech ratio: {speech_ratio:.3f}, Total energy: {total_energy:.3f}")
                         
-                        # If it looks like pure noise or tone, skip
-                        if zcr > 0.5 or speech_ratio < 0.05:
-                            logger.warning("⚠️ Audio doesn't appear to contain speech, skipping transcription")
+                        # If it looks like pure noise or tone, skip (relaxed thresholds)
+                        if zcr > 0.8 or speech_ratio < 0.02:
+                            logger.warning(f"⚠️ Audio rejected - ZCR: {zcr:.3f} > 0.8 or Speech ratio: {speech_ratio:.3f} < 0.02")
                             return None
+                        else:
+                            logger.info(f"✅ Audio passes speech detection - ZCR: {zcr:.3f}, Speech ratio: {speech_ratio:.3f}")
+                    else:
+                        logger.warning("⚠️ No spectral energy detected in audio")
                 
         except Exception as analysis_e:
             logger.warning(f"Audio analysis failed: {analysis_e}, proceeding with transcription")
