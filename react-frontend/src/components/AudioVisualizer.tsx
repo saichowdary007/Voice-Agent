@@ -64,20 +64,59 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
       try {
         console.log('Requesting microphone access...');
         
-        // Request microphone permission with optimized settings for voice
+        // Request microphone with optimal settings (browsers ignore sampleRate)
         const stream = await navigator.mediaDevices.getUserMedia({ 
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: false,  // Disable AGC to prevent audio distortion
-            sampleRate: { ideal: 16000 },  // 16kHz as required by forensic analysis
-            channelCount: { exact: 1 }     // Mono channel as required
+            channelCount: 1          // Mono audio
           } 
         });
         
         console.log('Microphone access granted');
         microphoneRef.current = stream;
         stableMicrophonePermission(true);
+
+        // Create audio context and check sample rate
+        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+        
+        // Resume audio context if it's suspended (required on some browsers)
+        if (audioContext.state === 'suspended') {
+          await audioContext.resume();
+        }
+        
+        audioContextRef.current = audioContext;
+        console.log(`🎵 Audio context sample rate: ${audioContext.sampleRate}Hz`);
+        
+        // Set up audio processing chain with downsampling if needed
+        let finalStream = stream;
+        
+        if (audioContext.sampleRate !== 16000) {
+          try {
+            // Load the downsampler worklet
+            await audioContext.audioWorklet.addModule('/downsampler.js');
+            
+            // Create audio source and downsampler
+            const source = audioContext.createMediaStreamSource(stream);
+            const downsamplerNode = new AudioWorkletNode(audioContext, 'downsampler', {
+              processorOptions: { targetSampleRate: 16000 }
+            });
+            
+            // Create destination for resampled audio
+            const dest = audioContext.createMediaStreamDestination();
+            
+            // Connect: source -> downsampler -> destination
+            source.connect(downsamplerNode);
+            downsamplerNode.connect(dest);
+            
+            finalStream = dest.stream;
+            console.log('✅ Audio downsampler initialized: 48kHz → 16kHz');
+          } catch (error) {
+            console.warn('⚠️ Failed to initialize downsampler, using original stream:', error);
+            finalStream = stream;
+          }
+        }
 
         // Initialize MediaRecorder with correct format as per forensic analysis
         let mediaRecorder: MediaRecorder | null = null;
@@ -87,7 +126,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
             audioBitsPerSecond: 128000, // 128kbps for voice
           };
           
-          mediaRecorder = new MediaRecorder(stream, mediaRecorderOptions);
+          mediaRecorder = new MediaRecorder(finalStream, mediaRecorderOptions);
           console.log('✅ MediaRecorder initialized with:', mediaRecorderOptions);
           
           // Store MediaRecorder globally for potential use
@@ -140,7 +179,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
                   data: base64Audio,
                   is_final: false,
                   format: "webm_opus",
-                  sample_rate: 16000,
+                  sample_rate: audioContext.sampleRate !== 16000 ? 16000 : audioContext.sampleRate, // Use 16kHz if downsampled
                   channels: 1,
                   chunk_size: event.data.size,
                   timestamp: Date.now(),
@@ -180,16 +219,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
           console.warn('⚠️ MediaRecorder not supported, falling back to direct audio processing:', error);
         }
 
-        // Create audio context and analyser
-        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-        
-        // Resume audio context if it's suspended (required on some browsers)
-        if (audioContext.state === 'suspended') {
-          await audioContext.resume();
-        }
-        
-        audioContextRef.current = audioContext;
-        
+        // Create analyser using the existing audio context
         const analyser = audioContext.createAnalyser();
         analyser.fftSize = 256;
         analyser.smoothingTimeConstant = 0.8;
@@ -197,8 +227,8 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         analyser.maxDecibels = -10;
         analyserRef.current = analyser;
 
-        // Create audio processing chain as recommended
-        const source = audioContext.createMediaStreamSource(stream);
+        // Create audio processing chain - use finalStream for analysis too
+        const source = audioContext.createMediaStreamSource(finalStream);
         
         // 1. High-pass filter to kill HVAC rumble (120Hz cutoff)
         const highPassFilter = audioContext.createBiquadFilter();

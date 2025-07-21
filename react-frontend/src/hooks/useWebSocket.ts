@@ -132,9 +132,8 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
         console.log('🔗 Attempting WebSocket connection to:', wsUrl);
         console.log('🎫 Using token:', token.substring(0, 20) + '...');
         
-        // Support both "binary" and "stream-audio" protocols for compatibility
-        const supportedProtocols = ['binary', 'stream-audio'];
-        const newSocket = new WebSocket(wsUrl, supportedProtocols);
+        // FIX #1: Use "binary" protocol to match backend expectations
+        const newSocket = new WebSocket(wsUrl, "binary");
         currentSocket = newSocket;
 
         // Heartbeat timer id

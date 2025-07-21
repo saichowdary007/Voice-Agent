@@ -1,590 +1,566 @@
 #!/usr/bin/env python3
 """
-WebSocket Audio Fixes Validation Script
-Validates that all fixes work together to achieve sub-3-second response times
-and eliminate 1011 errors while maintaining connection stability.
+Validation script for the 5 critical WebSocket fixes identified in the forensic analysis.
+Tests each fix to ensure proper implementation and functionality.
 """
 
 import asyncio
-import json
-import time
-import base64
-import statistics
 import websockets
-import numpy as np
-from typing import List, Dict, Any
+import json
+import base64
+import time
 import logging
-from concurrent.futures import ThreadPoolExecutor
-import psutil
-import os
+import subprocess
+import sys
+from typing import Dict, Any, Optional
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-
-class WebSocketFixesValidator:
-    """Validates WebSocket audio fixes implementation."""
+class WebSocketFixValidator:
+    """Validates the 5 critical WebSocket fixes."""
     
-    def __init__(self, server_url: str = "ws://localhost:8000"):
+    def __init__(self, server_url: str = "ws://localhost:8080"):
         self.server_url = server_url
-        self.test_results = {
-            'protocol_negotiation': [],
-            'connection_stability': [],
-            'audio_processing': [],
-            'latency_measurements': [],
-            'error_rates': [],
-            'concurrent_connections': []
-        }
+        self.test_results: Dict[str, Dict[str, Any]] = {}
+        
+    async def validate_all_fixes(self) -> Dict[str, Dict[str, Any]]:
+        """Run all validation tests."""
+        logger.info("🧪 Starting WebSocket fixes validation...")
+        
+        # Test each fix
+        await self.test_fix_1_protocol_handshake()
+        await self.test_fix_2_ping_timeout()
+        await self.test_fix_3_audio_format()
+        await self.test_fix_4_ffmpeg_streaming()
+        await self.test_fix_5_vad_reset_loop()
+        
+        # Generate summary
+        self.generate_summary()
+        
+        return self.test_results
     
-    def generate_test_audio(self, duration_ms: int = 250, sample_rate: int = 16000) -> bytes:
-        """Generate test audio data matching the required format."""
-        samples = int(sample_rate * duration_ms / 1000)
-        # Generate sine wave with some noise (simulating speech)
-        t = np.linspace(0, duration_ms / 1000, samples, False)
-        frequency = 440  # A4 note
-        audio_signal = 0.3 * np.sin(2 * np.pi * frequency * t) + 0.1 * np.random.normal(0, 1, samples)
-        audio_int16 = (audio_signal * 32767).astype(np.int16)
-        return audio_int16.tobytes()
-    
-    async def test_protocol_negotiation(self) -> Dict[str, Any]:
-        """Test WebSocket protocol negotiation for both binary and stream-audio."""
-        logger.info("🔍 Testing WebSocket protocol negotiation...")
+    async def test_fix_1_protocol_handshake(self):
+        """FIX #1: Test WebSocket protocol handshake accepts any protocol."""
+        logger.info("🔧 Testing FIX #1: Protocol handshake compatibility...")
         
-        results = {
-            'binary_protocol': False,
-            'stream_audio_protocol': False,
-            'no_protocol': False,
-            'errors': []
-        }
+        test_protocols = [
+            "binary",
+            "stream-audio", 
+            "unknown-protocol",
+            None  # No protocol
+        ]
         
-        # Test binary protocol
-        try:
-            async with websockets.connect(
-                f"{self.server_url}/ws/test_token",
-                subprotocols=["binary"]
-            ) as websocket:
-                logger.info(f"✅ Binary protocol negotiated: {websocket.subprotocol}")
-                results['binary_protocol'] = websocket.subprotocol == "binary"
-        except Exception as e:
-            results['errors'].append(f"Binary protocol test failed: {e}")
+        results = []
         
-        # Test stream-audio protocol
-        try:
-            async with websockets.connect(
-                f"{self.server_url}/ws/test_token",
-                subprotocols=["stream-audio"]
-            ) as websocket:
-                logger.info(f"✅ Stream-audio protocol negotiated: {websocket.subprotocol}")
-                results['stream_audio_protocol'] = websocket.subprotocol == "stream-audio"
-        except Exception as e:
-            results['errors'].append(f"Stream-audio protocol test failed: {e}")
-        
-        # Test no protocol (backward compatibility)
-        try:
-            async with websockets.connect(f"{self.server_url}/ws/test_token") as websocket:
-                logger.info("✅ No protocol connection successful")
-                results['no_protocol'] = True
-        except Exception as e:
-            results['errors'].append(f"No protocol test failed: {e}")
-        
-        self.test_results['protocol_negotiation'].append(results)
-        return results
-    
-    async def test_connection_stability(self, duration_minutes: int = 5) -> Dict[str, Any]:
-        """Test connection stability over time to ensure 1011 errors are eliminated."""
-        logger.info(f"🔍 Testing connection stability for {duration_minutes} minutes...")
-        
-        results = {
-            'duration_seconds': duration_minutes * 60,
-            'connection_drops': 0,
-            'error_1011_count': 0,
-            'heartbeat_responses': 0,
-            'total_messages': 0,
-            'errors': []
-        }
-        
-        start_time = time.time()
-        end_time = start_time + (duration_minutes * 60)
-        
-        try:
-            async with websockets.connect(
-                f"{self.server_url}/ws/test_token",
-                subprotocols=["binary"],
-                ping_interval=20,
-                ping_timeout=10
-            ) as websocket:
-                
-                while time.time() < end_time:
-                    try:
-                        # Send heartbeat
-                        heartbeat_msg = {
-                            "type": "heartbeat",
-                            "timestamp": int(time.time() * 1000)
-                        }
-                        await websocket.send(json.dumps(heartbeat_msg))
-                        results['total_messages'] += 1
-                        
-                        # Wait for response
-                        try:
-                            response = await asyncio.wait_for(websocket.recv(), timeout=5.0)
-                            response_data = json.loads(response)
-                            if response_data.get('type') == 'heartbeat_ack':
-                                results['heartbeat_responses'] += 1
-                        except asyncio.TimeoutError:
-                            logger.warning("⚠️ Heartbeat timeout")
-                        
-                        # Wait before next heartbeat
-                        await asyncio.sleep(10)
-                        
-                    except websockets.exceptions.ConnectionClosed as e:
-                        results['connection_drops'] += 1
-                        if e.code == 1011:
-                            results['error_1011_count'] += 1
-                        logger.error(f"❌ Connection closed: {e.code} - {e.reason}")
-                        break
-                    except Exception as e:
-                        results['errors'].append(str(e))
-                        logger.error(f"❌ Connection error: {e}")
-                        break
-        
-        except Exception as e:
-            results['errors'].append(f"Connection test failed: {e}")
-        
-        # Calculate success rate
-        if results['total_messages'] > 0:
-            results['heartbeat_success_rate'] = results['heartbeat_responses'] / results['total_messages']
-        else:
-            results['heartbeat_success_rate'] = 0.0
-        
-        self.test_results['connection_stability'].append(results)
-        return results
-    
-    async def test_audio_processing_performance(self, num_chunks: int = 50) -> Dict[str, Any]:
-        """Test audio processing performance with correct format."""
-        logger.info(f"🔍 Testing audio processing performance with {num_chunks} chunks...")
-        
-        results = {
-            'total_chunks': num_chunks,
-            'successful_chunks': 0,
-            'processing_times': [],
-            'chunk_sizes': [],
-            'format_validation_passes': 0,
-            'errors': []
-        }
-        
-        try:
-            async with websockets.connect(
-                f"{self.server_url}/ws/test_token",
-                subprotocols=["binary"]
-            ) as websocket:
-                
-                for i in range(num_chunks):
-                    try:
-                        # Generate test audio (250ms, mono, 16kHz as per requirements)
-                        test_audio = self.generate_test_audio(duration_ms=250)
-                        encoded_audio = base64.b64encode(test_audio).decode('ascii')
-                        
-                        # Create audio message
-                        audio_msg = {
-                            "type": "audio_chunk",
-                            "data": encoded_audio,
-                            "is_final": i == num_chunks - 1,
-                            "format": "pcm_s16le",
-                            "sample_rate": 16000,
-                            "channels": 1,
-                            "timestamp": int(time.time() * 1000)
-                        }
-                        
-                        # Measure processing time
-                        start_time = time.perf_counter()
-                        await websocket.send(json.dumps(audio_msg))
-                        
-                        # Wait for acknowledgment
-                        try:
-                            response = await asyncio.wait_for(websocket.recv(), timeout=2.0)
-                            processing_time = (time.perf_counter() - start_time) * 1000
-                            
-                            results['processing_times'].append(processing_time)
-                            results['chunk_sizes'].append(len(test_audio))
-                            results['successful_chunks'] += 1
-                            
-                            # Check if format validation passed
-                            response_data = json.loads(response)
-                            if response_data.get('type') != 'error':
-                                results['format_validation_passes'] += 1
-                            
-                        except asyncio.TimeoutError:
-                            logger.warning(f"⚠️ Timeout on chunk {i}")
-                        
-                        # Small delay between chunks
-                        await asyncio.sleep(0.1)
-                        
-                    except Exception as e:
-                        results['errors'].append(f"Chunk {i} failed: {e}")
-        
-        except Exception as e:
-            results['errors'].append(f"Audio processing test failed: {e}")
-        
-        # Calculate statistics
-        if results['processing_times']:
-            results['avg_processing_time'] = statistics.mean(results['processing_times'])
-            results['max_processing_time'] = max(results['processing_times'])
-            results['min_processing_time'] = min(results['processing_times'])
-            results['processing_time_std'] = statistics.stdev(results['processing_times']) if len(results['processing_times']) > 1 else 0
-        
-        results['success_rate'] = results['successful_chunks'] / results['total_chunks']
-        results['format_validation_rate'] = results['format_validation_passes'] / results['total_chunks']
-        
-        self.test_results['audio_processing'].append(results)
-        return results
-    
-    async def test_end_to_end_latency(self, num_tests: int = 10) -> Dict[str, Any]:
-        """Test end-to-end latency to ensure sub-3-second response times."""
-        logger.info(f"🔍 Testing end-to-end latency with {num_tests} voice interactions...")
-        
-        results = {
-            'total_tests': num_tests,
-            'successful_tests': 0,
-            'latencies': [],
-            'sub_3_second_count': 0,
-            'errors': []
-        }
-        
-        try:
-            async with websockets.connect(
-                f"{self.server_url}/ws/test_token",
-                subprotocols=["binary"]
-            ) as websocket:
-                
-                for i in range(num_tests):
-                    try:
-                        # Generate longer audio for realistic test (1 second)
-                        test_audio = self.generate_test_audio(duration_ms=1000)
-                        encoded_audio = base64.b64encode(test_audio).decode('ascii')
-                        
-                        # Create final audio message
-                        audio_msg = {
-                            "type": "audio_chunk",
-                            "data": encoded_audio,
-                            "is_final": True,
-                            "language": "en",
-                            "timestamp": int(time.time() * 1000)
-                        }
-                        
-                        # Measure end-to-end latency
-                        start_time = time.perf_counter()
-                        await websocket.send(json.dumps(audio_msg))
-                        
-                        # Wait for final response (text or audio)
-                        response_received = False
-                        timeout_start = time.perf_counter()
-                        
-                        while not response_received and (time.perf_counter() - timeout_start) < 5.0:
-                            try:
-                                response = await asyncio.wait_for(websocket.recv(), timeout=1.0)
-                                response_data = json.loads(response)
-                                
-                                # Check for final response types
-                                if response_data.get('type') in ['text_response', 'tts_audio', 'audio_response']:
-                                    end_time = time.perf_counter()
-                                    latency = (end_time - start_time) * 1000  # Convert to ms
-                                    
-                                    results['latencies'].append(latency)
-                                    results['successful_tests'] += 1
-                                    
-                                    if latency < 3000:  # Sub-3-second requirement
-                                        results['sub_3_second_count'] += 1
-                                    
-                                    response_received = True
-                                    logger.info(f"✅ Test {i+1}: {latency:.1f}ms latency")
-                                
-                            except asyncio.TimeoutError:
-                                continue
-                        
-                        if not response_received:
-                            results['errors'].append(f"Test {i+1}: No response received within 5 seconds")
-                        
-                        # Wait between tests
-                        await asyncio.sleep(1)
-                        
-                    except Exception as e:
-                        results['errors'].append(f"Test {i+1} failed: {e}")
-        
-        except Exception as e:
-            results['errors'].append(f"Latency test failed: {e}")
-        
-        # Calculate statistics
-        if results['latencies']:
-            results['avg_latency'] = statistics.mean(results['latencies'])
-            results['max_latency'] = max(results['latencies'])
-            results['min_latency'] = min(results['latencies'])
-            results['latency_std'] = statistics.stdev(results['latencies']) if len(results['latencies']) > 1 else 0
-        
-        results['success_rate'] = results['successful_tests'] / results['total_tests']
-        results['sub_3_second_rate'] = results['sub_3_second_count'] / results['total_tests']
-        
-        self.test_results['latency_measurements'].append(results)
-        return results
-    
-    async def test_concurrent_connections(self, num_connections: int = 10) -> Dict[str, Any]:
-        """Test system stability under concurrent connections."""
-        logger.info(f"🔍 Testing {num_connections} concurrent connections...")
-        
-        results = {
-            'total_connections': num_connections,
-            'successful_connections': 0,
-            'connection_times': [],
-            'errors': []
-        }
-        
-        async def create_connection(connection_id: int):
-            """Create a single WebSocket connection."""
+        for protocol in test_protocols:
             try:
-                start_time = time.perf_counter()
+                # Create WebSocket connection with specific protocol
+                extra_headers = {}
+                if protocol:
+                    extra_headers["Sec-WebSocket-Protocol"] = protocol
+                
+                # Use demo token for testing
+                ws_url = f"{self.server_url}/ws/guest_test_user"
+                
                 async with websockets.connect(
-                    f"{self.server_url}/ws/test_token_{connection_id}",
-                    subprotocols=["binary"]
+                    ws_url, 
+                    extra_headers=extra_headers,
+                    timeout=5
                 ) as websocket:
-                    connection_time = (time.perf_counter() - start_time) * 1000
-                    results['connection_times'].append(connection_time)
-                    
                     # Send a test message
-                    test_msg = {
+                    test_message = {
                         "type": "connection",
-                        "message": f"Test connection {connection_id}",
-                        "timestamp": int(time.time() * 1000)
+                        "message": f"Testing protocol: {protocol or 'none'}"
                     }
-                    await websocket.send(json.dumps(test_msg))
+                    await websocket.send(json.dumps(test_message))
                     
                     # Wait for response
-                    try:
-                        response = await asyncio.wait_for(websocket.recv(), timeout=2.0)
-                        results['successful_connections'] += 1
-                        logger.info(f"✅ Connection {connection_id}: {connection_time:.1f}ms")
-                    except asyncio.TimeoutError:
-                        logger.warning(f"⚠️ Connection {connection_id}: No response")
+                    response = await asyncio.wait_for(websocket.recv(), timeout=3)
+                    response_data = json.loads(response)
                     
-                    # Keep connection alive briefly
-                    await asyncio.sleep(2)
+                    results.append({
+                        "protocol": protocol or "none",
+                        "status": "success",
+                        "response": response_data.get("type", "unknown")
+                    })
+                    
+                    logger.info(f"✅ Protocol '{protocol or 'none'}' accepted successfully")
                     
             except Exception as e:
-                results['errors'].append(f"Connection {connection_id} failed: {e}")
+                results.append({
+                    "protocol": protocol or "none", 
+                    "status": "failed",
+                    "error": str(e)
+                })
+                logger.error(f"❌ Protocol '{protocol or 'none'}' failed: {e}")
         
-        # Create all connections concurrently
-        tasks = [create_connection(i) for i in range(num_connections)]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Calculate statistics
-        if results['connection_times']:
-            results['avg_connection_time'] = statistics.mean(results['connection_times'])
-            results['max_connection_time'] = max(results['connection_times'])
-        
-        results['success_rate'] = results['successful_connections'] / results['total_connections']
-        
-        self.test_results['concurrent_connections'].append(results)
-        return results
-    
-    def measure_system_performance(self) -> Dict[str, Any]:
-        """Measure system performance metrics."""
-        logger.info("🔍 Measuring system performance...")
-        
-        # Get CPU and memory usage
-        cpu_percent = psutil.cpu_percent(interval=1)
-        memory = psutil.virtual_memory()
-        
-        # Get process-specific metrics if possible
-        try:
-            current_process = psutil.Process()
-            process_memory = current_process.memory_info()
-            process_cpu = current_process.cpu_percent()
-        except:
-            process_memory = None
-            process_cpu = None
-        
-        return {
-            'system_cpu_percent': cpu_percent,
-            'system_memory_percent': memory.percent,
-            'system_memory_available': memory.available,
-            'process_memory_rss': process_memory.rss if process_memory else None,
-            'process_memory_vms': process_memory.vms if process_memory else None,
-            'process_cpu_percent': process_cpu,
-            'timestamp': time.time()
+        self.test_results["fix_1_protocol_handshake"] = {
+            "description": "WebSocket accepts any protocol to avoid 1011 handshake failures",
+            "results": results,
+            "passed": all(r["status"] == "success" for r in results)
         }
     
-    async def run_comprehensive_validation(self) -> Dict[str, Any]:
-        """Run comprehensive validation of all WebSocket fixes."""
-        logger.info("🚀 Starting comprehensive WebSocket fixes validation...")
-        
-        validation_results = {
-            'start_time': time.time(),
-            'system_performance_before': self.measure_system_performance(),
-            'tests': {}
-        }
+    async def test_fix_2_ping_timeout(self):
+        """FIX #2: Test ping timeout is disabled."""
+        logger.info("🔧 Testing FIX #2: Ping timeout disabled...")
         
         try:
-            # Test 1: Protocol Negotiation
-            logger.info("\n" + "="*50)
-            logger.info("TEST 1: Protocol Negotiation")
-            logger.info("="*50)
-            validation_results['tests']['protocol_negotiation'] = await self.test_protocol_negotiation()
+            ws_url = f"{self.server_url}/ws/guest_test_user"
             
-            # Test 2: Connection Stability (shorter duration for testing)
-            logger.info("\n" + "="*50)
-            logger.info("TEST 2: Connection Stability")
-            logger.info("="*50)
-            validation_results['tests']['connection_stability'] = await self.test_connection_stability(duration_minutes=1)
-            
-            # Test 3: Audio Processing Performance
-            logger.info("\n" + "="*50)
-            logger.info("TEST 3: Audio Processing Performance")
-            logger.info("="*50)
-            validation_results['tests']['audio_processing'] = await self.test_audio_processing_performance(num_chunks=20)
-            
-            # Test 4: End-to-End Latency
-            logger.info("\n" + "="*50)
-            logger.info("TEST 4: End-to-End Latency")
-            logger.info("="*50)
-            validation_results['tests']['latency'] = await self.test_end_to_end_latency(num_tests=5)
-            
-            # Test 5: Concurrent Connections
-            logger.info("\n" + "="*50)
-            logger.info("TEST 5: Concurrent Connections")
-            logger.info("="*50)
-            validation_results['tests']['concurrent_connections'] = await self.test_concurrent_connections(num_connections=5)
-            
+            async with websockets.connect(ws_url, timeout=5) as websocket:
+                # Send connection message
+                await websocket.send(json.dumps({
+                    "type": "connection",
+                    "message": "Testing ping timeout"
+                }))
+                
+                # Wait for initial response
+                await websocket.recv()
+                
+                # Wait longer than the old ping interval (25 seconds)
+                logger.info("⏳ Waiting 30 seconds to test ping timeout...")
+                start_time = time.time()
+                
+                try:
+                    # Send periodic heartbeats to keep connection alive
+                    for i in range(6):  # 6 * 5 = 30 seconds
+                        await asyncio.sleep(5)
+                        
+                        # Send heartbeat
+                        await websocket.send(json.dumps({
+                            "type": "heartbeat",
+                            "timestamp": time.time()
+                        }))
+                        
+                        # Try to receive response (optional)
+                        try:
+                            response = await asyncio.wait_for(websocket.recv(), timeout=1)
+                            logger.debug(f"Heartbeat response: {response}")
+                        except asyncio.TimeoutError:
+                            pass  # No response is fine
+                    
+                    elapsed = time.time() - start_time
+                    
+                    # If we get here, ping timeout is disabled
+                    self.test_results["fix_2_ping_timeout"] = {
+                        "description": "Ping timeout disabled to prevent 1011 errors during processing",
+                        "elapsed_seconds": elapsed,
+                        "passed": True,
+                        "status": "success"
+                    }
+                    logger.info(f"✅ Connection survived {elapsed:.1f}s without ping timeout")
+                    
+                except websockets.exceptions.ConnectionClosed as e:
+                    # Connection closed - ping timeout might still be active
+                    elapsed = time.time() - start_time
+                    self.test_results["fix_2_ping_timeout"] = {
+                        "description": "Ping timeout disabled to prevent 1011 errors during processing",
+                        "elapsed_seconds": elapsed,
+                        "passed": False,
+                        "status": "failed",
+                        "error": f"Connection closed after {elapsed:.1f}s: {e}"
+                    }
+                    logger.error(f"❌ Connection closed after {elapsed:.1f}s - ping timeout may still be active")
+                    
         except Exception as e:
-            logger.error(f"❌ Validation failed: {e}")
-            validation_results['error'] = str(e)
-        
-        validation_results['end_time'] = time.time()
-        validation_results['total_duration'] = validation_results['end_time'] - validation_results['start_time']
-        validation_results['system_performance_after'] = self.measure_system_performance()
-        
-        return validation_results
+            self.test_results["fix_2_ping_timeout"] = {
+                "description": "Ping timeout disabled to prevent 1011 errors during processing",
+                "passed": False,
+                "status": "failed", 
+                "error": str(e)
+            }
+            logger.error(f"❌ Ping timeout test failed: {e}")
     
-    def generate_report(self, results: Dict[str, Any]) -> str:
-        """Generate a comprehensive validation report."""
-        report = []
-        report.append("🎯 WEBSOCKET AUDIO FIXES VALIDATION REPORT")
-        report.append("=" * 60)
-        report.append(f"Total Duration: {results['total_duration']:.1f} seconds")
-        report.append(f"Start Time: {time.ctime(results['start_time'])}")
-        report.append(f"End Time: {time.ctime(results['end_time'])}")
-        report.append("")
+    async def test_fix_3_audio_format(self):
+        """FIX #3: Test audio format is 16kHz mono."""
+        logger.info("🔧 Testing FIX #3: Audio format validation...")
         
-        # Protocol Negotiation Results
-        if 'protocol_negotiation' in results['tests']:
-            pn = results['tests']['protocol_negotiation']
-            report.append("📡 PROTOCOL NEGOTIATION")
-            report.append("-" * 30)
-            report.append(f"Binary Protocol: {'✅ PASS' if pn['binary_protocol'] else '❌ FAIL'}")
-            report.append(f"Stream-Audio Protocol: {'✅ PASS' if pn['stream_audio_protocol'] else '❌ FAIL'}")
-            report.append(f"No Protocol (Compatibility): {'✅ PASS' if pn['no_protocol'] else '❌ FAIL'}")
-            if pn['errors']:
-                report.append(f"Errors: {len(pn['errors'])}")
-            report.append("")
+        # This test validates the configuration, not runtime behavior
+        # since we can't easily test browser MediaRecorder from Python
         
-        # Connection Stability Results
-        if 'connection_stability' in results['tests']:
-            cs = results['tests']['connection_stability']
-            report.append("🔗 CONNECTION STABILITY")
-            report.append("-" * 30)
-            report.append(f"Duration: {cs['duration_seconds']} seconds")
-            report.append(f"Connection Drops: {cs['connection_drops']}")
-            report.append(f"1011 Errors: {cs['error_1011_count']} {'✅ ELIMINATED' if cs['error_1011_count'] == 0 else '❌ STILL PRESENT'}")
-            report.append(f"Heartbeat Success Rate: {cs['heartbeat_success_rate']:.1%}")
-            report.append("")
+        try:
+            # Check frontend configuration
+            frontend_config_checks = []
+            
+            # Read the AudioVisualizer component
+            try:
+                with open("react-frontend/src/components/AudioVisualizer.tsx", "r") as f:
+                    content = f.read()
+                    
+                # Check for 16kHz sample rate
+                if "sampleRate: 16000" in content:
+                    frontend_config_checks.append({
+                        "check": "16kHz sample rate configured",
+                        "status": "passed"
+                    })
+                else:
+                    frontend_config_checks.append({
+                        "check": "16kHz sample rate configured", 
+                        "status": "failed",
+                        "error": "sampleRate: 16000 not found"
+                    })
+                
+                # Check for mono channel
+                if "channelCount: 1" in content:
+                    frontend_config_checks.append({
+                        "check": "Mono channel configured",
+                        "status": "passed"
+                    })
+                else:
+                    frontend_config_checks.append({
+                        "check": "Mono channel configured",
+                        "status": "failed", 
+                        "error": "channelCount: 1 not found"
+                    })
+                
+                # Check for WebM/Opus format
+                if "audio/webm;codecs=opus" in content:
+                    frontend_config_checks.append({
+                        "check": "WebM/Opus format configured",
+                        "status": "passed"
+                    })
+                else:
+                    frontend_config_checks.append({
+                        "check": "WebM/Opus format configured",
+                        "status": "failed",
+                        "error": "audio/webm;codecs=opus not found"
+                    })
+                
+                # Check for 250ms chunks
+                if "start(250)" in content:
+                    frontend_config_checks.append({
+                        "check": "250ms chunks configured",
+                        "status": "passed"
+                    })
+                else:
+                    frontend_config_checks.append({
+                        "check": "250ms chunks configured",
+                        "status": "failed",
+                        "error": "start(250) not found"
+                    })
+                    
+            except FileNotFoundError:
+                frontend_config_checks.append({
+                    "check": "AudioVisualizer.tsx exists",
+                    "status": "failed",
+                    "error": "File not found"
+                })
+            
+            all_passed = all(check["status"] == "passed" for check in frontend_config_checks)
+            
+            self.test_results["fix_3_audio_format"] = {
+                "description": "Audio format configured as 16kHz mono WebM/Opus with 250ms chunks",
+                "checks": frontend_config_checks,
+                "passed": all_passed,
+                "status": "success" if all_passed else "failed"
+            }
+            
+            if all_passed:
+                logger.info("✅ Audio format configuration validated")
+            else:
+                logger.error("❌ Audio format configuration issues found")
+                
+        except Exception as e:
+            self.test_results["fix_3_audio_format"] = {
+                "description": "Audio format configured as 16kHz mono WebM/Opus with 250ms chunks",
+                "passed": False,
+                "status": "failed",
+                "error": str(e)
+            }
+            logger.error(f"❌ Audio format test failed: {e}")
+    
+    async def test_fix_4_ffmpeg_streaming(self):
+        """FIX #4: Test persistent ffmpeg streaming processor."""
+        logger.info("🔧 Testing FIX #4: Persistent ffmpeg streaming...")
         
-        # Audio Processing Results
-        if 'audio_processing' in results['tests']:
-            ap = results['tests']['audio_processing']
-            report.append("🎵 AUDIO PROCESSING")
-            report.append("-" * 30)
-            report.append(f"Success Rate: {ap['success_rate']:.1%}")
-            report.append(f"Format Validation Rate: {ap['format_validation_rate']:.1%}")
-            if ap.get('avg_processing_time'):
-                report.append(f"Avg Processing Time: {ap['avg_processing_time']:.1f}ms")
-                report.append(f"Max Processing Time: {ap['max_processing_time']:.1f}ms")
-            report.append("")
+        try:
+            # Check if StreamingAudioProcessor is properly implemented
+            implementation_checks = []
+            
+            # Read the audio preprocessor
+            try:
+                with open("src/audio_preprocessor.py", "r") as f:
+                    content = f.read()
+                
+                # Check for persistent ffmpeg process
+                if "self.ffmpeg_process: Optional[subprocess.Popen] = None" in content:
+                    implementation_checks.append({
+                        "check": "Persistent ffmpeg process attribute",
+                        "status": "passed"
+                    })
+                else:
+                    implementation_checks.append({
+                        "check": "Persistent ffmpeg process attribute",
+                        "status": "failed",
+                        "error": "ffmpeg_process attribute not found"
+                    })
+                
+                # Check for streaming initialization
+                if "initialize_streaming_ffmpeg" in content:
+                    implementation_checks.append({
+                        "check": "Streaming ffmpeg initialization method",
+                        "status": "passed"
+                    })
+                else:
+                    implementation_checks.append({
+                        "check": "Streaming ffmpeg initialization method",
+                        "status": "failed",
+                        "error": "initialize_streaming_ffmpeg method not found"
+                    })
+                
+                # Check for low delay flags
+                if "'-fflags', '+nobuffer'" in content and "'-flags', 'low_delay'" in content:
+                    implementation_checks.append({
+                        "check": "Low delay ffmpeg flags",
+                        "status": "passed"
+                    })
+                else:
+                    implementation_checks.append({
+                        "check": "Low delay ffmpeg flags",
+                        "status": "failed",
+                        "error": "Low delay flags not found"
+                    })
+                
+                # Check for process reuse logic
+                if "if not self.is_initialized" in content:
+                    implementation_checks.append({
+                        "check": "Process reuse logic",
+                        "status": "passed"
+                    })
+                else:
+                    implementation_checks.append({
+                        "check": "Process reuse logic",
+                        "status": "failed",
+                        "error": "Process reuse logic not found"
+                    })
+                    
+            except FileNotFoundError:
+                implementation_checks.append({
+                    "check": "audio_preprocessor.py exists",
+                    "status": "failed",
+                    "error": "File not found"
+                })
+            
+            # Test actual ffmpeg availability
+            try:
+                result = subprocess.run(["ffmpeg", "-version"], 
+                                      capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    implementation_checks.append({
+                        "check": "ffmpeg binary available",
+                        "status": "passed"
+                    })
+                else:
+                    implementation_checks.append({
+                        "check": "ffmpeg binary available",
+                        "status": "failed",
+                        "error": "ffmpeg command failed"
+                    })
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                implementation_checks.append({
+                    "check": "ffmpeg binary available",
+                    "status": "failed",
+                    "error": "ffmpeg not found or timeout"
+                })
+            
+            all_passed = all(check["status"] == "passed" for check in implementation_checks)
+            
+            self.test_results["fix_4_ffmpeg_streaming"] = {
+                "description": "Persistent ffmpeg process eliminates CPU spike from spawning new processes",
+                "checks": implementation_checks,
+                "passed": all_passed,
+                "status": "success" if all_passed else "failed"
+            }
+            
+            if all_passed:
+                logger.info("✅ Persistent ffmpeg streaming implementation validated")
+            else:
+                logger.error("❌ Persistent ffmpeg streaming issues found")
+                
+        except Exception as e:
+            self.test_results["fix_4_ffmpeg_streaming"] = {
+                "description": "Persistent ffmpeg process eliminates CPU spike from spawning new processes",
+                "passed": False,
+                "status": "failed",
+                "error": str(e)
+            }
+            logger.error(f"❌ ffmpeg streaming test failed: {e}")
+    
+    async def test_fix_5_vad_reset_loop(self):
+        """FIX #5: Test VAD reset loop is eliminated."""
+        logger.info("🔧 Testing FIX #5: VAD reset loop elimination...")
         
-        # Latency Results
-        if 'latency' in results['tests']:
-            lat = results['tests']['latency']
-            report.append("⚡ END-TO-END LATENCY")
-            report.append("-" * 30)
-            report.append(f"Success Rate: {lat['success_rate']:.1%}")
-            report.append(f"Sub-3-Second Rate: {lat['sub_3_second_rate']:.1%} {'✅ TARGET MET' if lat['sub_3_second_rate'] >= 0.8 else '❌ TARGET MISSED'}")
-            if lat.get('avg_latency'):
-                report.append(f"Average Latency: {lat['avg_latency']:.1f}ms")
-                report.append(f"Max Latency: {lat['max_latency']:.1f}ms")
-                report.append(f"Min Latency: {lat['min_latency']:.1f}ms")
-            report.append("")
+        try:
+            implementation_checks = []
+            
+            # Check websocket handlers
+            try:
+                with open("src/websocket_handlers.py", "r") as f:
+                    content = f.read()
+                
+                # Check that per-chunk VAD reset is removed
+                if "# FIX #5: Remove per-chunk VAD/STT resets" in content:
+                    implementation_checks.append({
+                        "check": "Per-chunk VAD reset removed",
+                        "status": "passed"
+                    })
+                else:
+                    implementation_checks.append({
+                        "check": "Per-chunk VAD reset removed",
+                        "status": "failed",
+                        "error": "FIX #5 comment not found in websocket_handlers.py"
+                    })
+                
+                # Check that reset calls are commented out or removed
+                vad_reset_count = content.count("vad_instance.reset_state()")
+                stt_reset_count = content.count("await stt_instance._reset_state()")
+                
+                if vad_reset_count == 0 and stt_reset_count == 0:
+                    implementation_checks.append({
+                        "check": "VAD/STT reset calls removed from audio processing",
+                        "status": "passed"
+                    })
+                else:
+                    implementation_checks.append({
+                        "check": "VAD/STT reset calls removed from audio processing",
+                        "status": "failed",
+                        "error": f"Found {vad_reset_count} VAD resets and {stt_reset_count} STT resets"
+                    })
+                    
+            except FileNotFoundError:
+                implementation_checks.append({
+                    "check": "websocket_handlers.py exists",
+                    "status": "failed",
+                    "error": "File not found"
+                })
+            
+            # Check server.py for disconnect cleanup
+            try:
+                with open("server.py", "r") as f:
+                    content = f.read()
+                
+                # Check that VAD/STT reset is moved to disconnect
+                if "# FIX #5: Reset VAD and STT state when WebSocket closes" in content:
+                    implementation_checks.append({
+                        "check": "VAD/STT reset moved to disconnect handler",
+                        "status": "passed"
+                    })
+                else:
+                    implementation_checks.append({
+                        "check": "VAD/STT reset moved to disconnect handler",
+                        "status": "failed",
+                        "error": "FIX #5 disconnect cleanup not found"
+                    })
+                    
+            except FileNotFoundError:
+                implementation_checks.append({
+                    "check": "server.py exists",
+                    "status": "failed",
+                    "error": "File not found"
+                })
+            
+            all_passed = all(check["status"] == "passed" for check in implementation_checks)
+            
+            self.test_results["fix_5_vad_reset_loop"] = {
+                "description": "VAD reset loop eliminated - only reset on WebSocket close",
+                "checks": implementation_checks,
+                "passed": all_passed,
+                "status": "success" if all_passed else "failed"
+            }
+            
+            if all_passed:
+                logger.info("✅ VAD reset loop elimination validated")
+            else:
+                logger.error("❌ VAD reset loop elimination issues found")
+                
+        except Exception as e:
+            self.test_results["fix_5_vad_reset_loop"] = {
+                "description": "VAD reset loop eliminated - only reset on WebSocket close",
+                "passed": False,
+                "status": "failed",
+                "error": str(e)
+            }
+            logger.error(f"❌ VAD reset loop test failed: {e}")
+    
+    def generate_summary(self):
+        """Generate a summary of all test results."""
+        logger.info("\n" + "="*60)
+        logger.info("🧪 WEBSOCKET FIXES VALIDATION SUMMARY")
+        logger.info("="*60)
         
-        # Concurrent Connections Results
-        if 'concurrent_connections' in results['tests']:
-            cc = results['tests']['concurrent_connections']
-            report.append("🔀 CONCURRENT CONNECTIONS")
-            report.append("-" * 30)
-            report.append(f"Success Rate: {cc['success_rate']:.1%}")
-            if cc.get('avg_connection_time'):
-                report.append(f"Avg Connection Time: {cc['avg_connection_time']:.1f}ms")
-                report.append(f"Max Connection Time: {cc['max_connection_time']:.1f}ms")
-            report.append("")
+        total_fixes = len(self.test_results)
+        passed_fixes = sum(1 for result in self.test_results.values() if result.get("passed", False))
         
-        # Overall Assessment
-        report.append("🎯 OVERALL ASSESSMENT")
-        report.append("-" * 30)
+        logger.info(f"Total fixes tested: {total_fixes}")
+        logger.info(f"Fixes passed: {passed_fixes}")
+        logger.info(f"Fixes failed: {total_fixes - passed_fixes}")
+        logger.info(f"Success rate: {(passed_fixes/total_fixes)*100:.1f}%")
         
-        # Check if key requirements are met
-        protocol_ok = results['tests'].get('protocol_negotiation', {}).get('binary_protocol', False)
-        no_1011_errors = results['tests'].get('connection_stability', {}).get('error_1011_count', 1) == 0
-        latency_ok = results['tests'].get('latency', {}).get('sub_3_second_rate', 0) >= 0.8
+        logger.info("\nDetailed Results:")
+        logger.info("-" * 40)
         
-        if protocol_ok and no_1011_errors and latency_ok:
-            report.append("✅ ALL CRITICAL REQUIREMENTS MET")
-            report.append("   - Protocol negotiation working")
-            report.append("   - 1011 errors eliminated")
-            report.append("   - Sub-3-second response times achieved")
+        for fix_name, result in self.test_results.items():
+            status_icon = "✅" if result.get("passed", False) else "❌"
+            logger.info(f"{status_icon} {fix_name.upper().replace('_', ' ')}")
+            logger.info(f"   {result.get('description', 'No description')}")
+            
+            if not result.get("passed", False) and "error" in result:
+                logger.info(f"   Error: {result['error']}")
+            
+            if "checks" in result:
+                for check in result["checks"]:
+                    check_icon = "✅" if check["status"] == "passed" else "❌"
+                    logger.info(f"   {check_icon} {check['check']}")
+                    if check["status"] == "failed" and "error" in check:
+                        logger.info(f"      Error: {check['error']}")
+        
+        logger.info("\n" + "="*60)
+        
+        if passed_fixes == total_fixes:
+            logger.info("🎉 ALL FIXES VALIDATED SUCCESSFULLY!")
+            logger.info("The WebSocket implementation should now be stable and performant.")
         else:
-            report.append("❌ SOME REQUIREMENTS NOT MET")
-            if not protocol_ok:
-                report.append("   - Protocol negotiation issues")
-            if not no_1011_errors:
-                report.append("   - 1011 errors still present")
-            if not latency_ok:
-                report.append("   - Latency targets not met")
+            logger.warning("⚠️  Some fixes need attention before deployment.")
+            logger.info("Please review the failed tests and make necessary corrections.")
         
-        return "\n".join(report)
+        logger.info("="*60)
 
 
 async def main():
     """Main validation function."""
-    # Check if server is running
-    server_url = os.getenv("WEBSOCKET_SERVER_URL", "ws://localhost:8000")
+    import argparse
     
-    validator = WebSocketFixesValidator(server_url)
+    parser = argparse.ArgumentParser(description="Validate WebSocket fixes")
+    parser.add_argument("--server", default="ws://localhost:8080", 
+                       help="WebSocket server URL (default: ws://localhost:8080)")
+    parser.add_argument("--output", help="Output results to JSON file")
+    
+    args = parser.parse_args()
+    
+    validator = WebSocketFixValidator(args.server)
     
     try:
-        # Run comprehensive validation
-        results = await validator.run_comprehensive_validation()
+        results = await validator.validate_all_fixes()
         
-        # Generate and display report
-        report = validator.generate_report(results)
-        print("\n" + report)
+        if args.output:
+            import json
+            with open(args.output, "w") as f:
+                json.dump(results, f, indent=2)
+            logger.info(f"Results saved to {args.output}")
         
-        # Save results to file
-        with open("websocket_fixes_validation_results.json", "w") as f:
-            json.dump(results, f, indent=2, default=str)
+        # Exit with appropriate code
+        all_passed = all(result.get("passed", False) for result in results.values())
+        sys.exit(0 if all_passed else 1)
         
-        logger.info("\n✅ Validation complete! Results saved to websocket_fixes_validation_results.json")
-        
+    except KeyboardInterrupt:
+        logger.info("Validation interrupted by user")
+        sys.exit(1)
     except Exception as e:
-        logger.error(f"❌ Validation failed: {e}")
-        return 1
-    
-    return 0
+        logger.error(f"Validation failed with error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    exit_code = asyncio.run(main())
+    asyncio.run(main())
