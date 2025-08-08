@@ -267,6 +267,17 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
               playAudioResponse(message.data, mime);
             }
             
+            // Surface STT feedback to console for diagnostics
+            if (message.type === 'stt_result') {
+              if (message.transcript && message.transcript.trim().length > 0) {
+                console.log(`🗣️ Final transcript: "${message.transcript}"`);
+              } else if ((message as any).message) {
+                // Backend may include helpful feedback + debug_info
+                const dbg = (message as any).debug_info;
+                console.warn('🛈 STT feedback:', (message as any).message, dbg ? { debug_info: dbg } : undefined);
+              }
+            }
+            
             setLastMessage(message);
             onMessage?.(message);
           } catch (err) {

@@ -355,8 +355,8 @@ class STT(DeepgramSTT):
             
             logger.info(f"🔊 Audio analysis - RMS: {rms_level:.4f}, Max: {max_level:.4f}")
             
-            # Enhanced silence detection - more strict to avoid empty transcripts
-            if rms_level < 0.005 or max_level < 0.02:
+            # Enhanced silence detection - slightly relaxed to accept quieter speech
+            if rms_level < 0.003 or max_level < 0.015:
                 logger.warning("⚠️ Audio appears to be silence or very quiet, skipping transcription")
                 return None
             
@@ -379,9 +379,9 @@ class STT(DeepgramSTT):
                         speech_ratio = speech_band_energy / total_energy
                         logger.info(f"🔍 Speech characteristics - ZCR: {zcr:.3f}, Speech ratio: {speech_ratio:.3f}, Total energy: {total_energy:.3f}")
                         
-                        # If it looks like pure noise or tone, skip (relaxed thresholds)
-                        if zcr > 0.8 or speech_ratio < 0.02:
-                            logger.warning(f"⚠️ Audio rejected - ZCR: {zcr:.3f} > 0.8 or Speech ratio: {speech_ratio:.3f} < 0.02")
+                        # If it looks like pure noise or tone, skip (slightly more permissive)
+                        if zcr > 0.9 or speech_ratio < 0.015:
+                            logger.warning(f"⚠️ Audio rejected - ZCR: {zcr:.3f} > 0.9 or Speech ratio: {speech_ratio:.3f} < 0.015")
                             return None
                         else:
                             logger.info(f"✅ Audio passes speech detection - ZCR: {zcr:.3f}, Speech ratio: {speech_ratio:.3f}")
