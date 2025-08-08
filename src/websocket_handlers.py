@@ -407,8 +407,9 @@ async def handle_audio_chunk(
         # Get sample rate from message or default to 16kHz
         sample_rate = message.get("sample_rate", 16000)
         
-        # Track total audio duration based on actual sample rate
-        chunk_duration_ms = (len(audio_bytes) / 2) / sample_rate * 1000
+        # Track total audio duration based on actual sample rate using processed PCM bytes
+        # Use processed_audio length to avoid miscalculations if input was compressed
+        chunk_duration_ms = (len(processed_audio) / 2) / sample_rate * 1000
         websocket._total_audio_duration += chunk_duration_ms
         
         # Store sample rate for duration calculations
@@ -491,9 +492,7 @@ async def handle_audio_chunk(
             if len(websocket._audio_buffer) < min_speech_bytes:
                 logger.debug(f"Audio buffer too short: {len(websocket._audio_buffer)} < {min_speech_bytes} bytes")
                 websocket._is_processing = False
-                # Reset speech detection state
-                websocket._speech_detected = False
-                websocket._silence_start_time = None
+                # Defer any state resets until after sending feedback to avoid duplicate speech_started events
                 # Don't return; allow final handling to send user feedback
                 too_short_audio = True
             
@@ -557,8 +556,8 @@ async def handle_audio_chunk(
                 feedback_message = "No clear speech detected."
                 effective_sample_rate = pre_reset_sample_rate
                 
-                if pre_reset_duration_ms < 300:
-                    feedback_message = "Audio too short. Try speaking for at least 1 second."
+                if pre_reset_duration_ms < 500:
+                    feedback_message = "Audio too short. Try speaking for at least half a second."
                 elif not pre_reset_speech_detected:
                     feedback_message = "No speech activity detected. Try speaking louder or closer to the microphone."
                 else:
@@ -589,6 +588,9 @@ async def handle_audio_chunk(
             websocket._speech_detected = False
             websocket._silence_start_time = None
             websocket._total_audio_duration = 0
+            # Reset additional counters for next utterance
+            websocket._frame_count = 0
+            websocket._speech_started_time = None
         elif not is_final:
             # Send periodic feedback for ongoing audio
             if len(websocket._audio_buffer) % 8192 == 0:  # Every ~0.5 seconds

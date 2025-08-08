@@ -1,6 +1,10 @@
 import React, { useEffect, useRef, useCallback } from 'react';
 import * as THREE from 'three';
 
+// Feature flag to control MediaRecorder-based streaming (WebM/Opus)
+// Backend expects 16kHz PCM; keep this false to use the PCM pipeline only.
+const USE_MEDIA_RECORDER_STREAMING = false;
+
 interface AudioVisualizerProps {
   /**
    * When true the audio element (if it exists) will be muted.
@@ -156,6 +160,10 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
 
           // Set up MediaRecorder event handlers
           mediaRecorder.ondataavailable = (event) => {
+            // Guard: disable MediaRecorder streaming to avoid duplicate streams and encoding mismatch
+            if (!USE_MEDIA_RECORDER_STREAMING) {
+              return;
+            }
             if (event.data.size > 0) {
               console.log(`📦 MediaRecorder chunk: ${event.data.size} bytes`);
               
