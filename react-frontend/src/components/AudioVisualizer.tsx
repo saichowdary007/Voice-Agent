@@ -1,8 +1,7 @@
 import React, { useEffect, useRef, useCallback } from 'react';
 import * as THREE from 'three';
 
-// Feature flag to control MediaRecorder-based streaming (WebM/Opus)
-// Backend expects 16kHz PCM; keep this false to use the PCM pipeline only.
+// Feature flag: when false, use PCM16 streaming (recommended for Deepgram Agent)
 const USE_MEDIA_RECORDER_STREAMING = false;
 
 interface AudioVisualizerProps {
@@ -40,6 +39,8 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
   const analyserRef = useRef<AnalyserNode | null>(null);
   const microphoneRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const opusStreamingActiveRef = useRef<boolean>(false);
+  const finalizeNextOpusChunkRef = useRef<boolean>(false);
   const initializedRef = useRef(false);
   const cleanupRef = useRef<(() => void) | null>(null);
 
@@ -122,109 +123,66 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
           }
         }
 
-        // Initialize MediaRecorder with correct format as per forensic analysis
-        let mediaRecorder: MediaRecorder | null = null;
-        try {
-          const mediaRecorderOptions = {
-            mimeType: "audio/webm;codecs=opus",
-            audioBitsPerSecond: 128000, // 128kbps for voice
-          };
-          
-          mediaRecorder = new MediaRecorder(finalStream, mediaRecorderOptions);
-          console.log('✅ MediaRecorder initialized with:', mediaRecorderOptions);
-          
-          // Store MediaRecorder globally for potential use
-          (window as any).voiceAgentMediaRecorder = mediaRecorder;
-          
-          // Audio format validation utility
-          const validateAudioFormat = (blob: Blob): { isValid: boolean; error?: string } => {
-            // Check MIME type
-            if (!blob.type.includes('webm') || !blob.type.includes('opus')) {
-              return { isValid: false, error: `Invalid MIME type: ${blob.type}, expected audio/webm;codecs=opus` };
-            }
-            
-            // Check chunk size (should be approximately 4KB for 250ms at 16kHz mono)
-            const expectedMinSize = 2000; // ~2KB minimum
-            const expectedMaxSize = 8000; // ~8KB maximum
-            
-            if (blob.size < expectedMinSize) {
-              return { isValid: false, error: `Chunk too small: ${blob.size} bytes, expected ${expectedMinSize}-${expectedMaxSize} bytes` };
-            }
-            
-            if (blob.size > expectedMaxSize) {
-              return { isValid: false, error: `Chunk too large: ${blob.size} bytes, expected ${expectedMinSize}-${expectedMaxSize} bytes` };
-            }
-            
-            return { isValid: true };
-          };
-
-          // Set up MediaRecorder event handlers
-          mediaRecorder.ondataavailable = (event) => {
-            // Guard: disable MediaRecorder streaming to avoid duplicate streams and encoding mismatch
-            if (!USE_MEDIA_RECORDER_STREAMING) {
-              return;
-            }
-            if (event.data.size > 0) {
-              console.log(`📦 MediaRecorder chunk: ${event.data.size} bytes`);
-              
-              // Validate audio format
-              const validation = validateAudioFormat(event.data);
-              if (!validation.isValid) {
-                console.warn('⚠️ Audio format validation failed:', validation.error);
-                // Continue processing but log the issue
-              } else {
-                console.log('✅ Audio format validation passed');
-              }
-              
-              // Convert blob to base64 and send via WebSocket
-              const reader = new FileReader();
-              reader.onload = () => {
-                const arrayBuffer = reader.result as ArrayBuffer;
-                const base64Audio = btoa(String.fromCharCode.apply(null, Array.from(new Uint8Array(arrayBuffer))));
-                
-                const audioMessage = {
-                  type: "audio_chunk",
-                  data: base64Audio,
-                  is_final: false,
-                  format: "webm_opus",
-                  sample_rate: audioContext.sampleRate !== 16000 ? 16000 : audioContext.sampleRate, // Use 16kHz if downsampled
-                  channels: 1,
-                  chunk_size: event.data.size,
-                  timestamp: Date.now(),
-                  validation: validation
-                };
-                
-                const ws = (window as any).voiceAgentWebSocket;
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                  try {
-                    ws.send(JSON.stringify(audioMessage));
-                    console.log('📡 Audio chunk sent successfully');
-                  } catch (error) {
-                    console.error('❌ Failed to send audio chunk:', error);
-                  }
-                } else {
-                  console.warn('⚠️ WebSocket not connected, discarding audio chunk');
+        // Initialize MediaRecorder only when opus streaming is enabled
+        if (USE_MEDIA_RECORDER_STREAMING) {
+          let mediaRecorder: MediaRecorder | null = null;
+          try {
+            let selectedMime = 'audio/ogg;codecs=opus';
+            try {
+              const isTypeSupported = (MediaRecorder as any)?.isTypeSupported?.bind(MediaRecorder);
+              if (isTypeSupported) {
+                if (isTypeSupported('audio/ogg;codecs=opus')) {
+                  selectedMime = 'audio/ogg;codecs=opus';
+                } else if (isTypeSupported('audio/webm;codecs=opus')) {
+                  selectedMime = 'audio/webm;codecs=opus';
                 }
-              };
-              
-              reader.onerror = () => {
-                console.error('❌ Failed to read audio blob');
-              };
-              
-              reader.readAsArrayBuffer(event.data);
-            }
-          };
-          
-          mediaRecorder.onstop = () => {
-            console.log('📦 MediaRecorder stopped');
-          };
-          
-          // Start recording with 250ms chunks as per forensic analysis
-          mediaRecorder.start(250); // 250ms chunks
-          console.log('🎙️ MediaRecorder started with 250ms chunks');
-          
-        } catch (error) {
-          console.warn('⚠️ MediaRecorder not supported, falling back to direct audio processing:', error);
+              }
+            } catch {}
+            const mediaRecorderOptions: MediaRecorderOptions = {
+              mimeType: selectedMime,
+              audioBitsPerSecond: 128000,
+            };
+            mediaRecorder = new MediaRecorder(finalStream, mediaRecorderOptions);
+            console.log('✅ MediaRecorder initialized with:', mediaRecorderOptions);
+            (window as any).voiceAgentMediaRecorder = mediaRecorder;
+            opusStreamingActiveRef.current = true;
+
+            mediaRecorder.ondataavailable = (event) => {
+              if (!USE_MEDIA_RECORDER_STREAMING) return;
+              if (event.data.size > 0) {
+                console.log(`📦 MediaRecorder chunk: ${event.data.size} bytes`);
+                const reader = new FileReader();
+                reader.onload = () => {
+                  const arrayBuffer = reader.result as ArrayBuffer;
+                  const base64Audio = btoa(String.fromCharCode.apply(null, Array.from(new Uint8Array(arrayBuffer))));
+                  const blobType = (event.data.type || '').toLowerCase();
+                  const detectedFormat = blobType.includes('webm') ? 'webm_opus' : 'ogg_opus';
+                  const audioMessage = {
+                    type: 'audio_chunk',
+                    data: base64Audio,
+                    is_final: finalizeNextOpusChunkRef.current === true,
+                    format: detectedFormat,
+                    sample_rate: audioContext.sampleRate !== 16000 ? 16000 : audioContext.sampleRate,
+                    channels: 1,
+                    chunk_size: event.data.size,
+                    timestamp: Date.now(),
+                  };
+                  finalizeNextOpusChunkRef.current = false;
+                  const ws = (window as any).voiceAgentWebSocket;
+                  if (ws && ws.readyState === WebSocket.OPEN) {
+                    try { ws.send(JSON.stringify(audioMessage)); } catch {}
+                  }
+                };
+                reader.readAsArrayBuffer(event.data);
+              }
+            };
+            mediaRecorder.onstop = () => console.log('📦 MediaRecorder stopped');
+            mediaRecorder.start(250);
+            console.log('🎙️ MediaRecorder started with 250ms chunks');
+          } catch (error) {
+            console.warn('⚠️ MediaRecorder init failed:', error);
+            opusStreamingActiveRef.current = false;
+          }
         }
 
         // Create analyser using the existing audio context
@@ -489,6 +447,8 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
       
       // Audio recording and streaming logic
       const handleAudioRecording = (isVoiceActive: boolean, rmsLevel: number) => {
+        // Only skip PCM pipeline if Opus streaming is active
+        if (USE_MEDIA_RECORDER_STREAMING && opusStreamingActiveRef.current) return;
         if (!audioContextRef.current || !microphoneRef.current || muted) return;
         
         const now = Date.now();
@@ -516,9 +476,16 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
             console.log('🎙️ Stopping voice recording...', { silenceFrames, rmsLevel });
             isCurrentlyRecording = false;
             
-            // Send final audio chunk to backend
-            if (audioRecordingBuffer.length > 0) {
-              sendAudioToBackend(true); // is_final = true
+            // Finalize Opus or PCM path
+            const mr: MediaRecorder | undefined = (window as any).voiceAgentMediaRecorder;
+            if (USE_MEDIA_RECORDER_STREAMING && opusStreamingActiveRef.current && mr && mr.state === 'recording') {
+              finalizeNextOpusChunkRef.current = true;
+              try { mr.requestData(); } catch {}
+            } else {
+              // PCM fallback final send
+              if (audioRecordingBuffer.length > 0) {
+                sendAudioToBackend(true); // is_final = true
+              }
             }
             
             // Reset state
@@ -532,6 +499,8 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
       
       // Capture current audio frame for streaming
       const captureAudioFrame = () => {
+        // Only skip PCM pipeline if Opus streaming is active
+        if (USE_MEDIA_RECORDER_STREAMING && opusStreamingActiveRef.current) return;
         if (!analyserRef.current || muted) return;
         
         // Get time domain data (actual audio samples)
@@ -561,14 +530,16 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         // Store the resampled float data directly (simpler and cleaner)
         audioRecordingBuffer.push(resampledData);
         
-        // Send chunks every ~1000ms (more conservative to avoid overwhelming the backend)
-        if (audioRecordingBuffer.length >= 50) { // ~1000ms worth of frames
+        // Ultra-low latency: Send chunks every ~200ms for faster response
+        if (audioRecordingBuffer.length >= 10) { // ~200ms worth of frames (10 * 20ms)
           sendAudioToBackend(false); // is_final = false
         }
       };
       
       // Send audio data to backend via WebSocket
       const sendAudioToBackend = (isFinal: boolean) => {
+        // Only skip PCM pipeline if Opus streaming is active
+        if (USE_MEDIA_RECORDER_STREAMING && opusStreamingActiveRef.current) return;
         if (audioRecordingBuffer.length === 0) return;
         
         try {
@@ -622,7 +593,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
           
           // Clear the buffer for non-final chunks (keep minimal overlap)
           if (!isFinal) {
-            audioRecordingBuffer = audioRecordingBuffer.slice(-1); // Keep only last frame for minimal overlap
+            audioRecordingBuffer = audioRecordingBuffer.slice(-40); // Keep ~800-1000ms for robust finalization
           }
           
         } catch (error) {

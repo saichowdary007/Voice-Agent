@@ -33,9 +33,10 @@ export interface ChatResponse {
 }
 
 export interface WebSocketMessage {
-  type: 'message' | 'audio' | 'status' | 'error' | 'audio_response' | 'audio_stream' | 'tts_audio' | 'vad_status' | 'text_response' | 'audio_processed' | 'listening_started' | 'listening_stopped' | 'heartbeat' | 'heartbeat_ack' | 'pong' | 'stt_result' | 'stt_partial' | 'audio_chunk' | 'ping';
+  type: 'message' | 'audio' | 'status' | 'error' | 'audio_response' | 'audio_stream' | 'tts_audio' | 'vad_status' | 'text_response' | 'audio_processed' | 'listening_started' | 'listening_stopped' | 'heartbeat' | 'heartbeat_ack' | 'pong' | 'stt_result' | 'stt_partial' | 'audio_chunk' | 'ping' | 'agent_text';
   data?: any;
   text?: string;
+  content?: string;
   isActive?: boolean;
   timestamp?: string;
   mime?: string;

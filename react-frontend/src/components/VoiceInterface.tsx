@@ -30,6 +30,10 @@ const VoiceInterface: React.FC = () => {
           setLastAIResponse(message.text || '');
           setIsAIResponding(false);
           break;
+        case 'agent_text':
+          setLastAIResponse(message.content || '');
+          setIsAIResponding(false);
+          break;
         case 'audio_response':
           // Audio playback is handled automatically in useWebSocket hook
           setIsAIResponding(false);
@@ -43,7 +47,7 @@ const VoiceInterface: React.FC = () => {
           // Backend VAD status (optional)
           break;
         case 'error':
-          console.error('❌ Backend error:', message.data);
+          console.error('❌ Backend error:', (message as any).message || message.data);
           setIsAIResponding(false);
           break;
       }

@@ -15,9 +15,7 @@ import signal
 import sys
 from typing import Optional
 
-from src.stt import STT
 from src.llm import LLM
-from src.tts import TTS
 from src.conversation import ConversationManager
 from src.auth import AuthManager
 from src.config import USE_SUPABASE
@@ -40,13 +38,7 @@ class VoiceAgent:
         self.running = False
         
         # Initialize components with error handling
-        try:
-            self.stt = STT()
-            logger.info("✅ STT initialized")
-        except Exception as e:
-            logger.error(f"❌ STT initialization failed: {e}")
-            raise
-            
+        # STT/TTS handled by Deepgram Voice Agent in server; CLI path no longer initializes them
         try:
             self.llm = LLM()
             logger.info("✅ LLM initialized")
@@ -54,12 +46,7 @@ class VoiceAgent:
             logger.error(f"❌ LLM initialization failed: {e}")
             raise
             
-        try:
-            self.tts = TTS()
-            logger.info("✅ TTS initialized")
-        except Exception as e:
-            logger.error(f"❌ TTS initialization failed: {e}")
-            raise
+        self.tts = None
         
         # Initialize conversation manager if Supabase is available
         if USE_SUPABASE:
@@ -95,8 +82,8 @@ class VoiceAgent:
         try:
             while self.running:
                 try:
-                    # 1. Listen and Transcribe
-                    user_text = self.stt.listen_and_transcribe()
+                    # 1. Input loop not supported in CLI after Voice Agent migration
+                    user_text = input("You: ").strip()
 
                     if not user_text:
                         continue

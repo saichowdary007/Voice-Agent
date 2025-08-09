@@ -46,34 +46,98 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
   const isConnectedRef = useRef(false);
   const connectionHealthRef = useRef({ lastPong: 0, missedPongs: 0 });
   
-  // Audio playback function
+  // Ultra-low latency audio playback with Web Audio API fallback
   const playAudioResponse = useCallback((audioData: string, mime: string) => {
+    // Fallback to optimized HTML5 audio function
+    const playWithHTMLAudio = () => {
+      try {
+        const audioBytes = atob(audioData);
+        const audioArray = new Uint8Array(audioBytes.length);
+        for (let i = 0; i < audioBytes.length; i++) {
+          audioArray[i] = audioBytes.charCodeAt(i);
+        }
+        
+        const audioBlob = new Blob([audioArray], { type: mime });
+        const audioUrl = URL.createObjectURL(audioBlob);
+        
+        // Create audio element with low-latency optimizations
+        const audio = new Audio(audioUrl);
+        
+        // Ultra-low latency settings
+        audio.preload = 'auto';
+        if ('mozAudioChannelType' in audio) {
+          (audio as any).mozAudioChannelType = 'content';
+        }
+        
+        // Start playback immediately
+        const playPromise = audio.play();
+        
+        if (playPromise) {
+          playPromise.then(() => {
+            console.log('🔊 Playing AI response audio (HTML5 - optimized)');
+          }).catch((error) => {
+            console.error('❌ Failed to play audio:', error);
+          });
+        }
+        
+        // Cleanup URL after playback
+        audio.onended = () => {
+          URL.revokeObjectURL(audioUrl);
+        };
+        
+        // Cleanup on error
+        audio.onerror = () => {
+          URL.revokeObjectURL(audioUrl);
+        };
+      } catch (error) {
+        console.error('❌ Failed to process audio response:', error);
+      }
+    };
+
     try {
-      // Convert base64 audio to blob
+      // Convert base64 audio to ArrayBuffer for Web Audio API
       const audioBytes = atob(audioData);
       const audioArray = new Uint8Array(audioBytes.length);
       for (let i = 0; i < audioBytes.length; i++) {
         audioArray[i] = audioBytes.charCodeAt(i);
       }
       
-      const audioBlob = new Blob([audioArray], { type: mime });
-      const audioUrl = URL.createObjectURL(audioBlob);
-      
-      // Play the audio
-      const audio = new Audio(audioUrl);
-      audio.play().then(() => {
-        console.log('🔊 Playing AI response audio');
-      }).catch((error) => {
-        console.error('❌ Failed to play audio:', error);
-      });
-      
-      // Cleanup URL after playback
-      audio.onended = () => {
-        URL.revokeObjectURL(audioUrl);
-      };
+      // Try Web Audio API first for lowest latency
+      if (window.AudioContext || (window as any).webkitAudioContext) {
+        try {
+          const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+          const audioContext = new AudioContextClass();
+          
+          // Decode audio data with proper parameters
+          audioContext.decodeAudioData(
+            audioArray.buffer.slice(0),
+            (audioBuffer) => {
+              const source = audioContext.createBufferSource();
+              source.buffer = audioBuffer;
+              source.connect(audioContext.destination);
+              source.start(0);
+              console.log('🔊 Playing AI response audio (Web Audio API - ultra-low latency)');
+            },
+            () => {
+              // Fallback to HTML5 audio on decode error
+              playWithHTMLAudio();
+            }
+          );
+          
+          return; // Exit early if Web Audio API works
+        } catch (e) {
+          // Fallback to HTML5 audio
+          playWithHTMLAudio();
+        }
+      } else {
+        // No Web Audio API support, use HTML5 audio
+        playWithHTMLAudio();
+      }
       
     } catch (error) {
       console.error('❌ Failed to process audio response:', error);
+      // Final fallback
+      playWithHTMLAudio();
     }
   }, []);
 
@@ -127,13 +191,18 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           ? url.replace(/^http/, 'ws')
           : url;
 
-        // Use 127.0.0.1 instead of localhost to avoid potential DNS issues
+        // Use 127.0.0.1 instead of localhost to avoid DNS lookup latency
         const wsUrl = `${baseUrl.replace('localhost', '127.0.0.1')}/ws/${encodeURIComponent(token)}`;
         console.log('🔗 Attempting WebSocket connection to:', wsUrl);
         console.log('🎫 Using token:', token.substring(0, 20) + '...');
         
-        // FIX #1: Use "binary" protocol to match backend expectations
+        // Optimize: Use binary protocol for lower overhead
         const newSocket = new WebSocket(wsUrl, "binary");
+        
+        // Ultra-low latency optimizations
+        if ('binaryType' in newSocket) {
+          newSocket.binaryType = 'arraybuffer'; // Faster than blob
+        }
         currentSocket = newSocket;
 
         // Heartbeat timer id
@@ -146,11 +215,11 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
                 // Check connection health before sending heartbeat
                 const now = Date.now();
                 if (connectionHealthRef.current.lastPong > 0 && 
-                    now - connectionHealthRef.current.lastPong > 60000) { // 1 minute without pong
+                    now - connectionHealthRef.current.lastPong > 90000) { // 1.5 minutes without pong
                   connectionHealthRef.current.missedPongs++;
                   console.warn(`Missed pong #${connectionHealthRef.current.missedPongs}`);
                   
-                  if (connectionHealthRef.current.missedPongs >= 3) {
+                  if (connectionHealthRef.current.missedPongs >= 2) {
                     console.error('Connection appears dead, forcing reconnect');
                     newSocket.close(1000, 'Connection health check failed');
                     return;
@@ -165,7 +234,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
             } else {
               stopHeartbeat();
             }
-          }, 30000); // 30-second heartbeat (less aggressive)
+          }, 60000); // 60-second heartbeat (optimized for latency)
         };
 
         const stopHeartbeat = () => {
@@ -237,17 +306,26 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           try {
             const message: WebSocketMessage = JSON.parse(event.data);
             
+            // Ultra-low latency: prioritize audio messages for immediate processing
+            if ((message.type === 'audio_response' || message.type === 'audio_stream' || message.type === 'tts_audio') && message.data) {
+              const mime = message.mime || 'audio/wav';
+              console.log(`🔊 Received ${message.type} (${message.data.length} bytes)`);
+              // Process audio immediately without waiting for other message handling
+              playAudioResponse(message.data, mime);
+              setLastMessage(message);
+              onMessage?.(message);
+              return; // Skip other processing for audio messages
+            }
+            
             // Handle heartbeat responses for connection health monitoring
             if (message.type === 'heartbeat_ack') {
               connectionHealthRef.current.lastPong = Date.now();
               connectionHealthRef.current.missedPongs = 0;
-              console.log('💓 Heartbeat acknowledged by server');
               return; // Don't process heartbeat acks further
             }
             
             // Handle ping messages from server (respond with pong)
             if (message.type === 'ping') {
-              console.log('📡 Received ping message, sending pong response');
               try {
                 newSocket.send(JSON.stringify({ 
                   type: 'pong', 
@@ -259,12 +337,6 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
                 console.error('Failed to send pong response:', error);
               }
               return; // Don't process ping messages further
-            }
-            
-            // Handle audio response from server
-            if ((message.type === 'audio_response' || message.type === 'audio_stream' || message.type === 'tts_audio') && message.data) {
-              const mime = message.mime || (message.type === 'audio_stream' || message.type === 'tts_audio' ? 'audio/mp3' : 'audio/wav');
-              playAudioResponse(message.data, mime);
             }
             
             // Surface STT feedback to console for diagnostics
@@ -366,7 +438,14 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
         clearTimeout(reconnectTimeoutRef.current);
       }
       if (currentSocket) {
-        currentSocket.close();
+        // Avoid closing a connecting socket during React StrictMode double-invocation
+        // Only close if the socket is OPEN or CLOSING; leave CONNECTING sockets alone
+        if (
+          currentSocket.readyState === WebSocket.OPEN ||
+          currentSocket.readyState === WebSocket.CLOSING
+        ) {
+          currentSocket.close();
+        }
       }
     };
   }, [authenticated]); // Minimal dependencies to avoid constant reconnections
@@ -378,7 +457,13 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
         clearTimeout(reconnectTimeoutRef.current);
       }
       if (socket) {
-        socket.close();
+        // Only close established or closing sockets; avoid tearing down CONNECTING sockets in StrictMode
+        if (
+          socket.readyState === WebSocket.OPEN ||
+          socket.readyState === WebSocket.CLOSING
+        ) {
+          socket.close();
+        }
       }
     };
   }, [socket]);

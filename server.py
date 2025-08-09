@@ -39,27 +39,10 @@ logger = logging.getLogger(__name__)
 
 # Import WebSocket handlers from dedicated module
 
-# Import Voice Agent modules
-try:
-    from src.config import USE_REALTIME_STT
-    if USE_REALTIME_STT:
-        logger.info(f"🚀 Server-side STT enabled with Deepgram")
-        try:
-            from src.stt import STT
-            # Initialize Deepgram STT
-            stt_instance = STT(model_size="nova-3", device="auto")
-            logger.info(f"✅ Deepgram STT initialized successfully")
-        except Exception as e:
-            logger.error(f"❌ Failed to load Deepgram STT: {e}")
-            USE_REALTIME_STT = False
-            stt_instance = None
-    else:
-        logger.info("🚀 Using Web Speech API only (no server-side STT)")
-        stt_instance = None
-except ImportError:
-    logger.warning("⚠️ STT configuration not found, defaulting to browser Web Speech API")
-    USE_REALTIME_STT = False
-    stt_instance = None
+from src.config import USE_DEEPGRAM_AGENT
+
+stt_instance = None
+tts_engine = None
 
 from src.config import (
     USE_SUPABASE, 
@@ -79,14 +62,7 @@ except Exception as e:
     logger.error(f"❌ Failed to initialize LLM interface: {e}")
     llm_interface = None
 
-# Initialize TTS engine
-try:
-    from src.tts import TTS
-    tts_engine = TTS()
-    logger.info("✅ TTS engine initialized")
-except Exception as e:
-    logger.error(f"❌ Failed to initialize TTS engine: {e}")
-    tts_engine = None
+# TTS handled by Deepgram Agent when enabled
 
 # Import conversation manager
 try:
@@ -118,12 +94,10 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Voice Agent API starting up...")
     
     # Validate critical services
-    if not USE_REALTIME_STT:
-        logger.warning("⚠️ STT engine not available")
+    # STT/TTS handled by Deepgram Agent; legacy engines disabled
     if not llm_interface:
         logger.warning("⚠️ LLM engine not available")
-    if not tts_engine:
-        logger.warning("⚠️ TTS engine not available")
+    # TTS handled by Deepgram Agent
     if not auth_manager:
         logger.warning("⚠️ Auth manager not available")
     
@@ -756,10 +730,9 @@ async def get_status():
         "status": "ready",
         "active_connections": len(connection_manager.active_connections),
         "services": {
-            "stt": "available" if USE_REALTIME_STT else "unavailable",
-            "llm": "available" if llm_interface else "unavailable", 
-            "tts": "available" if tts_engine else "unavailable",
-            "database": "connected" if USE_SUPABASE else "disabled",
+            "agent": True,
+            "llm": llm_interface is not None,
+            "database": USE_SUPABASE,
             "auth": auth_mode
         },
         "authentication": auth_details,
@@ -858,9 +831,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
             "status": "connected",
             "message": "Voice Agent WebSocket connected",
             "services": {
-                "stt": USE_REALTIME_STT,
+                "agent": True,
                 "llm": llm_interface is not None,
-                "tts": tts_engine is not None,
             },
         }
 
@@ -931,12 +903,13 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                         }
                     
                     message_type = message.get("type", "unknown")
+                    logger.debug(f"📨 Received WebSocket message: type={message_type}, size={len(str(message))}")
                     handler = message_handlers.get(message_type, handle_unknown_message)
                     
                     if message_type == "text_message":
                         await handler(websocket, message, conversation_mgr, llm_interface, tts_engine)
                     elif message_type == "audio_chunk":
-                        await handler(websocket, message, conversation_mgr, stt_instance, llm_interface, tts_engine, vad_instance)
+                        await handler(websocket, message, conversation_mgr, llm_interface, tts_engine)
                     else:
 
                         await handler(websocket, message)
