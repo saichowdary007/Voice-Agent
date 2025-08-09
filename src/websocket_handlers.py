@@ -13,10 +13,8 @@ from fastapi import WebSocket
 
 from src.conversation import ConversationManager
 from src.llm import LLM
-from src.stt import STT
-from src.tts import TTS
-from src.vad import VAD
-from src.audio_preprocessor import preprocess_audio_chunk
+from src.voice_agent import DeepgramVoiceAgent
+from src.config import USE_DEEPGRAM_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -33,17 +31,9 @@ class WebSocketSessionManager:
         session_id = f"session_{id(websocket)}_{int(time.time())}"
         
         async with self.session_lock:
-            # Initialize VAD instance for this session
-            vad_instance = VAD(sample_rate=16000, mode=1)
-            
-            # Initialize streaming audio processor
-            from src.audio_preprocessor import StreamingAudioProcessor
-            audio_processor = StreamingAudioProcessor(sample_rate=16000)
-            
             self.active_sessions[session_id] = {
                 'websocket': websocket,
-                'vad_instance': vad_instance,
-                'audio_processor': audio_processor,
+                'agent': None,
                 'created_at': time.time(),
                 'last_activity': time.time(),
                 'speech_state': {
@@ -80,13 +70,12 @@ class WebSocketSessionManager:
         async with self.session_lock:
             session = self.active_sessions.pop(session_id, None)
             if session:
-                # Clean up audio processor
-                if 'audio_processor' in session:
-                    await session['audio_processor'].cleanup_ffmpeg_process()
-                
-                # Reset VAD state
-                if 'vad_instance' in session:
-                    session['vad_instance'].reset_state()
+                # Stop agent
+                if session.get('agent') is not None:
+                    try:
+                        await session['agent'].stop()
+                    except Exception:
+                        pass
                 
                 logger.info(f"🧹 Cleaned up WebSocket session: {session_id}")
     
@@ -258,7 +247,7 @@ async def _process_and_respond(
     language: str,
     conversation_mgr: Optional[ConversationManager],
     llm_interface: LLM,
-    tts_engine: TTS,
+    tts_engine,
 ):
     """Helper to process user text and send AI response."""
     history = []
@@ -319,7 +308,7 @@ async def handle_text_message(
     message: dict,
     conversation_mgr: Optional[ConversationManager],
     llm_interface: LLM,
-    tts_engine: TTS,
+    tts_engine,
 ):
     """Handles a text message from the client."""
     user_text = message.get("text", "")
@@ -351,17 +340,12 @@ async def handle_audio_chunk(
     websocket: WebSocket,
     message: dict,
     conversation_mgr: Optional[ConversationManager],
-    stt_instance: STT,
     llm_interface: LLM,
-    tts_engine: TTS,
-    vad_instance: VAD,
+    tts_engine,
 ):
     """Handles an audio chunk from the client with enhanced speech boundary detection."""
-    if not stt_instance:
-        await websocket.send_json(
-            {"type": "error", "message": "STT service not available"}
-        )
-        return
+    # Agent path does not require legacy STT
+    logger.debug(f"🎵 Received audio chunk: {len(message.get('data', ''))} bytes (base64), is_final: {message.get('is_final', False)}")
 
     try:
         encoded_audio = message.get("data")
@@ -371,8 +355,9 @@ async def handle_audio_chunk(
             raise ValueError("Missing audio data")
 
         audio_bytes = base64.b64decode(encoded_audio)
+        audio_format = message.get("format")  # e.g., ogg_opus or webm_opus
 
-        # Initialize Nova-3 optimized audio processing state
+        # Initialize minimal state for agent path only
         if not hasattr(websocket, "_audio_buffer"):
             websocket._audio_buffer = bytearray()
             websocket._is_processing = False
@@ -382,27 +367,90 @@ async def handle_audio_chunk(
             websocket._total_audio_duration = 0
             websocket._speech_started_time = None
             websocket._frame_count = 0
-            # Initialize Nova-3 optimized preprocessor
-            from src.audio_preprocessor import get_audio_preprocessor
-            websocket._preprocessor = get_audio_preprocessor()
-            websocket._preprocessor.configure_for_ultra_fast_mode()
-            logger.info("🚀 Nova-3 audio processing initialized for WebSocket")
 
         # Prevent duplicate processing
         if is_final and websocket._is_processing:
             logger.debug("Skipping duplicate final audio processing")
             return
 
-        # Process audio chunk with Nova-3 optimized preprocessor
-        websocket._frame_count += 1
-        inject_preroll = websocket._speech_detected and not is_final  # Inject pre-roll when speech starts
-        
-        processed_audio, metadata = websocket._preprocessor.preprocess_audio_chunk(
-            audio_bytes, inject_preroll=inject_preroll
-        )
-        
-        # Add processed audio to buffer
-        websocket._audio_buffer.extend(processed_audio)
+        # Assume raw PCM16 (frontend is configured to send PCM); if compressed is sent, ignore legacy decode path
+        decoded_pcm = audio_bytes
+
+        # Ensure agent is started (once per connection) when enabled
+        if USE_DEEPGRAM_AGENT and not hasattr(websocket, "_dg_agent_started"):
+            try:
+                from src.config import DEEPGRAM_API_KEY
+                # Schedule WebSocket sends safely from SDK background threads
+                loop = asyncio.get_running_loop()
+
+                def send_json_threadsafe(payload: dict) -> None:
+                    try:
+                        asyncio.run_coroutine_threadsafe(websocket.send_json(payload), loop)
+                    except Exception as send_err:
+                        logger.error(f"Thread-safe send_json failed: {send_err}")
+
+                # Create and start agent; store on websocket for simplicity
+                websocket._dg_agent = DeepgramVoiceAgent(
+                    api_key=DEEPGRAM_API_KEY,
+                    sample_rate_input=16000,
+                    sample_rate_output=24000,
+                    on_audio_ready=lambda audio_bytes, mime: send_json_threadsafe({
+                        "type": "tts_audio",
+                        "data": base64.b64encode(audio_bytes).decode("ascii"),
+                        "mime": mime,
+                    }),
+                    on_text=lambda role, content: send_json_threadsafe({
+                        "type": "agent_text",
+                        "role": role,
+                        "content": content,
+                    }),
+                    on_error=lambda err: send_json_threadsafe({
+                        "type": "error",
+                        "message": f"Agent error: {err}",
+                    }),
+                )
+                started = await websocket._dg_agent.start()
+                websocket._dg_agent_started = started
+                if started:
+                    logger.info("✅ Deepgram Voice Agent started for this WebSocket")
+                else:
+                    logger.error("❌ Failed to start Deepgram Voice Agent; continuing without agent")
+            except Exception as e:
+                logger.error(f"Agent start exception: {e}")
+                websocket._dg_agent_started = False
+
+        # Agent-first path: forward PCM directly to Deepgram Agent and return
+        if USE_DEEPGRAM_AGENT and getattr(websocket, "_dg_agent_started", False):
+            try:
+                # Ultra-low latency: forward even smaller chunks (320 bytes = 10ms at 16kHz)
+                if decoded_pcm and len(decoded_pcm) >= 320:
+                    websocket._dg_agent.send_audio(decoded_pcm)
+                    if is_final:
+                        # Push minimal trailing silence for faster utterance detection
+                        try:
+                            trailing_silence = b"\x00" * int(0.1 * 16000 * 2)  # 100ms silence
+                            websocket._dg_agent.send_audio(trailing_silence)
+                        except Exception:
+                            pass
+                # Reduce feedback frequency for lower overhead
+                if is_final or len(decoded_pcm) % 3200 == 0:  # Every 100ms or final
+                    await websocket.send_json({
+                        "type": "audio_processed",
+                        "status": "receiving" if not is_final else "final",
+                        "buffer_size": len(decoded_pcm),
+                        "is_final": is_final,
+                    })
+            except Exception as e:
+                logger.debug(f"Agent direct-forward error: {e}")
+            # Short-circuit legacy VAD/STT/LLM pipeline entirely when agent is enabled
+            return
+
+        # Legacy pipeline removed when agent is enabled by design. If you reach here without agent, respond gracefully.
+        await websocket.send_json({
+            "type": "error",
+            "message": "Deepgram Agent not active; enable USE_DEEPGRAM_AGENT or update client to agent mode"
+        })
+        return
         
         # Get sample rate from message or default to 16kHz
         sample_rate = message.get("sample_rate", 16000)
@@ -421,11 +469,26 @@ async def handle_audio_chunk(
         current_speech_detected = metadata.get('is_speech', False)
         confidence = metadata.get('confidence', 0.0)
         
-        logger.debug(f"Audio chunk: {len(audio_bytes)} bytes, processed: {len(processed_audio)} bytes, "
+        logger.debug(f"Audio chunk: {len(audio_bytes)} bytes ({audio_format or 'pcm16'}), processed: {len(processed_audio)} bytes, "
                     f"buffer: {len(websocket._audio_buffer)} bytes, duration: {websocket._total_audio_duration:.1f}ms, "
                     f"speech: {current_speech_detected}, confidence: {confidence:.2f}, is_final: {is_final}")
 
         latency_tracker = get_latency_tracker(websocket)
+
+        # Stream decoded PCM to agent for real-time responses (including final to flush remainder)
+        if processed_audio and len(processed_audio) >= 640:
+            if USE_DEEPGRAM_AGENT and getattr(websocket, "_dg_agent_started", False):
+                try:
+                    websocket._dg_agent.send_audio(processed_audio)
+                    # On final chunks, also send a short trailing silence to help agent segment the utterance
+                    if is_final:
+                        try:
+                            trailing_silence = b"\x00" * int(0.2 * 16000 * 2)  # 200ms of PCM16 silence @16kHz
+                            websocket._dg_agent.send_audio(trailing_silence)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.debug(f"Agent send error: {e}")
         
         # Enhanced speech boundary detection using Nova-3 preprocessor
         if current_speech_detected and not websocket._speech_detected:
@@ -445,9 +508,9 @@ async def handle_audio_chunk(
             if websocket._silence_start_time is None:
                 websocket._silence_start_time = time.time()
             
-            # Check if we should end speech based on silence duration
+            # Check if we should end speech based on silence duration (optimized for low latency)
             silence_duration = time.time() - websocket._silence_start_time
-            if silence_duration > 0.7:  # 700ms silence timeout (matching Nova-3 utterance_end_ms)
+            if silence_duration > 0.4:  # 400ms silence timeout for faster response
                 logger.info(f"🔇 Speech ended after {silence_duration:.2f}s silence")
                 is_final = True  # Force final processing
                 
@@ -507,19 +570,19 @@ async def handle_audio_chunk(
                     should_process = True
                 
                 if should_process:
-                    logger.info(f"Processing final audio: {len(websocket._audio_buffer)} bytes "
-                               f"({websocket._total_audio_duration:.1f}ms)")
+                    logger.info(f"Finalizing after {websocket._total_audio_duration:.1f}ms")
                     
                     # Start latency tracking
                     latency_tracker.mark("audio_received")
                     
-                    user_text = await handle_streaming_stt_chunk(
-                        websocket=websocket,
-                        audio_chunk=bytes(websocket._audio_buffer),
-                        is_final=True,
-                        stt_instance=stt_instance,
-                        latency_tracker=latency_tracker,
-                    )
+                    # Finalize agent if enabled (no more audio to send right now)
+                    if USE_DEEPGRAM_AGENT and getattr(websocket, "_dg_agent_started", False):
+                        try:
+                            # No special finalize call; agent generates responses asynchronously
+                            pass
+                        except Exception:
+                            pass
+                    user_text = None
                 else:
                     logger.info("VAD determined audio should not be processed (likely silence)")
             else:
@@ -592,14 +655,12 @@ async def handle_audio_chunk(
             websocket._frame_count = 0
             websocket._speech_started_time = None
         elif not is_final:
-            # Send periodic feedback for ongoing audio
-            if len(websocket._audio_buffer) % 8192 == 0:  # Every ~0.5 seconds
+            # Minimal periodic feedback for ongoing audio (agent path)
+            if len(websocket._audio_buffer) % 8192 == 0:
                 await websocket.send_json({
                     "type": "audio_processed",
                     "status": "receiving",
-                    "buffer_size": len(websocket._audio_buffer),
-                    "duration_ms": websocket._total_audio_duration,
-                    "speech_detected": websocket._speech_detected
+                    "buffer_size": len(websocket._audio_buffer)
                 })
                 
     except Exception as e:
@@ -690,7 +751,7 @@ async def stream_text_to_audio_pipeline(
     history: list,
     profile_facts: list,
     llm_interface: LLM,
-    tts_engine: TTS,
+    tts_engine,
     websocket: WebSocket,
     latency_tracker: LatencyTracker
 ) -> str:
@@ -726,20 +787,11 @@ async def stream_text_to_audio_pipeline(
         
         latency_tracker.mark("tts_start")
         
-        # Now synthesize the complete response
-        audio_bytes = await tts_engine.synthesize(full_response)
-        
-        if audio_bytes:
-            latency_tracker.mark("tts_complete")
-            
-            # Send audio to client
-            await websocket.send_json({
-                "type": "tts_audio",
-                "data": base64.b64encode(audio_bytes).decode("ascii"),
-                "mime": "audio/mp3"
-            })
-            
-            latency_tracker.mark("audio_sent")
+        # TTS is handled by Deepgram Agent in agent mode; send text to client as a fallback
+        await websocket.send_json({
+            "type": "text_response",
+            "text": full_response
+        })
         
         latency_tracker.mark("pipeline_complete")
         latency_tracker.log_summary()
@@ -751,67 +803,13 @@ async def stream_text_to_audio_pipeline(
         # Fallback to non-streaming
         if llm_interface:
             response = await llm_interface.generate_response(user_text, history, profile_facts)
-            audio_bytes = await tts_engine.synthesize(response)
-            if audio_bytes:
-                await websocket.send_json({
-                    "type": "tts_audio",
-                    "data": base64.b64encode(audio_bytes).decode("ascii"),
-                    "mime": "audio/mp3"
-                })
+            await websocket.send_json({
+                "type": "text_response",
+                "text": response
+            })
             return response
         return "Sorry, I'm having trouble processing that right now."
 
 
-async def handle_streaming_stt_chunk(
-    websocket: WebSocket,
-    audio_chunk: bytes,
-    is_final: bool,
-    stt_instance: STT,
-    latency_tracker: LatencyTracker
-) -> Optional[str]:
-    """
-    Handle a single STT audio chunk with streaming processing.
-    Returns transcript if is_final=True, None otherwise.
-    """
-    try:
-        if not is_final:
-            latency_tracker.mark("audio_received")
-        
-        # Validate audio chunk before processing
-        if not audio_chunk or len(audio_chunk) < 640:  # Skip small chunks (increased threshold for stability)
-            logger.debug(f"Skipping small audio chunk: {len(audio_chunk)} bytes")
-            return None
-        
-        logger.debug(f"Processing audio chunk: {len(audio_chunk)} bytes, is_final: {is_final}")
-        
-        # Process with streaming STT
-        transcript = await stt_instance.stream_transcribe_chunk(audio_chunk, is_final=is_final)
-        
-        if transcript and transcript.strip():
-            logger.info(f"STT transcript received: '{transcript}' (final: {is_final})")
-            if is_final:
-                latency_tracker.mark("stt_complete")
-                # Send final transcription result
-                await websocket.send_json({
-                    "type": "stt_result",
-                    "transcript": transcript,
-                    "is_final": True
-                })
-                return transcript
-            else:
-                # Send partial result
-                await websocket.send_json({
-                    "type": "stt_partial",
-                    "transcript": transcript,
-                    "is_final": False
-                })
-        else:
-            logger.debug(f"No transcript from STT (is_final: {is_final})")
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"STT chunk processing error: {e}")
-        import traceback
-        logger.error(f"STT error traceback: {traceback.format_exc()}")
-        return None
+async def handle_streaming_stt_chunk(*args, **kwargs):
+    return None

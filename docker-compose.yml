@@ -47,6 +47,8 @@ services:
       SUPABASE_KEY: ${SUPABASE_KEY}
       USE_SUPABASE: ${USE_SUPABASE:-false}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
+      USE_DEEPGRAM_AGENT: ${USE_DEEPGRAM_AGENT:-true}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
       USE_REALTIME_STT: ${USE_REALTIME_STT:-false}
       DEEPGRAM_STT_MODEL: ${DEEPGRAM_STT_MODEL:-nova-3}
       DEEPGRAM_STT_LANGUAGE: ${DEEPGRAM_STT_LANGUAGE:-en-US}
@@ -78,8 +80,8 @@ services:
       dockerfile: Dockerfile
     container_name: voice-agent-frontend
     environment:
-      REACT_APP_API_URL: ${REACT_APP_API_URL:-http://localhost:8080}
-      REACT_APP_WS_URL: ${REACT_APP_WS_URL:-ws://localhost:8080}
+      REACT_APP_API_URL: ${REACT_APP_API_URL:-http://localhost:8000}
+      REACT_APP_WS_URL: ${REACT_APP_WS_URL:-ws://localhost:8000}
     ports:
       - "3000:80"
     networks:

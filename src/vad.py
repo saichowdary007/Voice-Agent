@@ -36,11 +36,11 @@ class VAD:
         self._last_speech_time = 0
         self._speech_started = False
         
-        # Configurable thresholds for better speech detection
-        self.min_speech_frames = 3  # Minimum consecutive speech frames to start
-        self.min_silence_frames = 25  # Minimum silence frames to end (500ms at 20ms frames)
-        self.energy_threshold = 500  # Minimum energy level for speech
-        self.speech_padding_ms = 200  # Extra padding after speech ends
+        # Ultra-low latency thresholds for immediate response
+        self.min_speech_frames = 1  # Minimum consecutive speech frames to start (20ms)
+        self.min_silence_frames = 15  # Minimum silence frames to end (300ms at 20ms frames)
+        self.energy_threshold = 300  # Lower threshold for faster detection
+        self.speech_padding_ms = 100  # Minimal padding for speed
         
         logger.info(f"Enhanced VAD initialized: mode={mode}, min_silence={self.min_silence_frames * 20}ms")
 

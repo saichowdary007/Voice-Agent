@@ -1,14 +1,6 @@
 # Core Voice Agent Dependencies
 aiohttp>=3.9.0,<4.0.0
 python-dotenv>=1.0.0
-SpeechRecognition>=3.10.0
-PyAudio>=0.2.11
-pydub>=0.25.1
-simpleaudio>=1.0.4
-soundfile>=0.12.1
-
-# Audio processing utilities
-ffmpeg-python==0.2.0
 
 # For Conversation History & ML
 supabase>=2.0.0,<3.0.0
@@ -34,23 +26,9 @@ pyjwt==2.8.0
 # Development Tools (only in development)
 watchdog>=3.0.0
 
-# Advanced STT Engine
-RealtimeSTT>=0.3.104
-
-# AI/ML Dependencies
-torch>=2.0.0,<3.0.0
-transformers>=4.35.0
-
 # Voice Activity Detection & Audio Processing
 webrtcvad>=2.0.10
 scipy>=1.10.0
-matplotlib>=3.5.0
 
-# Google Gemini SDK for native TTS support
-google-genai>=0.3.0
-
-# OpenAI dependencies
-openai>=1.0.0
-
-# Deepgram SDK for STT and TTS
-deepgram-sdk>=3.0.0
+# Deepgram SDK for Agent, STT, and TTS
+deepgram-sdk>=4.1.0
