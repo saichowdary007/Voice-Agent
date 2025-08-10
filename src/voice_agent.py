@@ -259,9 +259,9 @@ class DeepgramVoiceAgent:
             
             # Adjusted STT settings for better speech detection
             options.agent.listen.interim_results = True  # Enable streaming results
-            options.agent.listen.endpointing = 300  # ms of silence to mark endpoint (more lenient)
-            options.agent.listen.utterance_end_ms = 1000  # longer utterance timeout for better detection
-            options.agent.listen.vad_turnoff = 300  # more lenient VAD turnoff
+            options.agent.listen.endpointing = 100  # ms of silence to mark endpoint (more sensitive)
+            options.agent.listen.utterance_end_ms = 500  # shorter utterance timeout for faster detection
+            options.agent.listen.vad_turnoff = 100  # more sensitive VAD turnoff
             options.agent.listen.smart_format = True  # Enable smart formatting for better transcripts
             # Align language with backend config default
             try:
@@ -287,7 +287,6 @@ class DeepgramVoiceAgent:
 
             # Configure LLM provider based on config
             options.agent.think.provider.type = LLM_PROVIDER_TYPE
-            options.agent.think.provider.model = LLM_MODEL
             options.agent.think.provider.temperature = LLM_TEMPERATURE
             
             # Add a system prompt to guide the agent's responses
@@ -300,6 +299,15 @@ class DeepgramVoiceAgent:
                     "headers": LLM_ENDPOINT_HEADERS
                 }
                 logger.info(f"Using custom endpoint for {LLM_PROVIDER_TYPE}: {LLM_ENDPOINT_URL}")
+                # For Google with custom endpoint, model is in URL - use a placeholder or empty model
+                if LLM_PROVIDER_TYPE == "google":
+                    logger.info("Google custom endpoint detected - model specified in URL, not in provider settings")
+                    # Don't set model at all for Google custom endpoints
+                else:
+                    options.agent.think.provider.model = LLM_MODEL
+            else:
+                # No custom endpoint, set model normally
+                options.agent.think.provider.model = LLM_MODEL
             
             # Validate API keys for the selected provider
             provider_valid = False
@@ -341,7 +349,9 @@ class DeepgramVoiceAgent:
                     logger.error(f"No valid API key found for LLM provider: {LLM_PROVIDER_TYPE} and no fallback available")
                     return False
 
-            logger.info(f"Using LLM provider: {options.agent.think.provider.type} with model: {options.agent.think.provider.model}")
+            # Log the provider configuration
+            model_info = getattr(options.agent.think.provider, 'model', 'not set')
+            logger.info(f"Using LLM provider: {options.agent.think.provider.type} with model: {model_info}")
 
             # Speak provider (Deepgram TTS)
             options.agent.speak.provider.type = "deepgram"

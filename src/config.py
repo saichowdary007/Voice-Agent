@@ -126,12 +126,18 @@ else:
     )
     LLM_PROVIDER_TYPE = os.getenv("LLM_PROVIDER_TYPE", _default_provider)
 
-# Use DG_THINK_MODEL from .env if set
+# Use DG_THINK_MODEL from .env if set, otherwise choose based on provider
 _dg_model = os.getenv("DG_THINK_MODEL")
 if _dg_model:
     LLM_MODEL = _dg_model
 else:
-    LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
+    # Choose model based on provider
+    if LLM_PROVIDER_TYPE == "open_ai":
+        LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    elif LLM_PROVIDER_TYPE == "google":
+        LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
+    else:
+        LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "150"))
@@ -142,11 +148,13 @@ LLM_ENDPOINT_HEADERS = {}
 
 # Set up Google/Gemini configuration
 if LLM_PROVIDER_TYPE == "google" and GEMINI_API_KEY:
-    # Set the Google API key in environment for Deepgram Agent to use
-    os.environ["GOOGLE_API_KEY"] = GEMINI_API_KEY
-    # Try without custom endpoint first - let Deepgram handle Google natively
-    # Based on the documentation, Google might be managed by Deepgram like OpenAI/Anthropic
-    print(f"Configuring Google provider with native Deepgram management")
+    # Try v1 API instead of v1beta to avoid field compatibility issues
+    LLM_ENDPOINT_URL = f"https://generativelanguage.googleapis.com/v1/models/{LLM_MODEL}:generateContent"
+    LLM_ENDPOINT_HEADERS = {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "content-type": "application/json"
+    }
+    print(f"Configuring Google provider with v1 API endpoint: {LLM_ENDPOINT_URL}")
 elif os.getenv("LLM_ENDPOINT_AUTH_TOKEN"):
     LLM_ENDPOINT_HEADERS["authorization"] = f"Bearer {os.getenv('LLM_ENDPOINT_AUTH_TOKEN')}"
 
