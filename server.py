@@ -80,11 +80,7 @@ except Exception as e:
     logger.error(f"❌ Failed to initialize Auth manager: {e}")
     auth_manager = None
 
-# Import VAD
-from src.vad import VAD  # Voice Activity Detection
-
-# Global VAD instance (set during startup)
-vad_instance = None
+# VAD is handled by Deepgram Agent internally
 
 # Application lifecycle management using modern lifespan pattern
 @asynccontextmanager
@@ -103,10 +99,8 @@ async def lifespan(app: FastAPI):
     
     logger.info("✅ Voice Agent API startup complete")
 
-    # Initialize VAD
-    global vad_instance
-    vad_instance = VAD(sample_rate=16000, mode=1)  # Browser-side uses mode 1, server uses mode 2 via preprocessor
-    logger.info("✅ VAD initialized (WebRTC mode 1 for browser compatibility)")
+    # VAD is handled by Deepgram Agent internally
+    logger.info("✅ Voice Agent startup complete - VAD handled by Deepgram Agent")
     
     yield
     
@@ -276,22 +270,8 @@ class ConnectionManager:
         """Disconnect a websocket and clean up resources."""
         user_id = self.active_connections.pop(websocket, None)
         if user_id:
-            # FIX #5: Reset VAD and STT state when WebSocket closes (not per chunk)
-            try:
-                # Reset VAD state if available
-                global vad_instance
-                if vad_instance and hasattr(vad_instance, 'reset_state'):
-                    vad_instance.reset_state()
-                    logger.debug(f"🔄 VAD state reset for disconnected user {user_id}")
-                
-                # Reset STT state if available
-                global stt_instance
-                if stt_instance and hasattr(stt_instance, '_reset_state'):
-                    # Note: This is sync, but we're in a sync method
-                    # The actual reset will happen when STT is next used
-                    logger.debug(f"🔄 STT state marked for reset for disconnected user {user_id}")
-            except Exception as e:
-                logger.warning(f"Error resetting VAD/STT state: {e}")
+            # Deepgram Agent handles state management internally
+            logger.debug(f"🔄 WebSocket disconnected for user {user_id}")
             
             # Clean up conversation manager if no other connections for this user
             user_connections = [ws for ws, uid in self.active_connections.items() if uid == user_id]

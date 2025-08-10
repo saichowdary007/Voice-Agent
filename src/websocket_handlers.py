@@ -592,14 +592,8 @@ async def handle_audio_chunk(
                 too_short_audio = True
             
             if not too_short_audio:
-                # Additional validation using VAD
-                if vad_instance and hasattr(vad_instance, 'should_process_audio'):
-                    should_process = vad_instance.should_process_audio(
-                        bytes(websocket._audio_buffer), 
-                        force_final=True
-                    )
-                else:
-                    should_process = True
+                # Deepgram Agent handles VAD internally
+                should_process = True
                 
                 if should_process:
                     logger.info(f"Finalizing after {websocket._total_audio_duration:.1f}ms")

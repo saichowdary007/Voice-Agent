@@ -1,11 +1,9 @@
 """
-Refactored ConversationManager to be fully asynchronous and use the Supabase Python client.
-Enhanced with proper error handling, type safety, and optimized async patterns.
+Simplified ConversationManager for Deepgram Voice Agent with Supabase.
+Handles basic conversation history without ML embeddings or sentence transformers.
 """
 import asyncio
 import logging
-import os
-import re
 from typing import List, Dict, Optional, Any, TYPE_CHECKING
 from src.config import USE_SUPABASE, SUPABASE_URL, SUPABASE_KEY
 from datetime import datetime
@@ -20,26 +18,21 @@ if TYPE_CHECKING:
 # Conditional imports to avoid dependency issues
 if USE_SUPABASE:
     try:
-        from sentence_transformers import SentenceTransformer
         from supabase import create_client
         SUPABASE_AVAILABLE = True
     except ImportError as e:
         logger.warning(f"⚠️ Supabase dependencies not available: {e}")
         SUPABASE_AVAILABLE = False
-        SentenceTransformer = None
         create_client = None
 else:
     SUPABASE_AVAILABLE = False
-    SentenceTransformer = None
     create_client = None
 
 class ConversationManager:
     """
-    Manages conversation state and history using Supabase.
-    This class is designed to be used in an async environment with proper error handling.
+    Simplified conversation manager for Deepgram Voice Agent with Supabase.
+    Handles basic conversation history without ML embeddings.
     """
-    # Shared embedding model to avoid re-loading on every new WebSocket connection
-    _shared_embedding_model = None
 
     def __init__(self, user_id: str):
         if not user_id:
@@ -47,12 +40,6 @@ class ConversationManager:
         self.user_id = user_id
         self.use_supabase = USE_SUPABASE and SUPABASE_AVAILABLE
         self.supabase: Optional['Client'] = self._connect_supabase()
-        self.embedding_model = self._load_embedding_model() if self.use_supabase else None
-        self.vector_search_available = True  # Track if vector search is available
-        
-        # Personal fact storage settings
-        self.max_snippets_per_user = 200
-        self.similarity_threshold = 0.88  # For deduplication
         
         if self.use_supabase and self.supabase and SUPABASE_AVAILABLE:
             logger.info("✅ Conversation history is enabled (Supabase).")
@@ -76,20 +63,17 @@ class ConversationManager:
         Returns:
             True if successful, False otherwise.
         """
-        if not self.use_supabase or not self.supabase or not self.embedding_model:
+        if not self.use_supabase or not self.supabase:
             return False
 
         try:
-            embedding = self.embedding_model.encode(text).tolist()
-            
-            # Use asyncio.to_thread for CPU-bound operation
+            # Use asyncio.to_thread for database operation
             assert self.supabase is not None
             await asyncio.to_thread(
                 lambda: self.supabase.table('conversation_history').insert({
                     'session_id': self.user_id,
                     'role': role,
-                    'text': text,
-                    'embedding': embedding
+                    'text': text
                 }).execute()
             )
             return True
@@ -97,44 +81,16 @@ class ConversationManager:
             logger.error(f"❌ Error adding message to Supabase: {e}")
             return False
 
-    async def _get_semantic_context(self, current_text: str, max_results: int = 3) -> List[Dict]:
-        """Retrieves semantically similar messages from the past."""
-        if not self.embedding_model or not self.vector_search_available:
+    async def get_recent_context(self, max_results: int = 10) -> List[Dict]:
+        """Retrieves the most recent messages."""
+        if not self.use_supabase or not self.supabase:
             return []
             
-        try:
-            current_embedding = self.embedding_model.encode(current_text).tolist()
-            assert self.supabase is not None
-            response = await asyncio.to_thread(
-                lambda: self.supabase.rpc(
-                    'match_conversations', 
-                    {
-                        'query_embedding': current_embedding, 
-                        'match_threshold': 0.7, 
-                        'match_count': max_results,
-                        'session_id': self.user_id  # Add session filter
-                    }
-                ).execute()
-            )
-            return response.data or []
-        except Exception as e:
-            # Check for HTTP 404 (function not found) or general function errors
-            error_str = str(e).lower()
-            if ('404' in error_str or 'function' in error_str and 'match_conversations' in error_str or 
-                'does not exist' in error_str):
-                logger.warning("⚠️ Vector search function not available - disabling semantic context")
-                self.vector_search_available = False  # Disable future attempts
-            else:
-                logger.error(f"❌ Vector search error: {e}")
-            return []
-
-    async def _get_recent_context(self, max_results: int = 4) -> List[Dict]:
-        """Retrieves the most recent messages."""
         try:
             assert self.supabase is not None
             response = await asyncio.to_thread(
                 lambda: self.supabase.table('conversation_history')
-                .select('role, text, content:text, created_at')
+                .select('role, text, created_at')
                 .eq('session_id', self.user_id)
                 .order('created_at', desc=True)
                 .limit(max_results)
@@ -145,53 +101,29 @@ class ConversationManager:
             logger.error(f"❌ Error fetching recent history from Supabase: {e}")
             return []
 
-    async def get_context_for_llm(self, current_text: str) -> List[Dict[str, Any]]:
+    async def get_context_for_llm(self, current_text: str = "") -> List[Dict[str, Any]]:
         """
-        Retrieves a combined context of recent and semantically relevant messages.
+        Retrieves recent conversation history formatted for LLM consumption.
         
         Returns:
             Formatted message history for LLM consumption.
         """
-        if not self.use_supabase or not self.supabase or not self.embedding_model:
+        if not self.use_supabase or not self.supabase:
             return []
         
         try:
-            # Concurrently fetch recent and semantic history
-            tasks = [
-                self._get_recent_context(),
-                self._get_semantic_context(current_text)
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Get recent history
+            recent_history = await self.get_recent_context(max_results=8)
             
-            recent_history = results[0] if not isinstance(results[0], Exception) else []
-            semantic_history = results[1] if not isinstance(results[1], Exception) else []
-
-            # Combine and deduplicate the histories
-            combined_history = {}
-            
-            # Process semantic history
-            for item in semantic_history:
-                item_text = item.get('content')
-                if item_text:
-                    combined_history[item_text] = item
-
-            # Process recent history
-            for item in recent_history:
-                item_text = item.get('text')
-                if item_text and item_text not in combined_history:
-                    # Unify the key to 'content' for consistent formatting
-                    item['content'] = item_text
-                    combined_history[item_text] = item
-            
-            # Sort the unique history items by timestamp
+            # Sort by timestamp (oldest first for proper conversation flow)
             sorted_history = sorted(
-                list(combined_history.values()), 
+                recent_history, 
                 key=lambda x: datetime.fromisoformat(x['created_at'])
             )
             
             # Format for the Gemini API
             return [
-                {"role": row['role'], "parts": [{"text": row['content']}]} 
+                {"role": row['role'], "parts": [{"text": row['text']}]} 
                 for row in sorted_history
             ]
         except Exception as e:
@@ -199,7 +131,7 @@ class ConversationManager:
             return []
 
     async def get_user_profile(self) -> List[Dict[str, str]]:
-        """Retrieves all facts for the current user."""
+        """Retrieves basic user profile facts."""
         if not self.use_supabase or not self.supabase:
             return []
             
@@ -285,322 +217,39 @@ class ConversationManager:
             logger.error(f"❌ Error clearing history in Supabase: {e}")
             return False
 
-    def _load_embedding_model(self):
-        """Loads the sentence transformer model only once and reuses it for subsequent instances."""
-        if ConversationManager._shared_embedding_model is not None:
-            return ConversationManager._shared_embedding_model
-
-        try:
-            if SentenceTransformer is None:
-                logger.warning("SentenceTransformer is not available")
-                return None
-
-            # Load and cache the model
-            ConversationManager._shared_embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-            logger.info("✅ Embedding model loaded successfully (cached)")
-            return ConversationManager._shared_embedding_model
-        except Exception as e:
-            logger.error(f"❌ Failed to load embedding model: {e}")
-            return None
-
-    # === PERSONAL FACT STORAGE PIPELINE ===
-
-    async def _classify_personal_fact(self, sentence: str, llm_interface) -> bool:
+    async def handle_user_turn(self, user_msg: str, assistant_msg: str, llm_interface=None) -> None:
         """
-        Fast classification to determine if sentence contains personal information.
-        Returns True if it contains personal facts worth saving.
-        """
-        if not llm_interface:
-            return False
-            
-        fact_prompt = f"""
-Decide whether the USER sentence contains PERSONAL FACTS worth saving:
-
-USER: "{sentence}"
-
-Respond with exactly one token:
-- YES  -> contains new personal info
-- NO   -> does NOT contain personal info
-"""
-        
-        try:
-            # Use a simplified call for classification
-            response = await llm_interface.generate_response(
-                user_text=fact_prompt,
-                conversation_history=[],
-                user_profile=[]
-            )
-            
-            # Clean and check response
-            decision = response.strip().upper()
-            return decision == "YES"
-            
-        except Exception as e:
-            logger.error(f"❌ Error in personal fact classification: {e}")
-            return False
-
-    async def _summarize_to_bullet(self, text: str, llm_interface) -> str:
-        """
-        Summarizes user text into a single bullet point.
-        """
-        if not llm_interface:
-            return text
-            
-        prompt = f"""
-Rewrite the USER's sentence as one bullet starting with '• '. 
-Keep concrete nouns & numbers; drop filler words.
-
-USER: "{text}"
-"""
-        
-        try:
-            response = await llm_interface.generate_response(
-                user_text=prompt,
-                conversation_history=[],
-                user_profile=[]
-            )
-            
-            bullet = response.strip()
-            if not bullet.startswith('•'):
-                bullet = f"• {bullet}"
-            return bullet
-            
-        except Exception as e:
-            logger.error(f"❌ Error in summarization: {e}")
-            return f"• {text}"
-
-    def _redact_pii(self, text: str) -> str:
-        """
-        Basic PII redaction using regex patterns.
-        """
-        # Phone numbers (supports various formats)
-        text = re.sub(r'(\b\+?\d{1,3}[-.\s]?)?(\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}\b', '[PHONE]', text)
-        
-        # Email addresses
-        text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '[EMAIL]', text)
-        
-        # SSN patterns
-        text = re.sub(r'\b\d{3}-\d{2}-\d{4}\b', '[SSN]', text)
-        
-        # Credit card patterns (very basic, targets 13-16 digit numbers)
-        text = re.sub(r'\b(?:\d[ -]*?){13,16}\b', '[CARD]', text)
-        
-        return text
-
-    async def _check_duplicate(self, fact: str) -> bool:
-        """
-        Check if a similar fact already exists using cosine similarity.
-        Returns True if duplicate exists (similarity > threshold).
-        """
-        if not self.embedding_model or not self.use_supabase or not self.supabase:
-            return False
-            
-        try:
-            fact_embedding = self.embedding_model.encode(fact).tolist()
-            
-            # Get existing snippets for this user
-            assert self.supabase is not None
-            response = await asyncio.to_thread(
-                lambda: self.supabase.table('memory_snippets')
-                .select('content, embedding')
-                .eq('user_id', self.user_id)
-                .execute()
-            )
-            
-            existing_snippets = response.data or []
-            
-            # Check similarity with existing snippets
-            for snippet in existing_snippets:
-                if 'embedding' in snippet and snippet['embedding']:
-                    # Calculate cosine similarity
-                    similarity = self._cosine_similarity(fact_embedding, snippet['embedding'])
-                    if similarity > self.similarity_threshold:
-                        return True
-                        
-            return False
-            
-        except Exception as e:
-            logger.error(f"❌ Error checking for duplicates: {e}")
-            return False
-
-    def _cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
-        """Calculate cosine similarity between two vectors."""
-        try:
-            import numpy as np
-            vec1 = np.array(vec1)
-            vec2 = np.array(vec2)
-            
-            dot_product = np.dot(vec1, vec2)
-            norm_vec1 = np.linalg.norm(vec1)
-            norm_vec2 = np.linalg.norm(vec2)
-            
-            if norm_vec1 == 0 or norm_vec2 == 0:
-                return 0
-                
-            return dot_product / (norm_vec1 * norm_vec2)
-        except Exception as e:
-            logger.error(f"❌ Error calculating cosine similarity: {e}")
-            return 0
-
-    async def _store_fact(self, fact: str) -> bool:
-        """
-        Store a personal fact in the memory_snippets table.
-        """
-        if not self.use_supabase or not self.supabase or not self.embedding_model:
-            return False
-            
-        try:
-            # Redact PII
-            clean_fact = self._redact_pii(fact)
-            
-            # Check for duplicates
-            if await self._check_duplicate(clean_fact):
-                logger.debug(f"Skipping duplicate fact: {clean_fact}")
-                return True  # Not an error, just a duplicate
-            
-            # Generate embedding
-            embedding = self.embedding_model.encode(clean_fact).tolist()
-            
-            # Store the fact
-            assert self.supabase is not None
-            await asyncio.to_thread(
-                lambda: self.supabase.table('memory_snippets').insert({
-                    'user_id': self.user_id,
-                    'content': clean_fact,
-                    'importance': 7,  # Default importance
-                    'embedding': embedding
-                }).execute()
-            )
-            
-            # Prune old facts if over limit
-            await self._prune_old_facts()
-            
-            logger.info(f"✅ Stored personal fact: {clean_fact}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Error storing fact: {e}")
-            return False
-
-    async def _prune_old_facts(self) -> None:
-        """
-        Keep only the most recent facts, prune by lowest importance.
-        """
-        if not self.use_supabase or not self.supabase:
-            return
-            
-        try:
-            # Count current snippets
-            assert self.supabase is not None
-            count_response = await asyncio.to_thread(
-                lambda: self.supabase.table('memory_snippets')
-                .select('id', count='exact')
-                .eq('user_id', self.user_id)
-                .execute()
-            )
-            
-            current_count = count_response.count
-            
-            if current_count <= self.max_snippets_per_user:
-                return
-                
-            # Get snippets to delete (oldest and lowest importance)
-            snippets_to_delete = current_count - self.max_snippets_per_user
-            
-            assert self.supabase is not None
-            response = await asyncio.to_thread(
-                lambda: self.supabase.table('memory_snippets')
-                .select('id')
-                .eq('user_id', self.user_id)
-                .order('importance', desc=False)
-                .order('created_at', desc=False)
-                .limit(snippets_to_delete)
-                .execute()
-            )
-            
-            if response.data:
-                ids_to_delete = [item['id'] for item in response.data]
-                assert self.supabase is not None
-                await asyncio.to_thread(
-                    lambda: self.supabase.table('memory_snippets')
-                    .delete()
-                    .in_('id', ids_to_delete)
-                    .execute()
-                )
-                logger.info(f"✅ Pruned {len(ids_to_delete)} old facts")
-                
-        except Exception as e:
-            logger.error(f"❌ Error pruning old facts: {e}")
-
-    async def handle_user_turn(self, user_msg: str, assistant_msg: str, llm_interface) -> None:
-        """
-        Main pipeline for handling user turns and storing personal facts.
+        Simple handler for user turns - just stores the conversation.
         
         Args:
             user_msg: The user's message
             assistant_msg: The assistant's response
-            llm_interface: LLM interface for classification and summarization
+            llm_interface: LLM interface (optional, for future use)
         """
         if not user_msg.strip():
             return
             
         try:
-            # 1. Check for explicit verbs
-            user_lower = user_msg.lower()
-            explicit_keywords = ("remember", "save this", "note this")
+            # Store the conversation messages
+            await self.add_message("user", user_msg)
+            await self.add_message("model", assistant_msg)
             
-            if any(keyword in user_lower for keyword in explicit_keywords):
-                # Store raw or summarized version
-                bullet = await self._summarize_to_bullet(user_msg, llm_interface)
-                await self._store_fact(bullet)
-                return
-            
-            # 2. Run the classification
-            if await self._classify_personal_fact(user_msg, llm_interface):
-                # 3. Summarize into one bullet
-                bullet = await self._summarize_to_bullet(user_msg, llm_interface)
-                await self._store_fact(bullet)
+            # Extract basic facts if LLM interface is available
+            if llm_interface:
+                try:
+                    facts = await llm_interface.extract_facts(f"User: {user_msg}\nAI: {assistant_msg}")
+                    if facts:
+                        await self.update_user_profile(facts)
+                except Exception as e:
+                    logger.warning(f"Failed to extract facts: {e}")
             
         except Exception as e:
             logger.error(f"❌ Error in handle_user_turn: {e}")
 
-    async def get_memory_snippets(self, query_text: str, max_results: int = 5) -> List[Dict]:
-        """
-        Retrieve memory snippets semantically similar to the query.
-        """
-        if not self.embedding_model or not self.use_supabase or not self.supabase:
-            return []
-            
-        try:
-            query_embedding = self.embedding_model.encode(query_text).tolist()
-            
-            assert self.supabase is not None
-            response = await asyncio.to_thread(
-                lambda: self.supabase.rpc(
-                    'match_memory_snippets',
-                    {
-                        'query_embedding': query_embedding,
-                        'match_threshold': 0.35,
-                        'match_count': max_results,
-                        'user_id': self.user_id
-                    }
-                ).execute()
-            )
-            
-            return response.data or []
-            
-        except Exception as e:
-            error_str = str(e).lower()
-            if '404' in error_str or 'function' in error_str:
-                logger.warning("⚠️ Memory snippets search function not available")
-            else:
-                logger.error(f"❌ Error retrieving memory snippets: {e}")
-            return []
-
 # --- Example Usage ---
 async def main():
-    """Example of how to use the async ConversationManager."""
-    print("--- ConversationManager Example ---")
+    """Example of how to use the simplified ConversationManager."""
+    print("--- Simplified ConversationManager Example ---")
     manager = ConversationManager("user_123")
     
     if not manager.use_supabase:
@@ -616,8 +265,8 @@ async def main():
     await manager.add_message("user", "And what is its most famous landmark?")
     await manager.add_message("model", "That would likely be the Colosseum.")
 
-    print("\nSearching for context related to 'famous places there'...")
-    context = await manager.get_context_for_llm("famous places there")
+    print("\nGetting context for LLM...")
+    context = await manager.get_context_for_llm()
 
     print("\nRetrieved Context:")
     for item in context:
@@ -626,8 +275,4 @@ async def main():
     print("\n--- ConversationManager Example Complete ---")
 
 if __name__ == '__main__':
-    # This requires a running event loop to work.
-    # To run this file directly: python -m asyncio
-    # And then in the REPL: from src.conversation import main; await main()
-    # Or simply run the server.py which uses this class.
     print("To test this module, run server.py or use an asyncio REPL.")
