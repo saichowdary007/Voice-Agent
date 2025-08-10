@@ -146,15 +146,14 @@ LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "150"))
 LLM_ENDPOINT_URL = os.getenv("LLM_ENDPOINT_URL")
 LLM_ENDPOINT_HEADERS = {}
 
-# Set up Google/Gemini configuration
+# Set up Google/Gemini configuration for Deepgram Agent
 if LLM_PROVIDER_TYPE == "google" and GEMINI_API_KEY:
-    # Try v1 API instead of v1beta to avoid field compatibility issues
-    LLM_ENDPOINT_URL = f"https://generativelanguage.googleapis.com/v1/models/{LLM_MODEL}:generateContent"
+    # Use v1beta endpoint which supports system_instruction and more features
+    LLM_ENDPOINT_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{LLM_MODEL}:generateContent?key={GEMINI_API_KEY}"
     LLM_ENDPOINT_HEADERS = {
-        "x-goog-api-key": GEMINI_API_KEY,
-        "content-type": "application/json"
+        "Content-Type": "application/json"
     }
-    print(f"Configuring Google provider with v1 API endpoint: {LLM_ENDPOINT_URL}")
+    print(f"Configuring Google provider for Deepgram Agent: {LLM_MODEL}")
 elif os.getenv("LLM_ENDPOINT_AUTH_TOKEN"):
     LLM_ENDPOINT_HEADERS["authorization"] = f"Bearer {os.getenv('LLM_ENDPOINT_AUTH_TOKEN')}"
 

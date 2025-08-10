@@ -259,9 +259,9 @@ class DeepgramVoiceAgent:
             
             # Adjusted STT settings for better speech detection
             options.agent.listen.interim_results = True  # Enable streaming results
-            options.agent.listen.endpointing = 100  # ms of silence to mark endpoint (more sensitive)
-            options.agent.listen.utterance_end_ms = 500  # shorter utterance timeout for faster detection
-            options.agent.listen.vad_turnoff = 100  # more sensitive VAD turnoff
+            options.agent.listen.endpointing = 50  # ms of silence to mark endpoint (more sensitive)
+            options.agent.listen.utterance_end_ms = 300  # shorter utterance timeout for faster detection
+            options.agent.listen.vad_turnoff = 50  # more sensitive VAD turnoff
             options.agent.listen.smart_format = True  # Enable smart formatting for better transcripts
             # Align language with backend config default
             try:
@@ -289,25 +289,30 @@ class DeepgramVoiceAgent:
             options.agent.think.provider.type = LLM_PROVIDER_TYPE
             options.agent.think.provider.temperature = LLM_TEMPERATURE
             
-            # Add a system prompt to guide the agent's responses
-            options.agent.think.prompt = "You are a helpful AI voice assistant. Respond naturally and conversationally to user questions. Keep your responses concise but informative. Always respond when the user speaks to you."
+            # Avoid setting a custom think.prompt to prevent provider payload translation issues
             
-            # Set up custom endpoint for providers that require it
-            if LLM_ENDPOINT_URL and LLM_ENDPOINT_HEADERS:
-                options.agent.think.endpoint = {
-                    "url": LLM_ENDPOINT_URL,
-                    "headers": LLM_ENDPOINT_HEADERS
-                }
-                logger.info(f"Using custom endpoint for {LLM_PROVIDER_TYPE}: {LLM_ENDPOINT_URL}")
-                # For Google with custom endpoint, model is in URL - use a placeholder or empty model
-                if LLM_PROVIDER_TYPE == "google":
-                    logger.info("Google custom endpoint detected - model specified in URL, not in provider settings")
-                    # Don't set model at all for Google custom endpoints
-                else:
-                    options.agent.think.provider.model = LLM_MODEL
+            # Set provider model / endpoint
+            if LLM_PROVIDER_TYPE == "google":
+                # Use Deepgram-managed Google integration; set model directly and clear any endpoint
+                options.agent.think.provider.model = LLM_MODEL or "gemini-2.0-flash"
+                try:
+                    if hasattr(options.agent.think, 'endpoint'):
+                        delattr(options.agent.think, 'endpoint')
+                except Exception:
+                    pass
+                logger.info("Google provider configured with native Deepgram management")
             else:
-                # No custom endpoint, set model normally
-                options.agent.think.provider.model = LLM_MODEL
+                # Use a custom endpoint only when explicitly provided (e.g., groq) and headers are present
+                if LLM_ENDPOINT_URL and LLM_ENDPOINT_HEADERS:
+                    options.agent.think.endpoint = {
+                        "url": LLM_ENDPOINT_URL,
+                        "headers": LLM_ENDPOINT_HEADERS
+                    }
+                    logger.info(f"Using custom endpoint for {LLM_PROVIDER_TYPE}: {LLM_ENDPOINT_URL}")
+                    options.agent.think.provider.model = LLM_MODEL
+                else:
+                    # No custom endpoint, set model normally
+                    options.agent.think.provider.model = LLM_MODEL
             
             # Validate API keys for the selected provider
             provider_valid = False
@@ -316,9 +321,8 @@ class DeepgramVoiceAgent:
             elif LLM_PROVIDER_TYPE == "anthropic" and ANTHROPIC_API_KEY:
                 provider_valid = True
             elif LLM_PROVIDER_TYPE == "google" and GEMINI_API_KEY:
-                # Try Google provider with native Deepgram management (like OpenAI/Anthropic)
                 provider_valid = True
-                logger.info(f"Google provider configured with native Deepgram management")
+                logger.info("Google provider configured with native Deepgram management")
             elif LLM_PROVIDER_TYPE == "groq" and GROQ_API_KEY:
                 # Groq requires explicit endpoint with headers per API spec
                 provider_valid = bool(LLM_ENDPOINT_URL and LLM_ENDPOINT_HEADERS)
@@ -326,24 +330,27 @@ class DeepgramVoiceAgent:
             # If provider not valid, try fallbacks
             if not provider_valid:
                 logger.warning(f"Provider '{LLM_PROVIDER_TYPE}' not properly configured, trying fallbacks...")
-                
-                # Try OpenAI first (even with test key to see error)
+                # Try OpenAI fallback
                 if OPENAI_API_KEY:
                     logger.info("Falling back to OpenAI GPT-4o-mini")
                     options.agent.think.provider.type = "open_ai"
                     options.agent.think.provider.model = "gpt-4o-mini"
-                    # Clear custom endpoint for OpenAI
                     if hasattr(options.agent.think, 'endpoint'):
-                        delattr(options.agent.think, 'endpoint')
+                        try:
+                            delattr(options.agent.think, 'endpoint')
+                        except Exception:
+                            pass
                     provider_valid = True
-                # Try Anthropic as second fallback
+                # Try Anthropic fallback
                 elif ANTHROPIC_API_KEY:
                     logger.info("Falling back to Anthropic Claude")
                     options.agent.think.provider.type = "anthropic"
-                    options.agent.think.provider.model = "claude-3-haiku-20240307"
-                    # Clear custom endpoint for Anthropic
+                    options.agent.think.provider.model = "claude-3-5-haiku-latest"
                     if hasattr(options.agent.think, 'endpoint'):
-                        delattr(options.agent.think, 'endpoint')
+                        try:
+                            delattr(options.agent.think, 'endpoint')
+                        except Exception:
+                            pass
                     provider_valid = True
                 else:
                     logger.error(f"No valid API key found for LLM provider: {LLM_PROVIDER_TYPE} and no fallback available")
@@ -359,7 +366,8 @@ class DeepgramVoiceAgent:
             options.agent.greeting = ""
 
             # Register client-side functions as tool definitions for the think provider
-            if self._function_registry:
+            # Temporarily disabled to debug camelCase error with Gemini
+            if False and self._function_registry:
                 funcs = []
                 for fname, desc in self._function_descriptions.items():
                     try:
@@ -393,26 +401,15 @@ class DeepgramVoiceAgent:
 
             if not self._conn.start(options):
                 logger.error("Failed to start Deepgram Agent WS with configured THINK provider/model")
-                # Fallbacks for common misconfigs
+                # Attempt simple Google model fallback if applicable
                 try:
-                    # If Google Gemini 2.0 model was set, fall back to 1.5-flash
                     if getattr(options.agent.think.provider, 'type', '') == 'google':
-                        current_model = getattr(options.agent.think.provider, 'model', '')
-                        if current_model.startswith('gemini-2.0'):
-                            logger.info("Falling back THINK model to gemini-2.0-flash")
-                            options.agent.think.provider.model = 'gemini-2.0-flash'
-                            if self._conn.start(options):
-                                self._keepalive_task = asyncio.create_task(self._run_keepalive())
-                                return True
-                    # If still failing and OpenAI key is available, switch provider to OpenAI
-                    if os.getenv('OPENAI_API_KEY'):
-                        logger.info("Switching THINK provider to open_ai:gpt-4o-mini as fallback")
-                        options.agent.think.provider.type = 'open_ai'
-                        options.agent.think.provider.model = 'gpt-4o-mini'
+                        logger.info("Retrying with gemini-2.0-flash")
+                        options.agent.think.provider.model = 'gemini-2.0-flash'
                         if self._conn.start(options):
                             self._keepalive_task = asyncio.create_task(self._run_keepalive())
                             return True
-                except Exception as _:
+                except Exception:
                     pass
                 return False
 
@@ -443,6 +440,19 @@ class DeepgramVoiceAgent:
             logger.info(f"📤 Sent {len(pcm16_bytes)} bytes of audio to Deepgram Agent")
         except Exception as e:
             logger.error(f"Agent send error: {e}")
+
+    def send_silence(self, duration_ms: int = 200) -> None:
+        """Send trailing PCM16 silence to help the agent segment the utterance."""
+        if self._conn is None:
+            logger.warning("Cannot send silence: agent connection is None")
+            return
+        try:
+            num_bytes = int(self._sr_in * (duration_ms / 1000.0) * 2)
+            silence = b"\x00" * num_bytes
+            self._conn.send(silence)
+            logger.info(f"📤 Sent {duration_ms}ms of trailing silence to Deepgram Agent")
+        except Exception as e:
+            logger.error(f"Agent silence send error: {e}")
 
     async def stop(self) -> None:
         if self._keepalive_task:
