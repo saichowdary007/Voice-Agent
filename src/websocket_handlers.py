@@ -409,6 +409,21 @@ async def handle_audio_chunk(
                         "message": f"Agent error: {err}",
                     }),
                 )
+                # Register a couple of simple client-side functions
+                try:
+                    from datetime import datetime
+                    websocket._dg_agent.register_function(
+                        name="ping",
+                        func=lambda args: {"ok": True, "args": args},
+                        description="Basic health check; echoes args back"
+                    )
+                    websocket._dg_agent.register_function(
+                        name="server_time",
+                        func=lambda args: {"iso": datetime.utcnow().isoformat()},
+                        description="Returns server UTC timestamp in ISO format"
+                    )
+                except Exception as reg_err:
+                    logger.warning(f"Failed to register client-side functions: {reg_err}")
                 started = await websocket._dg_agent.start()
                 websocket._dg_agent_started = started
                 if started:
@@ -425,13 +440,29 @@ async def handle_audio_chunk(
                 # Ultra-low latency: forward even smaller chunks (320 bytes = 10ms at 16kHz)
                 if decoded_pcm and len(decoded_pcm) >= 320:
                     websocket._dg_agent.send_audio(decoded_pcm)
+                    # Barge-in signal to client exactly once per utterance
+                    if not getattr(websocket, "_client_speaking", False):
+                        websocket._client_speaking = True
+                        await websocket.send_json({
+                            "type": "UserStartedSpeaking",
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
                     if is_final:
-                        # Push minimal trailing silence for faster utterance detection
+                        # Push trailing silence (~300ms) for reliable utterance detection
                         try:
-                            trailing_silence = b"\x00" * int(0.1 * 16000 * 2)  # 100ms silence
+                            trailing_silence = b"\x00" * int(0.3 * 16000 * 2)  # 300ms silence
                             websocket._dg_agent.send_audio(trailing_silence)
                         except Exception:
                             pass
+                        # Mark utterance end for client
+                        try:
+                            await websocket.send_json({
+                                "type": "UserStoppedSpeaking",
+                                "timestamp": datetime.utcnow().isoformat()
+                            })
+                        except Exception:
+                            pass
+                        websocket._client_speaking = False
                 # Reduce feedback frequency for lower overhead
                 if is_final or len(decoded_pcm) % 3200 == 0:  # Every 100ms or final
                     await websocket.send_json({
@@ -483,7 +514,8 @@ async def handle_audio_chunk(
                     # On final chunks, also send a short trailing silence to help agent segment the utterance
                     if is_final:
                         try:
-                            trailing_silence = b"\x00" * int(0.2 * 16000 * 2)  # 200ms of PCM16 silence @16kHz
+                            # Send ~300ms of silence on final to flush any buffered frames
+                            trailing_silence = b"\x00" * int(0.3 * 16000 * 2)  # 300ms of PCM16 silence @16kHz
                             websocket._dg_agent.send_audio(trailing_silence)
                         except Exception:
                             pass
@@ -670,6 +702,110 @@ async def handle_audio_chunk(
         await websocket.send_json(
             {"type": "error", "message": f"Audio processing failed: {str(e)}"}
         )
+
+
+async def handle_settings(websocket: WebSocket, message: dict):
+    """Handles Settings handshake from client and starts the Deepgram Agent early.
+
+    Accepts a superset of the Deepgram Agent Settings schema but only applies
+    the audio sample rates (input/output). Provider/model selection remains
+    environment-driven (Gemini vs OpenAI) for security.
+    """
+    try:
+        if not USE_DEEPGRAM_AGENT:
+            await websocket.send_json({
+                "type": "error",
+                "message": "Deepgram Agent is disabled on the server"
+            })
+            return
+
+        # If already started, acknowledge immediately
+        if getattr(websocket, "_dg_agent_started", False):
+            await websocket.send_json({
+                "type": "settings_applied",
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            return
+
+        # Defaults aligned to our browser capture/output
+        audio = message.get("audio", {}) if isinstance(message, dict) else {}
+        input_cfg = audio.get("input", {}) if isinstance(audio, dict) else {}
+        output_cfg = audio.get("output", {}) if isinstance(audio, dict) else {}
+
+        sr_in = int(input_cfg.get("sample_rate", 16000) or 16000)
+        sr_out = int(output_cfg.get("sample_rate", 24000) or 24000)
+
+        # Create and start agent; store on websocket
+        loop = asyncio.get_running_loop()
+
+        def send_json_threadsafe(payload: dict) -> None:
+            try:
+                asyncio.run_coroutine_threadsafe(websocket.send_json(payload), loop)
+            except Exception as send_err:
+                logger.error(f"Thread-safe send_json failed: {send_err}")
+
+        from src.config import DEEPGRAM_API_KEY
+        websocket._dg_agent = DeepgramVoiceAgent(
+            api_key=DEEPGRAM_API_KEY,
+            sample_rate_input=sr_in,
+            sample_rate_output=sr_out,
+            on_audio_ready=lambda audio_bytes, mime: send_json_threadsafe({
+                "type": "tts_audio",
+                "data": base64.b64encode(audio_bytes).decode("ascii"),
+                "mime": mime,
+            }),
+            on_text=lambda role, content: send_json_threadsafe({
+                "type": "agent_text",
+                "role": role,
+                "content": content,
+            }),
+            on_error=lambda err: send_json_threadsafe({
+                "type": "error",
+                "message": f"Agent error: {err}",
+            }),
+        )
+        # Register a couple of simple client-side functions
+        try:
+            from datetime import datetime
+            websocket._dg_agent.register_function(
+                name="ping",
+                func=lambda args: {"ok": True, "args": args},
+                description="Basic health check; echoes args back"
+            )
+            websocket._dg_agent.register_function(
+                name="server_time",
+                func=lambda args: {"iso": datetime.utcnow().isoformat()},
+                description="Returns server UTC timestamp in ISO format"
+            )
+        except Exception as reg_err:
+            logger.warning(f"Failed to register client-side functions: {reg_err}")
+
+        started = await websocket._dg_agent.start()
+        websocket._dg_agent_started = started
+        if not started:
+            await websocket.send_json({
+                "type": "error",
+                "message": "Failed to start Deepgram Agent"
+            })
+            return
+
+        # Acknowledge settings applied so client can begin streaming audio
+        await websocket.send_json({
+            "type": "settings_applied",
+            "timestamp": datetime.utcnow().isoformat(),
+            "audio": {
+                "input": {"sample_rate": sr_in},
+                "output": {"sample_rate": sr_out}
+            }
+        })
+        logger.info("✅ Settings applied and Deepgram Agent started via Settings handshake")
+
+    except Exception as e:
+        logger.error(f"Settings handling error: {e}")
+        await websocket.send_json({
+            "type": "error",
+            "message": f"Settings error: {str(e)}"
+        })
 
 
 async def handle_ping(websocket: WebSocket, message: dict):

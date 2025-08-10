@@ -752,6 +752,7 @@ app.include_router(api_router)
 from src.websocket_handlers import (
     handle_text_message,
     handle_audio_chunk,
+    handle_settings,
     handle_ping,
     handle_vad_status,
     handle_start_listening,
@@ -857,6 +858,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
             message_handlers = {
                 "text_message": handle_text_message,
                 "audio_chunk": handle_audio_chunk,
+        "Settings": handle_settings,
                 "ping": handle_ping,
                 "vad_status": handle_vad_status,
                 "start_listening": handle_start_listening,
@@ -941,7 +943,7 @@ if __name__ == "__main__":
     
     # Get configuration from environment
     host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", 8080))
+    port = int(os.getenv("PORT", 8000))
     log_level = os.getenv("LOG_LEVEL", "info").lower()
     
     logger.info(f"Starting Voice Agent API server on {host}:{port}")

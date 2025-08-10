@@ -7,6 +7,9 @@ load_dotenv()
 # --- API Keys ---
 # It's recommended to set your API key in the .env file for security
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 
 # --- Supabase Configuration ---
@@ -109,6 +112,43 @@ DEEPGRAM_STT_ENDPOINTING = int(os.getenv("DEEPGRAM_STT_ENDPOINTING", "300"))  # 
 
 # Voice Agent toggle
 USE_DEEPGRAM_AGENT = os.getenv("USE_DEEPGRAM_AGENT", "true").lower() == "true"
+
+# --- LLM Provider Configuration ---
+# LLM provider type: open_ai, anthropic, google, groq
+# Use DG_THINK_PROVIDER from .env if set, otherwise choose based on available keys
+_dg_provider = os.getenv("DG_THINK_PROVIDER")
+if _dg_provider:
+    LLM_PROVIDER_TYPE = _dg_provider
+else:
+    _default_provider = (
+        "open_ai" if OPENAI_API_KEY else
+        ("anthropic" if ANTHROPIC_API_KEY else "google")
+    )
+    LLM_PROVIDER_TYPE = os.getenv("LLM_PROVIDER_TYPE", _default_provider)
+
+# Use DG_THINK_MODEL from .env if set
+_dg_model = os.getenv("DG_THINK_MODEL")
+if _dg_model:
+    LLM_MODEL = _dg_model
+else:
+    LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
+
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "150"))
+
+# Custom LLM endpoint configuration (optional for open_ai/anthropic, required for others)
+LLM_ENDPOINT_URL = os.getenv("LLM_ENDPOINT_URL")
+LLM_ENDPOINT_HEADERS = {}
+
+# Set up Google/Gemini configuration
+if LLM_PROVIDER_TYPE == "google" and GEMINI_API_KEY:
+    # Set the Google API key in environment for Deepgram Agent to use
+    os.environ["GOOGLE_API_KEY"] = GEMINI_API_KEY
+    # Try without custom endpoint first - let Deepgram handle Google natively
+    # Based on the documentation, Google might be managed by Deepgram like OpenAI/Anthropic
+    print(f"Configuring Google provider with native Deepgram management")
+elif os.getenv("LLM_ENDPOINT_AUTH_TOKEN"):
+    LLM_ENDPOINT_HEADERS["authorization"] = f"Bearer {os.getenv('LLM_ENDPOINT_AUTH_TOKEN')}"
 
 # TTS Configuration  
 DEEPGRAM_TTS_MODEL = os.getenv("DEEPGRAM_TTS_MODEL", "aura-asteria-en")

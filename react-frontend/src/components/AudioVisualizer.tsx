@@ -531,7 +531,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         audioRecordingBuffer.push(resampledData);
         
         // Ultra-low latency: Send chunks every ~200ms for faster response
-        if (audioRecordingBuffer.length >= 10) { // ~200ms worth of frames (10 * 20ms)
+        if ((window as any).voiceAgentReady && audioRecordingBuffer.length >= 10) { // ~200ms (10 * 20ms)
           sendAudioToBackend(false); // is_final = false
         }
       };
@@ -543,6 +543,10 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         if (audioRecordingBuffer.length === 0) return;
         
         try {
+          if (!(window as any).voiceAgentReady) {
+            // Hold until SettingsApplied
+            return;
+          }
           // Concatenate all buffered audio frames
           const totalLength = audioRecordingBuffer.reduce((sum, arr) => sum + arr.length, 0);
           const combinedAudio = new Float32Array(totalLength);

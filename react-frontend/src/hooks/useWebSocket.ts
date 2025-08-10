@@ -39,6 +39,9 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
   const [lastMessage, setLastMessage] = useState<WebSocketMessage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected');
+  const settingsAppliedRef = useRef(false);
+  const settingsSentRef = useRef(false);
+  const stopPlaybackRef = useRef<(() => void) | null>(null);
   
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -89,6 +92,15 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
         audio.onerror = () => {
           URL.revokeObjectURL(audioUrl);
         };
+
+        // Expose stop for barge-in
+        stopPlaybackRef.current = () => {
+          try {
+            audio.pause();
+          } catch {}
+          URL.revokeObjectURL(audioUrl);
+          stopPlaybackRef.current = null;
+        };
       } catch (error) {
         console.error('❌ Failed to process audio response:', error);
       }
@@ -117,6 +129,13 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
               source.connect(audioContext.destination);
               source.start(0);
               console.log('🔊 Playing AI response audio (Web Audio API - ultra-low latency)');
+
+              // Expose stop for barge-in
+              stopPlaybackRef.current = () => {
+                try { source.stop(0); } catch {}
+                try { audioContext.close(); } catch {}
+                stopPlaybackRef.current = null;
+              };
             },
             () => {
               // Fallback to HTML5 audio on decode error
@@ -140,6 +159,9 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
       playWithHTMLAudio();
     }
   }, []);
+
+  // Track last time we played server-provided TTS audio to avoid double-speaking
+  const lastTTSAudioAtRef = useRef<number>(0);
 
   const sendMessage = useCallback((message: any) => {
     if (socket && socket.readyState === WebSocket.OPEN) {
@@ -306,12 +328,59 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           try {
             const message: WebSocketMessage = JSON.parse(event.data);
             
+            // Handle welcome -> send Settings
+            if (message.type === 'connection' && !settingsSentRef.current) {
+              try {
+                const settings = {
+                  type: 'Settings',
+                  tags: ['prod', 'voice_agent'],
+                  audio: {
+                    input: { encoding: 'linear16', sample_rate: 16000 },
+                    output: { encoding: 'linear16', sample_rate: 24000, container: 'none' }
+                  },
+                  agent: {
+                    language: 'en',
+                    listen: { provider: { type: 'deepgram', model: 'nova-3', smart_format: false } },
+                    think: { provider: { type: 'google', model: 'gemini-2.0-flash', temperature: 0.6 } },
+                    speak: { provider: { type: 'deepgram', model: 'aura-2-thalia-en' } },
+                    greeting: 'Hi! How can I help today?'
+                  }
+                };
+                newSocket.send(JSON.stringify(settings));
+                settingsSentRef.current = true;
+                console.log('⚙️ Sent Settings to server');
+              } catch (e) {
+                console.error('Failed to send Settings:', e);
+              }
+            }
+
+            // Settings applied -> enable mic streaming
+            if (message.type === 'settings_applied' && !settingsAppliedRef.current) {
+              settingsAppliedRef.current = true;
+              (window as any).voiceAgentReady = true;
+              console.log('✅ SettingsApplied received; mic streaming enabled');
+              setLastMessage(message);
+              onMessage?.(message);
+              return;
+            }
+
+            // Barge-in: user started speaking -> stop TTS playback immediately
+            if (message.type === 'speech_started' || message.type === 'UserStartedSpeaking') {
+              if (stopPlaybackRef.current) {
+                try { stopPlaybackRef.current(); } catch {}
+                stopPlaybackRef.current = null;
+                console.log('🛑 Barge-in: Stopped TTS playback');
+              }
+            }
+
             // Ultra-low latency: prioritize audio messages for immediate processing
             if ((message.type === 'audio_response' || message.type === 'audio_stream' || message.type === 'tts_audio') && message.data) {
               const mime = message.mime || 'audio/wav';
               console.log(`🔊 Received ${message.type} (${message.data.length} bytes)`);
               // Process audio immediately without waiting for other message handling
               playAudioResponse(message.data, mime);
+              // Mark that server-provided audio just played to suppress fallback TTS
+              lastTTSAudioAtRef.current = Date.now();
               setLastMessage(message);
               onMessage?.(message);
               return; // Skip other processing for audio messages
@@ -347,6 +416,25 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
                 // Backend may include helpful feedback + debug_info
                 const dbg = (message as any).debug_info;
                 console.warn('🛈 STT feedback:', (message as any).message, dbg ? { debug_info: dbg } : undefined);
+              }
+            }
+
+            // Fallback: if we receive text but no server audio, synthesize speech client-side
+            if ((message.type === 'text_response' && (message as any).text) || (message.type === 'agent_text' && (message as any).content)) {
+              const text = (message as any).text || (message as any).content;
+              const now = Date.now();
+              // Only speak if we haven't played server audio very recently (avoid double)
+              if (typeof window !== 'undefined' && 'speechSynthesis' in window && now - lastTTSAudioAtRef.current > 1500) {
+                try {
+                  const utterance = new SpeechSynthesisUtterance(text);
+                  utterance.rate = 1.0;
+                  utterance.pitch = 1.0;
+                  window.speechSynthesis.cancel();
+                  window.speechSynthesis.speak(utterance);
+                  console.log('🗣️ Spoke response via SpeechSynthesis fallback');
+                } catch (e) {
+                  console.warn('SpeechSynthesis fallback failed:', e);
+                }
               }
             }
             
@@ -419,6 +507,9 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           }
 
           stopHeartbeat();
+          settingsAppliedRef.current = false;
+          settingsSentRef.current = false;
+          (window as any).voiceAgentReady = false;
         };
 
         setSocket(newSocket);
