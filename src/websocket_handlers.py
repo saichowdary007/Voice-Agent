@@ -98,6 +98,15 @@ class DeepgramAgentProxy:
                                     })
                                     continue
 
+                                # Connection ack from client (ignore to keep protocol tidy)
+                                if msg_type == "connection":
+                                    await self.client_ws.send_json({
+                                        "type": "connection_ack",
+                                        "message": "Connection acknowledged",
+                                        "timestamp": datetime.utcnow().isoformat()
+                                    })
+                                    continue
+
                                 # Handle telemetry acks to avoid client warnings
                                 if msg_type in ("stt_client_info", "stt_metrics"):
                                     await self.client_ws.send_json({
@@ -110,9 +119,11 @@ class DeepgramAgentProxy:
                                 if msg_type in ("settings", "Settings"):
                                     try:
                                         new_settings = self._parse_settings_message(data)
+                                        # Avoid race with agent.events() recv; fire-and-forget apply
                                         ok = await self.agent.apply_settings(new_settings)
                                         payload = {
-                                            "type": "settings_applied" if ok else "settings_error",
+                                            # Reflect that settings were sent; final ack comes from agent
+                                            "type": "settings_sent" if ok else "settings_error",
                                             "timestamp": datetime.utcnow().isoformat(),
                                         }
                                         if ok and self.agent.last_settings_latency_ms is not None:

@@ -530,8 +530,8 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         // Store the resampled float data directly (simpler and cleaner)
         audioRecordingBuffer.push(resampledData);
         
-        // Ultra-low latency: Send chunks every ~200ms for faster response
-        if ((window as any).voiceAgentReady && audioRecordingBuffer.length >= 10) { // ~200ms (10 * 20ms)
+        // Ultra-low latency: Send chunks every ~40ms for faster response
+        if ((window as any).voiceAgentReady && audioRecordingBuffer.length >= 2) { // ~40ms (2 * ~20ms)
           sendAudioToBackend(false); // is_final = false
         }
       };
@@ -565,39 +565,26 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
             pcmData[i] = Math.round(sample * 32767);
           }
           
-          // Convert to bytes for backend processing
-          const audioBytes = new Uint8Array(pcmData.buffer);
-          const base64Audio = btoa(String.fromCharCode.apply(null, Array.from(audioBytes)));
-           
-           // Send via WebSocket (note: WebSocket logic will be implemented separately)
-           const audioMessage = {
-             type: "audio_chunk",
-             data: base64Audio,
-             is_final: isFinal,
-             sample_rate: 16000, // Always 16kHz after resampling
-             timestamp: Date.now()
-           };
-           
-           // This will be connected to the WebSocket hook
-           const ws = (window as any).voiceAgentWebSocket;
-           if (ws && ws.readyState === WebSocket.OPEN) {
-             try {
-               console.log(`🎵 Sending audio chunk: ${audioBytes.length} bytes, final: ${isFinal}`);
-               ws.send(JSON.stringify(audioMessage));
-             } catch (error) {
-               console.error('❌ Failed to send audio message:', error);
-             }
-           } else {
-             console.warn('⚠️ WebSocket not connected, discarding audio chunk', {
-               wsExists: !!ws,
-               readyState: ws?.readyState,
-               expectedState: WebSocket.OPEN
-             });
-           }
+          // Send raw binary PCM directly for lowest latency and zero base64 overhead
+          const ws = (window as any).voiceAgentWebSocket;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            try {
+              console.log(`🎵 Sending PCM chunk: ${pcmData.byteLength} bytes, final: ${isFinal}`);
+              ws.send(pcmData.buffer);
+            } catch (error) {
+              console.error('❌ Failed to send audio message:', error);
+            }
+          } else {
+            console.warn('⚠️ WebSocket not connected, discarding audio chunk', {
+              wsExists: !!ws,
+              readyState: ws?.readyState,
+              expectedState: WebSocket.OPEN
+            });
+          }
           
           // Clear the buffer for non-final chunks (keep minimal overlap)
           if (!isFinal) {
-            audioRecordingBuffer = audioRecordingBuffer.slice(-40); // Keep ~800-1000ms for robust finalization
+            audioRecordingBuffer = audioRecordingBuffer.slice(-2); // Keep ~40ms overlap for continuity
           }
           
         } catch (error) {

@@ -44,7 +44,7 @@ class AgentEventRouter:
         if msg_type in ["AgentErrors", "AgentWarnings", "Error", "Warning"]:
             return {
                 "type": "error",
-                "message": data.get("message", "Agent error occurred"),
+                "message": data.get("message") or data.get("description") or "Agent error occurred",
                 "timestamp": datetime.utcnow().isoformat(),
             }
         # Pass-through unknowns for debugging

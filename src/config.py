@@ -22,11 +22,11 @@ USE_SUPABASE = USE_SUPABASE_ENV and bool(SUPABASE_URL and SUPABASE_KEY)
 USE_DEEPGRAM_AGENT = True  # Always enabled for this implementation
 DEEPGRAM_AGENT_ENDPOINT = "wss://agent.deepgram.com/v1/agent/converse"
 
-# Audio settings for browser compatibility
+# Audio settings tuned for latency
 AUDIO_INPUT_ENCODING = "linear16"
-AUDIO_INPUT_SAMPLE_RATE = 24000  # 24kHz for browser compatibility
+AUDIO_INPUT_SAMPLE_RATE = 16000  # 16kHz aligns with microphone downsampling and DG low-latency STT
 AUDIO_OUTPUT_ENCODING = "linear16"
-AUDIO_OUTPUT_SAMPLE_RATE = 24000  # 24kHz for browser compatibility
+AUDIO_OUTPUT_SAMPLE_RATE = 24000  # 24kHz for high-quality TTS playback
 
 # --- Database ---
 # PostgreSQL (legacy support)

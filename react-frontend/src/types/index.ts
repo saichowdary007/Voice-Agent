@@ -33,7 +33,7 @@ export interface ChatResponse {
 }
 
 export interface WebSocketMessage {
-  type: 'message' | 'audio' | 'status' | 'error' | 'audio_response' | 'audio_stream' | 'tts_audio' | 'vad_status' | 'text_response' | 'audio_processed' | 'listening_started' | 'listening_stopped' | 'heartbeat' | 'heartbeat_ack' | 'pong' | 'stt_result' | 'stt_partial' | 'audio_chunk' | 'ping' | 'agent_text' | 'connection' | 'settings_applied' | 'speech_started' | 'UserStartedSpeaking' | 'UserStoppedSpeaking';
+  type: 'message' | 'audio' | 'status' | 'error' | 'audio_response' | 'audio_stream' | 'tts_audio' | 'vad_status' | 'text_response' | 'audio_processed' | 'listening_started' | 'listening_stopped' | 'heartbeat' | 'heartbeat_ack' | 'pong' | 'stt_result' | 'stt_partial' | 'audio_chunk' | 'ping' | 'agent_text' | 'connection' | 'connection_ack' | 'settings_applied' | 'speech_started' | 'UserStartedSpeaking' | 'UserStoppedSpeaking' | 'user_started_speaking';
   data?: any;
   text?: string;
   content?: string;

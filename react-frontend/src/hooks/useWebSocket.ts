@@ -41,6 +41,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected');
   const settingsAppliedRef = useRef(false);
   const settingsSentRef = useRef(false);
+  const settingsSendTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const stopPlaybackRef = useRef<(() => void) | null>(null);
   
   const reconnectAttemptsRef = useRef(0);
@@ -208,7 +209,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
         setConnectionStatus('connecting');
         setError(null);
 
-        // Convert http(s) URL to ws(s) if needed
+          // Convert http(s) URL to ws(s) if needed
         const baseUrl = url.startsWith('http')
           ? url.replace(/^http/, 'ws')
           : url;
@@ -221,7 +222,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
         // Establish WebSocket connection (no subprotocol; server does not negotiate any)
         const newSocket = new WebSocket(wsUrl);
         
-        // Ultra-low latency optimizations
+          // Ultra-low latency optimizations
         if ('binaryType' in newSocket) {
           newSocket.binaryType = 'arraybuffer'; // Faster than blob
         }
@@ -230,7 +231,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
         // Heartbeat timer id
         let heartbeatId: NodeJS.Timeout | null = null;
 
-        const startHeartbeat = () => {
+          const startHeartbeat = () => {
           heartbeatId = setInterval(() => {
             if (newSocket.readyState === WebSocket.OPEN) {
               try {
@@ -248,7 +249,12 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
                   }
                 }
                 
+                // App-level heartbeat
                 newSocket.send(JSON.stringify({ type: 'heartbeat', timestamp: now }));
+                // Deepgram KeepAlive to prevent 1005 idle close (send as text frame)
+                try {
+                  newSocket.send(JSON.stringify({ type: 'KeepAlive' }));
+                } catch {}
               } catch (error) {
                 console.error('Failed to send heartbeat:', error);
                 stopHeartbeat();
@@ -256,7 +262,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
             } else {
               stopHeartbeat();
             }
-          }, 60000); // 60-second heartbeat (optimized for latency)
+          }, 5000); // 5-second keepalive/heartbeat cadence to avoid 10s idle timeout
         };
 
         const stopHeartbeat = () => {
@@ -328,44 +334,71 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           try {
             const message: WebSocketMessage = JSON.parse(event.data);
             
-            // Handle welcome -> send Settings
-            if (message.type === 'connection' && !settingsSentRef.current) {
-              try {
-                const settings = {
-                  type: 'Settings',
-                  tags: ['prod', 'voice_agent'],
-                  audio: {
-                    input: { encoding: 'linear16', sample_rate: 16000 },
-                    output: { encoding: 'linear16', sample_rate: 24000, container: 'none' }
-                  },
-                  agent: {
-                    language: 'en',
-                    listen: { provider: { type: 'deepgram', model: 'nova-3', smart_format: false } },
-                    think: { provider: { type: 'google', model: 'gemini-2.0-flash', temperature: 0.6 } },
-                    speak: { provider: { type: 'deepgram', model: 'aura-2-thalia-en' } },
-                    greeting: 'Hi! How can I help today?'
-                  }
-                };
-                newSocket.send(JSON.stringify(settings));
-                settingsSentRef.current = true;
-                console.log('⚙️ Sent Settings to server');
-              } catch (e) {
-                console.error('Failed to send Settings:', e);
-              }
+            // Defer sending Settings: schedule after initial connection unless SettingsApplied arrives
+            const scheduleSettingsSend = () => {
+              if (settingsAppliedRef.current || settingsSentRef.current) return;
+              if (settingsSendTimeoutRef.current) clearTimeout(settingsSendTimeoutRef.current);
+              settingsSendTimeoutRef.current = setTimeout(() => {
+                if (settingsAppliedRef.current || settingsSentRef.current) return;
+                try {
+                  const settings = {
+                    type: 'Settings',
+                    tags: ['prod', 'voice_agent'],
+                    audio: {
+                      input: { encoding: 'linear16', sample_rate: 16000 },
+                      output: { encoding: 'linear16', sample_rate: 24000, container: 'none' }
+                    },
+                    agent: {
+                      language: 'en',
+                      listen: { provider: { type: 'deepgram', model: 'nova-3', smart_format: false } },
+                      think: { provider: { type: 'google', model: 'gemini-2.0-flash', temperature: 0.6 } },
+                      speak: { provider: { type: 'deepgram', model: 'aura-2-thalia-en' } },
+                      greeting: 'Hi! How can I help today?'
+                    }
+                  };
+                  newSocket.send(JSON.stringify(settings));
+                  settingsSentRef.current = true;
+                  console.log('⚙️ Sent Settings to server (deferred)');
+                } catch (e) {
+                  console.error('Failed to send Settings:', e);
+                }
+              }, 1200);
+            };
+
+            if ((message.type === 'connection' || message.type === 'connection_ack') && !settingsSentRef.current) {
+              scheduleSettingsSend();
             }
 
             // Settings applied -> enable mic streaming
             if (message.type === 'settings_applied' && !settingsAppliedRef.current) {
               settingsAppliedRef.current = true;
               (window as any).voiceAgentReady = true;
+              if (settingsSendTimeoutRef.current) {
+                clearTimeout(settingsSendTimeoutRef.current);
+                settingsSendTimeoutRef.current = null;
+              }
               console.log('✅ SettingsApplied received; mic streaming enabled');
               setLastMessage(message);
               onMessage?.(message);
               return;
             }
 
+            // If server reports settings already applied, treat as applied success
+            if (message.type === 'error' && typeof (message as any).message === 'string' && (message as any).message.includes('SETTINGS_ALREADY_APPLIED')) {
+              settingsAppliedRef.current = true;
+              (window as any).voiceAgentReady = true;
+              if (settingsSendTimeoutRef.current) {
+                clearTimeout(settingsSendTimeoutRef.current);
+                settingsSendTimeoutRef.current = null;
+              }
+              console.log('✅ Settings already applied on server; mic streaming enabled');
+              setLastMessage({ ...message, type: 'settings_applied' } as any);
+              onMessage?.({ ...message, type: 'settings_applied' } as any);
+              return;
+            }
+
             // Barge-in: user started speaking -> stop TTS playback immediately
-            if (message.type === 'speech_started' || message.type === 'UserStartedSpeaking') {
+            if (message.type === 'speech_started' || message.type === 'UserStartedSpeaking' || message.type === 'user_started_speaking') {
               if (stopPlaybackRef.current) {
                 try { stopPlaybackRef.current(); } catch {}
                 stopPlaybackRef.current = null;
