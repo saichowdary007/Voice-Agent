@@ -47,6 +47,9 @@ class DeepgramAgentProxy:
         self.bridge = AgentConversationBridge(user_id)
         self.running = False
         self.tasks = []
+        # Track settings state for idempotency and accumulate TTS until utterance end
+        self.settings_established: bool = False
+        self._tts_pcm_buffer = bytearray()
          
     async def start(self):
         """Start the proxy connection to Deepgram Voice Agent"""
@@ -115,24 +118,33 @@ class DeepgramAgentProxy:
                                     })
                                     continue
 
-                                # Dynamic settings update
+                                # Dynamic settings update (idempotent)
                                 if msg_type in ("settings", "Settings"):
                                     try:
-                                        new_settings = self._parse_settings_message(data)
-                                        # Avoid race with agent.events() recv; fire-and-forget apply
-                                        ok = await self.agent.apply_settings(new_settings)
-                                        payload = {
-                                            # Reflect that settings were sent; final ack comes from agent
-                                            "type": "settings_sent" if ok else "settings_error",
-                                            "timestamp": datetime.utcnow().isoformat(),
-                                        }
-                                        if ok and self.agent.last_settings_latency_ms is not None:
-                                            payload["latency_ms"] = round(self.agent.last_settings_latency_ms, 2)
-                                            logger.info(
-                                                "SettingsApplied latency(ms)=%s",
-                                                payload["latency_ms"],
-                                            )
-                                        await self.client_ws.send_json(payload)
+                                        if self.settings_established:
+                                            # Idempotent: acknowledge but do not re-apply
+                                            await self.client_ws.send_json({
+                                                "type": "settings_applied",
+                                                "message": "Received Settings when settings were already established.",
+                                                "timestamp": datetime.utcnow().isoformat(),
+                                            })
+                                        else:
+                                            # No KeepAlive for Voice Agent V1
+                                            new_settings = self._parse_settings_message(data)
+                                            # Avoid race with agent.events() recv; fire-and-forget apply
+                                            ok = await self.agent.apply_settings(new_settings)
+                                            payload = {
+                                                # Reflect that settings were sent; final ack comes from agent
+                                                "type": "settings_sent" if ok else "settings_error",
+                                                "timestamp": datetime.utcnow().isoformat(),
+                                            }
+                                            if ok and self.agent.last_settings_latency_ms is not None:
+                                                payload["latency_ms"] = round(self.agent.last_settings_latency_ms, 2)
+                                                logger.info(
+                                                    "SettingsApplied latency(ms)=%s",
+                                                    payload["latency_ms"],
+                                                )
+                                            await self.client_ws.send_json(payload)
                                     except Exception as se:
                                         await self.client_ws.send_json({
                                             "type": "settings_error",
@@ -216,15 +228,52 @@ class DeepgramAgentProxy:
                                 # Skip forwarding to client as a normal agent message
                                 continue
                         if isinstance(event, dict) and event.get("type") == "AudioData":
-                            await self.client_ws.send_json(self.router.wrap_audio(event["data"]))
+                            # Accumulate PCM chunks until AgentAudioDone for single-utterance playback
+                            try:
+                                chunk = event.get("data") or b""
+                                if isinstance(chunk, (bytes, bytearray)):
+                                    pcm_bytes = bytes(chunk)
+                                    self._tts_pcm_buffer.extend(pcm_bytes)
+                                    # Also stream incrementally to client for immediate playback
+                                    try:
+                                        await self.client_ws.send_json(self.router.wrap_audio(pcm_bytes))
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
                         else:
                             transformed = self.router.transform(event if isinstance(event, dict) else {})
                             if transformed:
                                 # Add latency metric when settings applied
                                 if transformed.get("type") == "settings_applied" and self.agent.last_settings_latency_ms is not None:
                                     transformed["latency_ms"] = round(self.agent.last_settings_latency_ms, 2)
+                                    # Mark settings established for idempotency
+                                    self.settings_established = True
+                                    # Prime the stream with 100ms of silence to prevent early idle-closes
+                                    try:
+                                        silence_ms = 100
+                                        samples = int(self.agent._settings.input_sample_rate * silence_ms / 1000)
+                                        bytes_len = samples * 2  # 16-bit PCM mono
+                                        asyncio.create_task(self.agent.send_audio(b"\x00" * bytes_len))
+                                    except Exception:
+                                        pass
 
                                 await self.client_ws.send_json(transformed)
+
+                                # On utterance boundary, send a single WAV blob built from buffered PCM
+                                if transformed.get("type") == "agent_audio_done":
+                                    if self._tts_pcm_buffer:
+                                        try:
+                                            wav_msg = self.router.wrap_audio(bytes(self._tts_pcm_buffer))
+                                            # Normalize to tts_wav with sample_rate for client simplicity
+                                            normalized = {
+                                                "type": "tts_wav",
+                                                "data": wav_msg.get("data"),
+                                                "sample_rate": AUDIO_OUTPUT_SAMPLE_RATE,
+                                            }
+                                            await self.client_ws.send_json(normalized)
+                                        finally:
+                                            self._tts_pcm_buffer.clear()
 
                                 # Persist conversation text when available
                                 if transformed.get("type") == "agent_text":
@@ -238,12 +287,14 @@ class DeepgramAgentProxy:
                         if not self.running:
                             break
                     
-                except websockets.exceptions.ConnectionClosed:
-                    logger.info("Deepgram WebSocket connection closed")
+                except websockets.exceptions.ConnectionClosed as e:
+                    logger.info(f"Deepgram WebSocket connection closed (code={getattr(e, 'code', '?')}, reason={getattr(e, 'reason', '')})")
                     try:
                         await self.client_ws.send_json({
                             "type": "error",
                             "message": "Agent disconnected",
+                            "code": getattr(e, 'code', None),
+                            "reason": getattr(e, 'reason', None),
                             "timestamp": datetime.utcnow().isoformat(),
                         })
                     finally:

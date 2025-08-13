@@ -42,6 +42,7 @@ class AgentSettings:
     think_provider_type: Optional[str] = LLM_PROVIDER_TYPE
     think_model: Optional[str] = LLM_MODEL
     think_temperature: Optional[float] = LLM_TEMPERATURE
+    greeting: Optional[str] = None
 
 
 class DeepgramAgentManager:
@@ -51,7 +52,7 @@ class DeepgramAgentManager:
         self,
         api_key: str = DEEPGRAM_API_KEY,
         endpoint: str = DEEPGRAM_AGENT_ENDPOINT,
-        keepalive_interval: int = 8,
+        keepalive_interval: int = 5,
         connection_timeout: int = 30,
         max_retries: int = 3,
         settings: Optional[AgentSettings] = None,
@@ -70,12 +71,11 @@ class DeepgramAgentManager:
         self.awaiting_client_settings: bool = False
 
     async def start(self) -> bool:
-        """Connect to Deepgram. Try default Settings, but if they fail, defer to client Settings.
+        """Connect to Deepgram and begin streaming events; defer Settings to the client.
 
-        We previously failed hard when default Settings were invalid (e.g., no LLM provider keys),
-        which prevented the client from sending its own Settings right after connection. This
-        implementation connects first, attempts to apply defaults, and if that fails, keeps the
-        connection running and awaits client-provided Settings.
+        We connect and start keepalive immediately, but do NOT send any default Settings here.
+        This guarantees that Welcome and SettingsApplied (triggered later by client Settings)
+        are delivered via events() to the caller. Avoids premature closes due to invalid defaults.
         """
         backoffs = [1, 2, 4]
         attempt = 0
@@ -84,32 +84,11 @@ class DeepgramAgentManager:
                 # 1) Connect to Deepgram Agent endpoint
                 await self._connect()
 
-                # 2) Try sending default Settings. If it works, we're fully ready.
-                try:
-                    loop = asyncio.get_running_loop()
-                    t0 = loop.time()
-                    await self._send_settings()
-                    ok = await self._wait_for_settings_applied(timeout=self._connection_timeout)
-                    if ok:
-                        self.last_settings_latency_ms = (loop.time() - t0) * 1000.0
-                        self._running = True
-                        self.awaiting_client_settings = False
-                        self._keepalive_task = asyncio.create_task(self._send_keepalive_loop())
-                        logger.info("✅ Deepgram Agent ready (SettingsApplied)")
-                        return True
-                    # If timeout waiting for SettingsApplied, fall through to defer-to-client path
-                    logger.warning("Initial SettingsApplied timeout; deferring to client Settings")
-                except Exception as settings_error:
-                    # Most common root cause: missing/invalid LLM provider configuration.
-                    logger.warning(
-                        "Initial default Settings failed: %s. Deferring to client-provided Settings.",
-                        settings_error,
-                    )
-
-                # 3) Defer-to-client path: start keepalive and allow client to send Settings.
+                # 2) Start running and keepalive; do not send Settings here
                 self._running = True
-                self.awaiting_client_settings = True
                 self._keepalive_task = asyncio.create_task(self._send_keepalive_loop())
+                # 3) Defer Settings to the client message path
+                self.awaiting_client_settings = True
                 logger.info("🕓 Deepgram Agent connected; awaiting client Settings")
                 return True
 
@@ -207,9 +186,11 @@ class DeepgramAgentManager:
                     "provider": {"type": "deepgram", "model": s.listen_model, "smart_format": False}
                 },
                 "think": self._think_provider_block(s),
-                "speak": {
-                    "provider": {"type": "deepgram", "model": s.speak_model}
-                },
+                # Voice Agent V1 expects speak as a list of providers
+                "speak": [
+                    {"provider": {"type": "deepgram", "model": s.speak_model}}
+                ],
+                **({"greeting": s.greeting} if s.greeting else {}),
             },
         }
 
@@ -224,7 +205,13 @@ class DeepgramAgentManager:
         elif t.startswith("anth") and ANTHROPIC_API_KEY:
             provider = {"type": "anthropic", "model": model, "temperature": temp}
         elif t.startswith("google") and GEMINI_API_KEY:
-            provider = {"type": "google", "model": model, "temperature": temp}
+            # Known incompatibilities with custom Google endpoints can cause 400 payload errors.
+            # Prefer OpenAI fallback when available to ensure end-to-end responses.
+            if OPENAI_API_KEY:
+                logger.warning("Google think provider detected; falling back to OpenAI to avoid payload schema issues.")
+                provider = {"type": "open_ai", "model": "gpt-4o-mini", "temperature": temp}
+            else:
+                provider = {"type": "google", "model": model, "temperature": temp}
         else:
             # Fallbacks
             if OPENAI_API_KEY:
@@ -236,36 +223,31 @@ class DeepgramAgentManager:
         think_block: Dict[str, Any] = {"provider": provider}
 
         # Attach optional endpoint and headers at the think level (not inside provider)
-        if LLM_ENDPOINT_URL:
+        if LLM_ENDPOINT_URL and provider.get("type") != "google":
             endpoint_obj: Dict[str, Any] = {"url": LLM_ENDPOINT_URL}
             # If headers provided via config, forward them
             if isinstance(LLM_ENDPOINT_HEADERS, dict) and LLM_ENDPOINT_HEADERS:
                 endpoint_obj["headers"] = LLM_ENDPOINT_HEADERS
             # For Google/Gemini, if no explicit auth header provided, include API key header
-            if provider.get("type") == "google" and GEMINI_API_KEY and (
-                not isinstance(LLM_ENDPOINT_HEADERS, dict) or
-                "x-goog-api-key" not in LLM_ENDPOINT_HEADERS
-            ):
-                endpoint_obj.setdefault("headers", {})["x-goog-api-key"] = GEMINI_API_KEY
-            # Deepgram requirement: when using custom Google endpoints, omit model in provider
-            if provider.get("type") == "google":
-                provider.pop("model", None)
+            if provider.get("type") == "google" and GEMINI_API_KEY:
+                # Avoid attaching custom endpoints for Google to prevent schema mismatches
+                pass
             think_block["endpoint"] = endpoint_obj
 
         return think_block
 
     async def _send_keepalive_loop(self) -> None:
         assert self._ws is not None
+        # Voice Agent V1 does not accept KeepAlive. Maintain only app-level heartbeat.
         try:
             while self._running:
                 await asyncio.sleep(self._keepalive_interval)
-                try:
-                    await self._ws.send(json.dumps({"type": "KeepAlive"}))
-                except Exception as e:
-                    logger.warning(f"KeepAlive send failed: {e}")
-                    break
         finally:
             logger.debug("Keepalive loop exited")
+
+    async def send_keepalive_now(self) -> None:
+        # No-op for Voice Agent V1 (no KeepAlive message supported)
+        return
 
     async def send_audio(self, pcm16_bytes: bytes) -> None:
         if not self._ws:

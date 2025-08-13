@@ -255,12 +255,8 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
                   }
                 }
                 
-                // App-level heartbeat
+                // App-level heartbeat only
                 newSocket.send(JSON.stringify({ type: 'heartbeat', timestamp: now }));
-                // Deepgram KeepAlive to prevent 1005 idle close (send as text frame)
-                try {
-                  newSocket.send(JSON.stringify({ type: 'KeepAlive' }));
-                } catch {}
               } catch (error) {
                 console.error('Failed to send heartbeat:', error);
                 stopHeartbeat();
@@ -424,6 +420,16 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
               setLastMessage(message);
               onMessage?.(message);
               return; // Skip other processing for audio messages
+            }
+
+            // New: single-utterance WAV payload from server
+            if (message.type === 'tts_wav' && message.data) {
+              console.log(`🔊 Received tts_wav (${message.data.length} bytes)`);
+              playAudioResponse(message.data, 'audio/wav');
+              lastTTSAudioAtRef.current = Date.now();
+              setLastMessage(message);
+              onMessage?.(message);
+              return;
             }
             
             // Handle heartbeat responses for connection health monitoring
