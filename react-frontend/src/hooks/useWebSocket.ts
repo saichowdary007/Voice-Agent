@@ -41,6 +41,8 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected');
   const settingsAppliedRef = useRef(false);
   const settingsSentRef = useRef(false);
+  // Enforce exactly-once settings per socket instance
+  const socketGenerationRef = useRef(0);
   const settingsSendTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const stopPlaybackRef = useRef<(() => void) | null>(null);
   
@@ -221,6 +223,10 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
         
         // Establish WebSocket connection (no subprotocol; server does not negotiate any)
         const newSocket = new WebSocket(wsUrl);
+        // Track a new socket generation and reset settings guard for this socket
+        socketGenerationRef.current += 1;
+        const myGeneration = socketGenerationRef.current;
+        settingsSentRef.current = false;
         
           // Ultra-low latency optimizations
         if ('binaryType' in newSocket) {
@@ -334,39 +340,36 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           try {
             const message: WebSocketMessage = JSON.parse(event.data);
             
-            // Defer sending Settings: schedule after initial connection unless SettingsApplied arrives
-            const scheduleSettingsSend = () => {
-              if (settingsAppliedRef.current || settingsSentRef.current) return;
-              if (settingsSendTimeoutRef.current) clearTimeout(settingsSendTimeoutRef.current);
-              settingsSendTimeoutRef.current = setTimeout(() => {
-                if (settingsAppliedRef.current || settingsSentRef.current) return;
-                try {
-                  const settings = {
-                    type: 'Settings',
-                    tags: ['prod', 'voice_agent'],
-                    audio: {
-                      input: { encoding: 'linear16', sample_rate: 16000 },
-                      output: { encoding: 'linear16', sample_rate: 24000, container: 'none' }
-                    },
-                    agent: {
-                      language: 'en',
-                      listen: { provider: { type: 'deepgram', model: 'nova-3', smart_format: false } },
-                      think: { provider: { type: 'google', model: 'gemini-2.0-flash', temperature: 0.6 } },
-                      speak: { provider: { type: 'deepgram', model: 'aura-2-thalia-en' } },
-                      greeting: 'Hi! How can I help today?'
-                    }
-                  };
-                  newSocket.send(JSON.stringify(settings));
-                  settingsSentRef.current = true;
-                  console.log('⚙️ Sent Settings to server (deferred)');
-                } catch (e) {
-                  console.error('Failed to send Settings:', e);
-                }
-              }, 1200);
-            };
-
-            if ((message.type === 'connection' || message.type === 'connection_ack') && !settingsSentRef.current) {
-              scheduleSettingsSend();
+            // Send settings exactly once per socket, only on connection_ack
+            if (message.type === 'connection_ack') {
+              if (!settingsAppliedRef.current && !settingsSentRef.current && myGeneration === socketGenerationRef.current) {
+                if (settingsSendTimeoutRef.current) clearTimeout(settingsSendTimeoutRef.current);
+                settingsSendTimeoutRef.current = setTimeout(() => {
+                  if (settingsAppliedRef.current || settingsSentRef.current || myGeneration !== socketGenerationRef.current) return;
+                  try {
+                    const settings = {
+                      type: 'Settings',
+                      tags: ['prod', 'voice_agent'],
+                      audio: {
+                        input: { encoding: 'linear16', sample_rate: 16000 },
+                        output: { encoding: 'linear16', sample_rate: 24000, container: 'none' }
+                      },
+                      agent: {
+                        language: 'en',
+                        listen: { provider: { type: 'deepgram', model: 'nova-3', smart_format: false } },
+                        think: { provider: { type: 'google', model: 'gemini-2.0-flash', temperature: 0.6 } },
+                        speak: { provider: { type: 'deepgram', model: 'aura-2-thalia-en' } },
+                        greeting: 'Hi! How can I help today?'
+                      }
+                    };
+                    newSocket.send(JSON.stringify(settings));
+                    settingsSentRef.current = true;
+                    console.log('⚙️ Sent Settings to server (once)');
+                  } catch (e) {
+                    console.error('Failed to send Settings:', e);
+                  }
+                }, 200); // small debounce to allow any immediate server setup
+              }
             }
 
             // Settings applied -> enable mic streaming
@@ -383,15 +386,19 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
               return;
             }
 
-            // If server reports settings already applied, treat as applied success
-            if (message.type === 'error' && typeof (message as any).message === 'string' && (message as any).message.includes('SETTINGS_ALREADY_APPLIED')) {
+            // If backend complains about duplicate settings, treat as success and ignore error
+            if (message.type === 'error' && typeof (message as any).message === 'string' && (
+              (message as any).message.includes('SETTINGS_ALREADY_APPLIED') ||
+              (message as any).message.includes('settings were already established') ||
+              (message as any).message.includes('SETTINGS_ALREADY_ESTABLISHED')
+            )) {
               settingsAppliedRef.current = true;
               (window as any).voiceAgentReady = true;
               if (settingsSendTimeoutRef.current) {
                 clearTimeout(settingsSendTimeoutRef.current);
                 settingsSendTimeoutRef.current = null;
               }
-              console.log('✅ Settings already applied on server; mic streaming enabled');
+              console.warn('✅ Duplicate settings reported by server; treating as applied and continuing');
               setLastMessage({ ...message, type: 'settings_applied' } as any);
               onMessage?.({ ...message, type: 'settings_applied' } as any);
               return;
