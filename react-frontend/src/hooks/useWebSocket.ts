@@ -218,8 +218,8 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
         console.log('🔗 Attempting WebSocket connection to:', wsUrl);
         console.log('🎫 Using token:', token.substring(0, 20) + '...');
         
-        // Optimize: Use binary protocol for lower overhead
-        const newSocket = new WebSocket(wsUrl, "binary");
+        // Establish WebSocket connection (no subprotocol; server does not negotiate any)
+        const newSocket = new WebSocket(wsUrl);
         
         // Ultra-low latency optimizations
         if ('binaryType' in newSocket) {

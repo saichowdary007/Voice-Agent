@@ -132,6 +132,34 @@ app = FastAPI(
 # API Router
 api_router = APIRouter(prefix="/api")
 
+# --- [BEGIN Deepgram Agent wiring] ---
+from deepgram import DeepgramClient
+from src.deepgram_settings import build_settings
+
+dg_router = APIRouter(prefix="/api/dg", tags=["deepgram"])
+
+class GrantTokenBody(BaseModel):
+    ttl_seconds: Optional[int] = 30
+
+@dg_router.post("/token")
+def grant_token(body: GrantTokenBody):
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="DEEPGRAM_API_KEY not set")
+    try:
+        client = DeepgramClient(api_key=api_key)
+        resp = client.auth.v("1").grant_token(ttl_seconds=body.ttl_seconds or 30)
+        return {"access_token": resp.access_token, "expires_in": resp.expires_in}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Deepgram grant failed: {e}")
+
+@dg_router.get("/settings")
+def get_settings():
+    return build_settings()
+
+app.include_router(dg_router)
+# --- [END Deepgram Agent wiring] ---
+
 # CORS middleware - SECURITY FIX: Use environment-configured origins
 app.add_middleware(
     CORSMiddleware,
@@ -791,6 +819,18 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
         await connection_manager.connect(websocket, user_id)
         logger.info(f"✅ WebSocket connected successfully for user_id: {user_id}")
         
+        # -----------------------------------
+        # Notify client connection established so it can send Settings
+        # -----------------------------------
+        try:
+            await websocket.send_json({
+                "type": "connection",
+                "message": "Voice Agent server connected",
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+        except Exception:
+            pass
+
         # -----------------------------------
         # Start Deepgram Voice Agent proxy (feature-flagged)
         # -----------------------------------

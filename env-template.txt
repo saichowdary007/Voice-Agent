@@ -31,6 +31,15 @@ DEEPGRAM_STT_MODEL=nova-3
 DEEPGRAM_STT_LANGUAGE=en-US
 DEEPGRAM_STT_ENDPOINTING=300
 
+# Deepgram Agent Defaults (override per environment)
+DG_AGENT_LANGUAGE=en
+DG_AGENT_STT_MODEL=nova-3
+DG_AGENT_TTS_MODEL=aura-2-thalia-en
+DG_AGENT_LLM_PROVIDER=open_ai
+DG_AGENT_LLM_MODEL=gpt-4o-mini
+DG_AGENT_TEMPERATURE=0.7
+DG_AGENT_GREETING=Hello! How can I help you today?
+
 # Frontend URLs (adjust ports if needed)
 REACT_APP_API_URL=http://localhost:8000
 REACT_APP_WS_URL=ws://localhost:8000

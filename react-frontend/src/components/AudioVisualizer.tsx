@@ -188,7 +188,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         // Create analyser using the existing audio context
         const analyser = audioContext.createAnalyser();
         analyser.fftSize = 256;
-        analyser.smoothingTimeConstant = 0.8;
+        analyser.smoothingTimeConstant = 0.9; // increase smoothing to reduce jitter
         analyser.minDecibels = -90;
         analyser.maxDecibels = -10;
         analyserRef.current = analyser;
@@ -201,9 +201,9 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         highPassFilter.type = 'highpass';
         highPassFilter.frequency.value = 120; // Hz
         
-        // 2. Gain boost (+6dB) to keep RMS in 0.05-0.2 range for Deepgram
+        // 2. Gain boost (reduced) to keep RMS in a stable range
         const gainNode = audioContext.createGain();
-        gainNode.gain.value = 3.0; // Increased gain for better transcription
+        gainNode.gain.value = 1.5; // reduce gain to avoid over-driving visualizer
         
         // Connect the processing chain: source -> highpass -> gain -> analyser
         source.connect(highPassFilter);
@@ -390,9 +390,9 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
       const DEBOUNCE_MS = 300;          // Prevent rapid on/off
       
       // Energy thresholds (RMS-based, more reliable than frequency analysis)
-      const NOISE_FLOOR = 0.005;        // Lower background noise level for better sensitivity
-      const SPEECH_THRESHOLD = 0.02;    // Lower minimum speech energy threshold
-      const STRONG_SPEECH_THRESHOLD = 0.06; // Lower clear speech energy threshold
+      const NOISE_FLOOR = 0.01;         // raise noise floor to ignore ambient noise
+      const SPEECH_THRESHOLD = 0.05;    // raise threshold to avoid false positives
+      const STRONG_SPEECH_THRESHOLD = 0.12; // raise threshold for strong speech
       
       const getAverageFrequency = (): number => {
         if (!analyserRef.current || muted) return 0;
@@ -417,7 +417,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
           speechFrames = Math.min(speechFrames + 2, SPEECH_START_FRAMES * 2);
           silenceFrames = 0;
           isVoiceActive = true;
-          console.log(`🔊 Strong speech: RMS=${rms.toFixed(3)}`);
+          // toned down logging to avoid noisy console during active speech
         } else if (rms > SPEECH_THRESHOLD) {
           // Moderate speech detected
           speechFrames = Math.min(speechFrames + 1, SPEECH_START_FRAMES * 2);
@@ -442,7 +442,7 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         stableVoiceActivity(!muted && isVoiceActive);
         
         // Return scaled value for visualization (convert RMS to 0-255 range)
-        return Math.min(rms * 2000, 255);
+        return Math.min(rms * 1000, 255); // reduce scaling to soften motion
       };
       
       // Audio recording and streaming logic

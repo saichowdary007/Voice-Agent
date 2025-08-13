@@ -129,6 +129,27 @@ class DeepgramAgentProxy:
                                             "timestamp": datetime.utcnow().isoformat(),
                                         })
                                     continue
+                                # Audio chunk (PCM16 base64) from client → forward to agent
+                                if msg_type in ("audio_chunk", "AudioData"):
+                                    try:
+                                        b64 = data.get("data")
+                                        if isinstance(b64, str) and b64:
+                                            audio_bytes = base64.b64decode(b64)
+                                            await self.agent.send_audio(audio_bytes)
+                                            # Acknowledge to avoid client warnings
+                                            await self.client_ws.send_json({
+                                                "type": "audio_ack",
+                                                "timestamp": datetime.utcnow().isoformat(),
+                                            })
+                                        continue
+                                    except Exception as ae:
+                                        await self.client_ws.send_json({
+                                            "type": "error",
+                                            "message": f"Invalid audio payload: {ae}",
+                                            "timestamp": datetime.utcnow().isoformat(),
+                                        })
+                                        continue
+
                                 # Unknown text messages: keep protocol strict in agent-proxy mode
                                 await self.client_ws.send_json({
                                     "type": "error",
