@@ -5,27 +5,28 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- API Keys ---
-# It's recommended to set your API key in the .env file for security
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # --- Supabase Configuration ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
-# Check if Supabase is explicitly enabled and has valid credentials
 USE_SUPABASE_ENV = os.getenv("USE_SUPABASE", "false").lower() == "true"
 USE_SUPABASE = USE_SUPABASE_ENV and bool(SUPABASE_URL and SUPABASE_KEY)
 
-# --- Deepgram Agent Configuration ---
-# All audio processing, VAD, STT, and TTS handled by Deepgram Agent
-USE_DEEPGRAM_AGENT = os.getenv("USE_DEEPGRAM_AGENT", "true").lower() == "true"
+# --- Deepgram Voice Agent Configuration ---
+# Use Deepgram Voice Agent API for end-to-end voice processing
+USE_DEEPGRAM_AGENT = True  # Always enabled for this implementation
+DEEPGRAM_AGENT_ENDPOINT = "wss://agent.deepgram.com/v1/agent/converse"
 
-# Basic audio settings for Deepgram Agent
-INPUT_SAMPLE_RATE = 16000  # 16kHz input
-OUTPUT_SAMPLE_RATE = 24000  # 24kHz output
+# Audio settings for browser compatibility
+AUDIO_INPUT_ENCODING = "linear16"
+AUDIO_INPUT_SAMPLE_RATE = 24000  # 24kHz for browser compatibility
+AUDIO_OUTPUT_ENCODING = "linear16"
+AUDIO_OUTPUT_SAMPLE_RATE = 24000  # 24kHz for browser compatibility
 
 # --- Database ---
 # PostgreSQL (legacy support)
@@ -58,7 +59,7 @@ REFRESH_TOKEN_TIMEOUT_DAYS = int(os.getenv("REFRESH_TOKEN_TIMEOUT_DAYS", "30"))
 # --- Deepgram Configuration ---
 # STT and TTS settings for Deepgram Agent
 DEEPGRAM_STT_LANGUAGE = os.getenv("DEEPGRAM_STT_LANGUAGE", "en-US")
-DEEPGRAM_TTS_MODEL = os.getenv("DEEPGRAM_TTS_MODEL", "aura-asteria-en")
+DEEPGRAM_TTS_MODEL = os.getenv("DEEPGRAM_TTS_MODEL", "aura-2-thalia-en")
 DEEPGRAM_TTS_ENCODING = os.getenv("DEEPGRAM_TTS_ENCODING", "linear16")
 DEEPGRAM_TTS_SAMPLE_RATE = int(os.getenv("DEEPGRAM_TTS_SAMPLE_RATE", "24000"))
 
@@ -94,6 +95,10 @@ LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "150"))
 # Custom LLM endpoint configuration (optional for open_ai/anthropic, required for others)
 LLM_ENDPOINT_URL = os.getenv("LLM_ENDPOINT_URL")
 LLM_ENDPOINT_HEADERS = {}
+
+# --- Feature Flags ---
+# Enable backend function calling bridge between agent and server
+USE_FUNCTION_CALLS = os.getenv("USE_FUNCTION_CALLS", "false").lower() == "true"
 
 # Set up Google/Gemini configuration for Deepgram Agent
 if LLM_PROVIDER_TYPE == "google" and GEMINI_API_KEY:

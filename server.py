@@ -729,14 +729,9 @@ async def get_status():
 
 app.include_router(api_router)
 
+# Import handlers for compatibility (not used in proxy mode)
 from src.websocket_handlers import (
-    handle_text_message,
-    handle_audio_chunk,
-    handle_settings,
     handle_ping,
-    handle_vad_status,
-    handle_start_listening,
-    handle_stop_listening,
     handle_heartbeat,
     handle_connection_message,
     handle_unknown_message,
@@ -746,25 +741,20 @@ from src.websocket_handlers import (
 @app.websocket("/ws/{token}")
 async def websocket_endpoint(websocket: WebSocket, token: str):
     """
-    WebSocket endpoint for real-time voice interaction.
-    Handles audio streaming and real-time messaging with actual STT/LLM/TTS processing.
+    WebSocket endpoint for Deepgram Voice Agent proxy.
+    Proxies client connections directly to Deepgram's Voice Agent API.
     """
     try:
         logger.info(f"🔌 New WebSocket connection attempt with token: {token[:20]}...")
         
-        # FIX #1: Accept any protocol to avoid 1011 handshake failures
-        # Get client-requested protocol but accept whatever they send
-        client_protocol = websocket.headers.get("sec-websocket-protocol", "")
-        
-        # Accept connection with client's requested protocol (or None)
-        await websocket.accept(subprotocol=client_protocol.split(',')[0].strip() if client_protocol else None)
-        logger.info(f"✅ WebSocket connection accepted with protocol: {client_protocol or 'none'}")
+        # Accept WebSocket connection
+        await websocket.accept()
+        logger.info("✅ WebSocket connection accepted")
         
         # -----------------------------------
         # Authenticate user (token path param)
         # -----------------------------------
         if token.startswith("guest_"):
-            # Guest / unauthenticated connection – use token as pseudo user_id
             user_id = token
             logger.info(f"🎭 Guest connection established: {user_id}")
         else:
@@ -773,10 +763,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                 user_id = user["id"]
                 logger.info(f"🔐 Authenticated connection for user: {user_id}")
             except HTTPException as e:
-                # Enhanced error logging for WebSocket authentication failures
                 logger.error(f"WebSocket authentication failed for token: {token[:20]}... Error: {e}")
                 
-                # Try auth manager fallback (includes DEBUG_MODE support)
+                # Try auth manager fallback
                 if auth_manager:
                     try:
                         auth_user = auth_manager.verify_token(token)
@@ -797,123 +786,36 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                     return
 
         # -----------------------------------
-        # Register the connection first
+        # Register the connection
         # -----------------------------------
         await connection_manager.connect(websocket, user_id)
-        
-        # Small delay to ensure connection is fully established
-        await asyncio.sleep(0.1)
-        
-        # -----------------------------------
-        # Send welcome message using connection manager for better reliability
-        # -----------------------------------
-        welcome_message = {
-            "type": "connection",
-            "status": "connected",
-            "message": "Voice Agent WebSocket connected",
-            "services": {
-                "agent": True,
-                "llm": llm_interface is not None,
-            },
-        }
-
-        welcome_sent = await connection_manager.send_to_websocket(websocket, welcome_message)
-        if welcome_sent:
-            logger.info(f"📨 Welcome message sent to user_id: {user_id}")
-        else:
-            logger.warning(f"Failed to send welcome message to user_id: {user_id} (connection closed)")
-            return
-
         logger.info(f"✅ WebSocket connected successfully for user_id: {user_id}")
         
-        try:
-            conversation_mgr = connection_manager.get_conversation_manager(websocket)
-            
-            # Ensure ConversationManager exists when Supabase integration is expected
-            if USE_SUPABASE and conversation_mgr is None:
-                logger.error("ConversationManager could not be initialised – aborting WebSocket session")
-                await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
-                return
-            
-            message_handlers = {
-                "text_message": handle_text_message,
-                "audio_chunk": handle_audio_chunk,
-        "Settings": handle_settings,
-                "ping": handle_ping,
-                "vad_status": handle_vad_status,
-                "start_listening": handle_start_listening,
-                "stop_listening": handle_stop_listening,
-                "heartbeat": handle_heartbeat,
-                "connection": handle_connection_message,
-            }
-            
-            while True:
-                # Receive message from client
-                try:
-                    # Check connection state before receiving
-                    if websocket.client_state != WebSocketState.CONNECTED:
-                        logger.info("WebSocket connection no longer active, breaking message loop")
-                        break
-                        
-                    data = await websocket.receive_text()
-                    is_text_message = True
-                except WebSocketDisconnect:
-                    logger.info("WebSocket disconnected normally")
-                    break
-                except ConnectionClosedError:
-                    logger.info("WebSocket connection closed")
-                    break
-                except Exception as e:
-                    # If text receive fails, try binary
-                    try:
-                        data = await websocket.receive_bytes()
-                        is_text_message = False
-                    except Exception as binary_error:
-                        logger.error(f"Failed to receive WebSocket message: {e}, binary attempt: {binary_error}")
-                        # Terminate the loop on unrecoverable receive errors
-                        break
-                
-                try:
-                    if is_text_message:
-                        message = json.loads(data)
-                    else:
-                        # Handle binary data (convert to base64 for audio processing)
-                        message = {
-                            "type": "audio_chunk",
-                            "data": base64.b64encode(data).decode("ascii"),
-                            "is_binary": True
-                        }
-                    
-                    message_type = message.get("type", "unknown")
-                    logger.debug(f"📨 Received WebSocket message: type={message_type}, size={len(str(message))}")
-                    handler = message_handlers.get(message_type, handle_unknown_message)
-                    
-                    if message_type == "text_message":
-                        await handler(websocket, message, conversation_mgr, llm_interface, tts_engine)
-                    elif message_type == "audio_chunk":
-                        await handler(websocket, message, conversation_mgr, llm_interface, tts_engine)
-                    else:
-
-                        await handler(websocket, message)
-                        
-                except json.JSONDecodeError:
-                    await connection_manager.send_personal_message(
-                        json.dumps({
-                            "type": "error",
-                            "message": "Invalid JSON format"
-                        }),
-                        websocket
-                    )
-                    
-        except WebSocketDisconnect:
-            connection_manager.disconnect(websocket)
-            logger.info(f"WebSocket disconnected for user: {user_id}")
-        except Exception as e:
-            logger.error(f"WebSocket error: {e}")
-            connection_manager.disconnect(websocket)
-
+        # -----------------------------------
+        # Start Deepgram Voice Agent proxy (feature-flagged)
+        # -----------------------------------
+        from src.websocket_handlers import handle_websocket_connection
+        if USE_DEEPGRAM_AGENT:
+            await handle_websocket_connection(websocket, user_id=user_id)
+        else:
+            # Legacy path not supported in this build
+            await websocket.send_json({
+                "type": "error",
+                "message": "Deepgram agent disabled (USE_DEEPGRAM_AGENT=false) and no legacy pipeline available.",
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+            return
+        
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected normally")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
+    finally:
+        # Clean up connection
+        connection_manager.disconnect(websocket)
+        from src.websocket_handlers import cleanup_websocket_connection
+        await cleanup_websocket_connection(websocket)
 
 # Server startup
 if __name__ == "__main__":
