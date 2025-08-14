@@ -152,6 +152,7 @@ class AgentProxy:
         self._tts_pcm = bytearray()
         self._last_pcm_ms: Optional[float] = None
         self._flush_task: Optional[asyncio.Task] = None
+        self._agent_ready: bool = False  # becomes True after SettingsApplied
 
     async def start(self) -> bool:
         if not DEEPGRAM_API_KEY:
@@ -192,6 +193,9 @@ class AgentProxy:
                 if msg.get("type") != "websocket.receive":
                     continue
                 if "bytes" in msg and msg["bytes"] is not None:
+                    # Drop early audio until SettingsApplied to avoid agent errors
+                    if not self._agent_ready:
+                        continue
                     if self.agent_ws:
                         await self.agent_ws.send(msg["bytes"])
                 elif "text" in msg and msg["text"]:
@@ -218,7 +222,7 @@ class AgentProxy:
                                 await self.agent_ws.send(raw)
                             await self.client_ws.send_json({"type": "audio_ack", "timestamp": datetime.utcnow().isoformat()})
                         continue
-                    # Intercept Settings to ensure sensible defaults and optional provider wiring
+                    # Intercept Settings to ensure sensible defaults
                     if mtype in ("settings", "Settings"):
                         try:
                             agent = data.setdefault("agent", {})
@@ -240,27 +244,16 @@ class AgentProxy:
                                 if not any((isinstance(p, dict) and p.get("provider", {}).get("type") == "cartesia") for p in agent["speak"]):
                                     agent["speak"].append({"provider": {"type": "cartesia", "model": "sonic-english"}})
 
-                            # Think provider endpoint wiring (Google Gemini via API key)
+                            # Prefer Google Gemini provider if requested; rely on Deepgram's native integration
                             think = agent.setdefault("think", {})
                             provider = think.setdefault("provider", {})
                             ptype = str(provider.get("type", "")).lower()
-                            gemini_key = os.getenv("GEMINI_API_KEY")
-                            if ptype.startswith("google") and gemini_key:
-                                model = provider.get("model", "gemini-2.0-flash")
-                                think["endpoint"] = {
-                                    "url": f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}",
-                                    "headers": {"Content-Type": "application/json"},
-                                }
-                                # When using endpoint, omit model from provider per DG guidance
-                                try:
-                                    provider.pop("model", None)
-                                except Exception:
-                                    pass
+                            # Do NOT inject custom endpoint; Deepgram handles Gemini payload/transport.
                         except Exception:
                             # Non-fatal; forward original
                             pass
-                    # Forward to agent
-                    if self.agent_ws:
+                    # Forward only supported message types to agent
+                    if self.agent_ws and mtype in ("settings", "Settings", "Speak"):
                         await self.agent_ws.send(json.dumps(data))
         except Exception as e:
             logger.debug(f"client_to_agent end: {e}")
@@ -314,6 +307,7 @@ class AgentProxy:
                     await self.client_ws.send_json({"type": "connection_ack", "message": "Connected to Deepgram Voice Agent", "request_id": data.get("request_id")})
                     continue
                 if etype == "SettingsApplied":
+                    self._agent_ready = True
                     await self.client_ws.send_json({"type": "settings_applied", "timestamp": datetime.utcnow().isoformat()})
                     continue
                 if etype == "ConversationText":
@@ -331,7 +325,14 @@ class AgentProxy:
                         await self.client_ws.send_json({"type": "agent_audio_done", "timestamp": datetime.utcnow().isoformat()})
                     continue
                 if etype in ("AgentErrors", "AgentWarnings", "Error", "Warning"):
-                    await self.client_ws.send_json({"type": "error", "message": data.get("message") or data.get("description") or "Agent error"})
+                    # Surface provider errors clearly (e.g., Gemini JSON payload issues)
+                    await self.client_ws.send_json({
+                        "type": "error",
+                        "message": data.get("message") or data.get("description") or "Agent error",
+                        "provider": data.get("provider"),
+                        "code": data.get("code") or data.get("status"),
+                        "debug": data.get("details") or data.get("error"),
+                    })
                     continue
                 # pass-through unknowns for debugging
                 try:

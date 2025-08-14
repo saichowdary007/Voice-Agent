@@ -217,9 +217,16 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           : url;
 
         // Use 127.0.0.1 instead of localhost to avoid DNS lookup latency
-        const wsUrl = `${baseUrl.replace('localhost', '127.0.0.1')}/ws/${encodeURIComponent(token)}`;
+        const userId = (() => {
+          try {
+            const u = localStorage.getItem('user');
+            return u ? (JSON.parse(u).id || '') : '';
+          } catch {
+            return '';
+          }
+        })();
+        const wsUrl = `${baseUrl.replace('localhost', '127.0.0.1')}/ws${userId ? `?user_id=${encodeURIComponent(userId)}` : ''}`;
         console.log('🔗 Attempting WebSocket connection to:', wsUrl);
-        console.log('🎫 Using token:', token.substring(0, 20) + '...');
         
         // Establish WebSocket connection (no subprotocol; server does not negotiate any)
         const newSocket = new WebSocket(wsUrl);
@@ -337,7 +344,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
             const message: WebSocketMessage = JSON.parse(event.data);
             
             // Send settings exactly once per socket, only on connection_ack
-            if (message.type === 'connection_ack') {
+            if (message.type === 'connection_ack' || message.type === 'connection') {
               if (!settingsAppliedRef.current && !settingsSentRef.current && myGeneration === socketGenerationRef.current) {
                 if (settingsSendTimeoutRef.current) clearTimeout(settingsSendTimeoutRef.current);
                 settingsSendTimeoutRef.current = setTimeout(() => {
@@ -351,9 +358,12 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
                         output: { encoding: 'linear16', sample_rate: 24000, container: 'none' }
                       },
                       agent: {
-                        language: 'en',
+                        language: 'en-US',
                         listen: { provider: { type: 'deepgram', model: 'nova-3', smart_format: false } },
-                        think: { provider: { type: 'google', model: 'gemini-2.0-flash', temperature: 0.6 } },
+                        // Use Google/Gemini directly to match backend configuration
+                        think: {
+                          provider: { type: 'google', model: 'gemini-2.0-flash', temperature: 0.7 }
+                        },
                         speak: { provider: { type: 'deepgram', model: 'aura-2-thalia-en' } },
                         greeting: 'Hi! How can I help today?'
                       }
