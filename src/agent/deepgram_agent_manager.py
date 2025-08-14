@@ -199,10 +199,22 @@ class DeepgramAgentManager:
         model = s.think_model or LLM_MODEL or "gemini-2.0-flash"
         temp = s.think_temperature if s.think_temperature is not None else 0.7
 
-        # Build provider block. Let Deepgram handle Google/Gemini transport to avoid payload mismatches.
+        # Google/Gemini: Use explicit endpoint URL and avoid sending model in provider to prevent
+        # downstream payload schema mismatches (e.g., camelCase vs snake_case fields).
+        # We embed the model name in the endpoint URL per Google Generative Language API.
         if t.startswith("google") and GEMINI_API_KEY:
-            provider = {"type": "google", "model": model, "temperature": temp}
-            return {"provider": provider}
+            endpoint_url = (
+                LLM_ENDPOINT_URL
+                or f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            )
+            block: Dict[str, Any] = {
+                "provider": {"type": "google", "temperature": temp},
+                "endpoint": {"url": endpoint_url},
+            }
+            # Optionally include headers if configured
+            if isinstance(LLM_ENDPOINT_HEADERS, dict) and LLM_ENDPOINT_HEADERS:
+                block["endpoint"]["headers"] = LLM_ENDPOINT_HEADERS
+            return block
 
         if t.startswith("open") and OPENAI_API_KEY:
             provider = {"type": "open_ai", "model": model, "temperature": temp}
