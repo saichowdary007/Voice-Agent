@@ -409,22 +409,19 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
               }
             }
 
-            // Ultra-low latency: prioritize audio messages for immediate processing
-            if ((message.type === 'audio_response' || message.type === 'audio_stream' || message.type === 'tts_audio') && message.data) {
-              const mime = message.mime || 'audio/wav';
-              console.log(`🔊 Received ${message.type} (${message.data.length} bytes)`);
-              // Process audio immediately without waiting for other message handling
-              playAudioResponse(message.data, mime);
-              // Mark that server-provided audio just played to suppress fallback TTS
-              lastTTSAudioAtRef.current = Date.now();
+            // ONLY play the final WAV blob to avoid duplicate audio
+            // Skip chunked audio (tts_audio) and only play complete utterance (tts_wav)
+            if (message.type === 'tts_audio') {
+              // Just log but don't play - wait for tts_wav
+              console.log(`🔊 Received tts_audio (${message.data?.length || 0} bytes) - buffering for final playback`);
               setLastMessage(message);
               onMessage?.(message);
-              return; // Skip other processing for audio messages
+              return;
             }
 
-            // New: single-utterance WAV payload from server
+            // Play only the final complete utterance WAV
             if (message.type === 'tts_wav' && message.data) {
-              console.log(`🔊 Received tts_wav (${message.data.length} bytes)`);
+              console.log(`🔊 Received tts_wav (${message.data.length} bytes) - playing complete utterance`);
               playAudioResponse(message.data, 'audio/wav');
               lastTTSAudioAtRef.current = Date.now();
               setLastMessage(message);

@@ -1,8 +1,437 @@
 #!/usr/bin/env python3
 """
-FastAPI Web Server for the Voice Agent.
-This replaces the CLI interface for Docker/production deployment.
+Single-file FastAPI backend that bridges the frontend WebSocket to Deepgram's
+Voice Agent API. Deepgram handles STT, TTS, and LLM orchestration.
+
+Runtime: uvicorn server:app --host 0.0.0.0 --port 8000
+
+Env Vars:
+  - DEEPGRAM_API_KEY      (required)   e.g. dg_xxx
+  - LLM_PROVIDER          (optional)   e.g. gemini, openai (we use gemini)
+  - LLM_API_KEY           (optional)   if using provider above
+  - GEMINI_API_KEY        (optional)   when using gemini provider (recommended)
+  - LLM_MODEL             (optional)   e.g. gpt-4o-mini or gemini-2.0-flash
+  - DG_STT_MODEL          (optional)   default nova-3
+  - DG_TTS_MODEL          (optional)   default aura-2-thalia-en
+  - AGENT_GREETING        (optional)   greeting string
+  - SUPABASE_URL          (optional)
+  - SUPABASE_ANON_KEY     (optional)
+  - SUPABASE_TABLE        (optional)
+
+HTTP Endpoints:
+  - GET  /health               → status
+  - GET  /healthz              → {"ok": true}
+  - POST /api/auth/debug-signin → returns a guest token for local dev
+
+WebSocket Endpoints:
+  - WS /ws/{token}             → existing frontend compatibility
+  - WS /ws?user_id=<uuid>      → acceptance criteria compatibility
+
+Frontend contract preserved: connection + settings_applied + tts_wav + heartbeats.
 """
+import os
+import asyncio
+import json
+import base64
+import logging
+import time
+from datetime import datetime, timedelta
+from typing import Dict, Optional
+
+import websockets
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, status, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import uvicorn
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("voice-agent")
+
+
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+DEEPGRAM_AGENT_ENDPOINT = os.getenv("DEEPGRAM_AGENT_ENDPOINT", "wss://agent.deepgram.com/v1")
+AUDIO_OUTPUT_SAMPLE_RATE = int(os.getenv("AUDIO_OUTPUT_SAMPLE_RATE", 24000))
+
+if not DEEPGRAM_API_KEY:
+    logger.warning("DEEPGRAM_API_KEY is not set. Set it in your environment before running.")
+
+
+# -----------------------------------------------------------------------------
+# Minimal utilities
+# -----------------------------------------------------------------------------
+def wav_from_pcm16_mono(pcm_data: bytes, sample_rate: int) -> bytes:
+    """Wrap raw PCM16 mono data into a WAV container."""
+    channels = 1
+    bits_per_sample = 16
+    byte_rate = sample_rate * channels * (bits_per_sample // 8)
+    block_align = channels * (bits_per_sample // 8)
+    data_size = len(pcm_data)
+
+    header = bytearray(44)
+    header[0:4] = b"RIFF"
+    header[4:8] = (36 + data_size).to_bytes(4, "little")
+    header[8:12] = b"WAVE"
+    header[12:16] = b"fmt "
+    header[16:20] = (16).to_bytes(4, "little")
+    header[20:22] = (1).to_bytes(2, "little")
+    header[22:24] = (channels).to_bytes(2, "little")
+    header[24:28] = (sample_rate).to_bytes(4, "little")
+    header[28:32] = (byte_rate).to_bytes(4, "little")
+    header[32:34] = (block_align).to_bytes(2, "little")
+    header[34:36] = (bits_per_sample).to_bytes(2, "little")
+    header[36:40] = b"data"
+    header[40:44] = (data_size).to_bytes(4, "little")
+    return bytes(header) + pcm_data
+
+
+# -----------------------------------------------------------------------------
+# FastAPI app
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Voice Agent", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "*",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    user: Dict[str, str]
+    expires_at: int
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "message": "Voice Agent is running",
+        "timestamp": datetime.utcnow().isoformat(),
+        "version": "1.0.0",
+    }
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+
+@app.post("/api/auth/debug-signin", response_model=AuthResponse)
+async def debug_sign_in(body: Dict[str, str]):
+    """Simple local dev auth that returns a guest token the frontend can use."""
+    email = body.get("email") if isinstance(body, dict) else "guest@example.com"
+    token = f"guest_{int(time.time())}"
+    expires_at = int((datetime.utcnow() + timedelta(hours=1)).timestamp())
+    return {
+        "access_token": token,
+        "refresh_token": "",
+        "user": {"id": token, "email": email or "guest@example.com", "created_at": datetime.utcnow().isoformat()},
+        "expires_at": expires_at,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Deepgram Agent proxy (inline, single-file)
+# -----------------------------------------------------------------------------
+class AgentProxy:
+    def __init__(self, client_ws: WebSocket):
+        self.client_ws = client_ws
+        self.agent_ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.running = False
+        self.tasks = []
+        self._tts_pcm = bytearray()
+        self._last_pcm_ms: Optional[float] = None
+        self._flush_task: Optional[asyncio.Task] = None
+
+    async def start(self) -> bool:
+        if not DEEPGRAM_API_KEY:
+            await self.client_ws.send_json({"type": "error", "message": "DEEPGRAM_API_KEY not set"})
+            return False
+        try:
+            self.agent_ws = await websockets.connect(
+                DEEPGRAM_AGENT_ENDPOINT,
+                subprotocols=["token", DEEPGRAM_API_KEY],
+                ping_interval=None,
+                close_timeout=5,
+            )
+            self.running = True
+            self.tasks = [
+                asyncio.create_task(self._client_to_agent()),
+                asyncio.create_task(self._agent_to_client()),
+            ]
+            return True
+        except Exception as e:
+            logger.error(f"Failed to connect to Deepgram Agent: {e}")
+            return False
+
+    async def stop(self):
+        self.running = False
+        for t in self.tasks:
+            if not t.done():
+                t.cancel()
+        try:
+            if self.agent_ws:
+                await self.agent_ws.close()
+        except Exception:
+            pass
+
+    async def _client_to_agent(self):
+        try:
+            while self.running:
+                msg = await self.client_ws.receive()
+                if msg.get("type") != "websocket.receive":
+                    continue
+                if "bytes" in msg and msg["bytes"] is not None:
+                    if self.agent_ws:
+                        await self.agent_ws.send(msg["bytes"])
+                elif "text" in msg and msg["text"]:
+                    try:
+                        data = json.loads(msg["text"])  # pass-through JSON
+                    except json.JSONDecodeError:
+                        continue
+                    mtype = data.get("type", "")
+                    # app-level heartbeats
+                    if mtype == "heartbeat":
+                        await self.client_ws.send_json({"type": "heartbeat_ack", "timestamp": datetime.utcnow().isoformat()})
+                        continue
+                    if mtype == "ping":
+                        await self.client_ws.send_json({"type": "pong", "timestamp": data.get("timestamp", datetime.utcnow().isoformat())})
+                        continue
+                    if mtype == "connection":
+                        await self.client_ws.send_json({"type": "connection_ack", "message": "OK", "timestamp": datetime.utcnow().isoformat()})
+                        continue
+                    if mtype in ("audio_chunk", "AudioData"):
+                        b64 = data.get("data")
+                        if isinstance(b64, str) and b64:
+                            raw = base64.b64decode(b64)
+                            if self.agent_ws:
+                                await self.agent_ws.send(raw)
+                            await self.client_ws.send_json({"type": "audio_ack", "timestamp": datetime.utcnow().isoformat()})
+                        continue
+                    # Intercept Settings to ensure sensible defaults and optional provider wiring
+                    if mtype in ("settings", "Settings"):
+                        try:
+                            agent = data.setdefault("agent", {})
+                            # Greeting default
+                            if "greeting" not in agent:
+                                agent["greeting"] = "Hello, I'm your AI assistant."
+
+                            # Ensure speak is a list; add optional cartesia fallback when present
+                            speak = agent.get("speak")
+                            if not isinstance(speak, list):
+                                # normalize single object to list or create default primary
+                                if isinstance(speak, dict):
+                                    speak_list = [speak]
+                                else:
+                                    speak_list = [{"provider": {"type": "deepgram", "model": "aura-2-thalia-en"}}]
+                                agent["speak"] = speak_list
+                            # Append cartesia fallback when configured
+                            if os.getenv("CARTESIA_API_KEY"):
+                                if not any((isinstance(p, dict) and p.get("provider", {}).get("type") == "cartesia") for p in agent["speak"]):
+                                    agent["speak"].append({"provider": {"type": "cartesia", "model": "sonic-english"}})
+
+                            # Think provider endpoint wiring (Google Gemini via API key)
+                            think = agent.setdefault("think", {})
+                            provider = think.setdefault("provider", {})
+                            ptype = str(provider.get("type", "")).lower()
+                            gemini_key = os.getenv("GEMINI_API_KEY")
+                            if ptype.startswith("google") and gemini_key:
+                                model = provider.get("model", "gemini-2.0-flash")
+                                think["endpoint"] = {
+                                    "url": f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}",
+                                    "headers": {"Content-Type": "application/json"},
+                                }
+                                # When using endpoint, omit model from provider per DG guidance
+                                try:
+                                    provider.pop("model", None)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            # Non-fatal; forward original
+                            pass
+                    # Forward to agent
+                    if self.agent_ws:
+                        await self.agent_ws.send(json.dumps(data))
+        except Exception as e:
+            logger.debug(f"client_to_agent end: {e}")
+        finally:
+            self.running = False
+
+    async def _flush_after_quiet(self):
+        try:
+            quiet_ms = 350
+            while self.running:
+                await asyncio.sleep(0.15)
+                if self._last_pcm_ms is None or not self._tts_pcm:
+                    continue
+                if (time.time() * 1000.0) - self._last_pcm_ms >= quiet_ms:
+                    await self._emit_wav()
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    async def _emit_wav(self):
+        try:
+            wav = wav_from_pcm16_mono(bytes(self._tts_pcm), AUDIO_OUTPUT_SAMPLE_RATE)
+            b64 = base64.b64encode(wav).decode("ascii")
+            await self.client_ws.send_json({"type": "tts_wav", "data": b64, "sample_rate": AUDIO_OUTPUT_SAMPLE_RATE})
+        finally:
+            self._tts_pcm.clear()
+            self._last_pcm_ms = None
+            if self._flush_task and not self._flush_task.done():
+                self._flush_task.cancel()
+
+    async def _agent_to_client(self):
+        try:
+            assert self.agent_ws is not None
+            while self.running:
+                msg = await self.agent_ws.recv()
+                if isinstance(msg, (bytes, bytearray)):
+                    self._tts_pcm.extend(bytes(msg))
+                    self._last_pcm_ms = time.time() * 1000.0
+                    if self._flush_task is None or self._flush_task.done():
+                        self._flush_task = asyncio.create_task(self._flush_after_quiet())
+                    continue
+                # JSON
+                try:
+                    data = json.loads(msg)
+                except json.JSONDecodeError:
+                    continue
+                etype = data.get("type", "")
+                if etype == "Welcome":
+                    await self.client_ws.send_json({"type": "connection_ack", "message": "Connected to Deepgram Voice Agent", "request_id": data.get("request_id")})
+                    continue
+                if etype == "SettingsApplied":
+                    await self.client_ws.send_json({"type": "settings_applied", "timestamp": datetime.utcnow().isoformat()})
+                    continue
+                if etype == "ConversationText":
+                    await self.client_ws.send_json({
+                        "type": "agent_text",
+                        "role": data.get("role", "assistant"),
+                        "content": data.get("content", ""),
+                        "timestamp": datetime.utcnow().isoformat(),
+                    })
+                    continue
+                if etype in ("AgentAudioDone", "AgentAudioCompleted", "AgentTtsDone"):
+                    if self._tts_pcm:
+                        await self._emit_wav()
+                    else:
+                        await self.client_ws.send_json({"type": "agent_audio_done", "timestamp": datetime.utcnow().isoformat()})
+                    continue
+                if etype in ("AgentErrors", "AgentWarnings", "Error", "Warning"):
+                    await self.client_ws.send_json({"type": "error", "message": data.get("message") or data.get("description") or "Agent error"})
+                    continue
+                # pass-through unknowns for debugging
+                try:
+                    await self.client_ws.send_json(data)
+                except Exception:
+                    pass
+        except websockets.exceptions.ConnectionClosed:
+            logger.info("Deepgram Agent connection closed")
+        except Exception as e:
+            logger.debug(f"agent_to_client end: {e}")
+        finally:
+            self.running = False
+
+
+# -----------------------------------------------------------------------------
+# WS endpoint
+# -----------------------------------------------------------------------------
+@app.websocket("/ws/{token}")
+async def ws_endpoint(ws: WebSocket, token: str):
+    try:
+        await ws.accept()
+        if not token:
+            await ws.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        # initial connection message (client expects it before sending Settings)
+        try:
+            await ws.send_json({"type": "connection", "message": "Voice Agent server connected", "timestamp": datetime.utcnow().isoformat()})
+        except Exception:
+            pass
+
+        proxy = AgentProxy(ws)
+        ok = await proxy.start()
+        if not ok:
+            await ws.send_json({"type": "error", "message": "Failed to connect to Deepgram Voice Agent"})
+            await ws.close(code=status.WS_1011_INTERNAL_ERROR)
+            return
+
+        await asyncio.gather(*proxy.tasks, return_exceptions=True)
+    except WebSocketDisconnect:
+        logger.info("Client WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        try:
+            await ws.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+@app.websocket("/ws")
+async def ws_endpoint_query(ws: WebSocket, user_id: Optional[str] = Query(default=None)):
+    """Alternate WS endpoint accepting ?user_id= for compatibility."""
+    try:
+        await ws.accept()
+        # initial message
+        try:
+            await ws.send_json({"type": "connection", "message": "Voice Agent server connected", "timestamp": datetime.utcnow().isoformat()})
+        except Exception:
+            pass
+
+        proxy = AgentProxy(ws)
+        ok = await proxy.start()
+        if not ok:
+            await ws.send_json({"type": "error", "message": "Failed to connect to Deepgram Voice Agent"})
+            await ws.close(code=status.WS_1011_INTERNAL_ERROR)
+            return
+        await asyncio.gather(*proxy.tasks, return_exceptions=True)
+    except WebSocketDisconnect:
+        logger.info("Client WebSocket disconnected (/ws query)")
+    except Exception as e:
+        logger.error(f"WebSocket error (/ws query): {e}")
+        try:
+            await ws.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", 8000))
+    log_level = os.getenv("LOG_LEVEL", "info").lower()
+    uvicorn.run(
+        "server:app",
+        host=host,
+        port=port,
+        log_level=log_level,
+        reload=os.getenv("RELOAD", "false").lower() == "true",
+        ws_ping_interval=None,
+        ws_ping_timeout=None,
+        ws_max_size=2 * 1024 * 1024,
+    )
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
