@@ -217,16 +217,9 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           : url;
 
         // Use 127.0.0.1 instead of localhost to avoid DNS lookup latency
-        const userId = (() => {
-          try {
-            const u = localStorage.getItem('user');
-            return u ? (JSON.parse(u).id || '') : '';
-          } catch {
-            return '';
-          }
-        })();
-        const wsUrl = `${baseUrl.replace('localhost', '127.0.0.1')}/ws${userId ? `?user_id=${encodeURIComponent(userId)}` : ''}`;
+        const wsUrl = `${baseUrl.replace('localhost', '127.0.0.1')}/ws/${encodeURIComponent(token)}`;
         console.log('🔗 Attempting WebSocket connection to:', wsUrl);
+        console.log('🎫 Using token:', token.substring(0, 20) + '...');
         
         // Establish WebSocket connection (no subprotocol; server does not negotiate any)
         const newSocket = new WebSocket(wsUrl);
