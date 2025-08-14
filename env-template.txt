@@ -27,6 +27,7 @@ GEMINI_API_KEY=your_gemini_api_key_here
 USE_REALTIME_STT=true
 USE_DEEPGRAM_AGENT=true
 DEEPGRAM_API_KEY=your_deepgram_api_key_here
+DEEPGRAM_AGENT_ENDPOINT=wss://agent.deepgram.com/v1/agent/converse
 DEEPGRAM_STT_MODEL=nova-3
 DEEPGRAM_STT_LANGUAGE=en-US
 DEEPGRAM_STT_ENDPOINTING=300
@@ -39,6 +40,9 @@ DG_AGENT_LLM_PROVIDER=open_ai
 DG_AGENT_LLM_MODEL=gpt-4o-mini
 DG_AGENT_TEMPERATURE=0.7
 DG_AGENT_GREETING=Hello! How can I help you today?
+
+# Frontend/Backend shared LLM envs
+GEMINI_API_KEY=your_gemini_api_key_here
 
 # Frontend URLs (adjust ports if needed)
 REACT_APP_API_URL=http://localhost:8000

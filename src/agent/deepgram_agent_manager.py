@@ -199,50 +199,37 @@ class DeepgramAgentManager:
         model = s.think_model or LLM_MODEL or "gemini-2.0-flash"
         temp = s.think_temperature if s.think_temperature is not None else 0.7
 
-        # Build provider block first
+        # Build provider block. Let Deepgram handle Google/Gemini transport to avoid payload mismatches.
         if t.startswith("google") and GEMINI_API_KEY:
-            # Use Google/Gemini with proper configuration for Deepgram Voice Agent
-            provider = {
-                "type": "google", 
-                "model": model, 
-                "temperature": temp
-            }
-        elif t.startswith("open") and OPENAI_API_KEY:
-            provider = {"type": "open_ai", "model": model, "temperature": temp}
-        elif t.startswith("anth") and ANTHROPIC_API_KEY:
-            provider = {"type": "anthropic", "model": model, "temperature": temp}
-        else:
-            # Only use Google/Gemini as fallback since OpenAI is disabled
-            if GEMINI_API_KEY:
-                logger.info("Using Google/Gemini as LLM provider")
-                provider = {"type": "google", "model": "gemini-2.0-flash", "temperature": 0.7}
-            else:
-                raise ValueError("No valid LLM provider configured - Gemini API key required")
+            provider = {"type": "google", "model": model, "temperature": temp}
+            return {"provider": provider}
 
-        # For Google/Gemini, endpoint is REQUIRED according to Deepgram docs
-        if provider.get("type") == "google" and GEMINI_API_KEY:
-            # Google requires endpoint configuration - use the correct API key parameter
-            # When using custom endpoint, model should be in URL, not in provider settings
-            endpoint_obj: Dict[str, Any] = {
-                "url": f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}",
-                "headers": {
-                    "Content-Type": "application/json"
-                }
-            }
-            # Remove model from provider when using custom endpoint
-            provider = {"type": "google", "temperature": temp}
-            think_block: Dict[str, Any] = {"provider": provider, "endpoint": endpoint_obj}
-        else:
-            think_block: Dict[str, Any] = {"provider": provider}
-            # For other providers with custom endpoints
-            if provider.get("type") != "google" and LLM_ENDPOINT_URL:
+        if t.startswith("open") and OPENAI_API_KEY:
+            provider = {"type": "open_ai", "model": model, "temperature": temp}
+            block: Dict[str, Any] = {"provider": provider}
+            if LLM_ENDPOINT_URL:
                 endpoint_obj: Dict[str, Any] = {"url": LLM_ENDPOINT_URL}
-                # If headers provided via config, forward them
                 if isinstance(LLM_ENDPOINT_HEADERS, dict) and LLM_ENDPOINT_HEADERS:
                     endpoint_obj["headers"] = LLM_ENDPOINT_HEADERS
-                think_block["endpoint"] = endpoint_obj
+                block["endpoint"] = endpoint_obj
+            return block
 
-        return think_block
+        if t.startswith("anth") and ANTHROPIC_API_KEY:
+            provider = {"type": "anthropic", "model": model, "temperature": temp}
+            block: Dict[str, Any] = {"provider": provider}
+            if LLM_ENDPOINT_URL:
+                endpoint_obj: Dict[str, Any] = {"url": LLM_ENDPOINT_URL}
+                if isinstance(LLM_ENDPOINT_HEADERS, dict) and LLM_ENDPOINT_HEADERS:
+                    endpoint_obj["headers"] = LLM_ENDPOINT_HEADERS
+                block["endpoint"] = endpoint_obj
+            return block
+
+        # Fallback to Google/Gemini when nothing else configured
+        if GEMINI_API_KEY:
+            provider = {"type": "google", "model": "gemini-2.0-flash", "temperature": 0.7}
+            return {"provider": provider}
+
+        raise ValueError("No valid LLM provider configured - Gemini API key required")
 
     async def _send_keepalive_loop(self) -> None:
         assert self._ws is not None

@@ -1311,3 +1311,13 @@ if __name__ == "__main__":
         ws_ping_timeout=None,   # Disable ping timeouts
         ws_max_size=2 * 1024 * 1024  # FIX #6: 2MB max message size for audio bursts
     ) 
+
+# -----------------------------------------------------------------------------
+# Compatibility alias: /voice-agent/{user_id}
+# Treats {user_id} as the token for authentication/backcompat.
+# -----------------------------------------------------------------------------
+@app.websocket("/voice-agent/{user_id}")
+async def websocket_endpoint_voice_agent(websocket: WebSocket, user_id: str):
+    # Treat provided user_id as a guest token to allow quick-start integration
+    guest_token = f"guest_{user_id}"
+    await websocket_endpoint(websocket, token=guest_token)

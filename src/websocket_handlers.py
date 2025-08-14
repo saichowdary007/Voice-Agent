@@ -202,12 +202,8 @@ class DeepgramAgentProxy:
                                         })
                                         continue
 
-                                # Unknown text messages: keep protocol strict in agent-proxy mode
-                                await self.client_ws.send_json({
-                                    "type": "error",
-                                    "message": f"Unknown message type: {msg_type}",
-                                    "timestamp": datetime.utcnow().isoformat(),
-                                })
+                                # Drop unknown client text frames silently to avoid agent complaints
+                                # and keep client logs clean.
                                 continue
                             
                             except json.JSONDecodeError:

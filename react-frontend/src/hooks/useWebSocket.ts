@@ -332,6 +332,27 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
           connectionHealthRef.current.missedPongs = 0;
         });
 
+        // Helper to build Settings payload consistently
+          const buildSettingsPayload = () => ({
+          type: 'Settings',
+          tags: ['prod', 'voice_agent'],
+          keepalive_interval: 10000,
+          audio: {
+            input: { encoding: 'linear16', sample_rate: 16000 },
+            output: { encoding: 'linear16', sample_rate: 16000, container: 'none' }
+          },
+          agent: {
+            language: 'en-US',
+            listen: { provider: { type: 'deepgram', model: 'nova-3', smart_format: false } },
+            // Use Google/Gemini directly to match backend configuration
+            think: {
+              provider: { type: 'google', model: 'gemini-2.0-flash', temperature: 0.7 }
+            },
+            speak: { provider: { type: 'deepgram', model: 'aura-2-thalia-en' } },
+            greeting: 'Hi! How can I help today?'
+          }
+        });
+
         newSocket.onmessage = (event) => {
           try {
             const message: WebSocketMessage = JSON.parse(event.data);
@@ -343,24 +364,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
                 settingsSendTimeoutRef.current = setTimeout(() => {
                   if (settingsAppliedRef.current || settingsSentRef.current || myGeneration !== socketGenerationRef.current) return;
                   try {
-                    const settings = {
-                      type: 'Settings',
-                      tags: ['prod', 'voice_agent'],
-                      audio: {
-                        input: { encoding: 'linear16', sample_rate: 16000 },
-                        output: { encoding: 'linear16', sample_rate: 24000, container: 'none' }
-                      },
-                      agent: {
-                        language: 'en-US',
-                        listen: { provider: { type: 'deepgram', model: 'nova-3', smart_format: false } },
-                        // Use Google/Gemini directly to match backend configuration
-                        think: {
-                          provider: { type: 'google', model: 'gemini-2.0-flash', temperature: 0.7 }
-                        },
-                        speak: { provider: { type: 'deepgram', model: 'aura-2-thalia-en' } },
-                        greeting: 'Hi! How can I help today?'
-                      }
-                    };
+                    const settings = buildSettingsPayload();
                     newSocket.send(JSON.stringify(settings));
                     settingsSentRef.current = true;
                     console.log('⚙️ Sent Settings to server (once)');
@@ -372,7 +376,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
             }
 
             // Settings applied -> enable mic streaming
-            if (message.type === 'settings_applied' && !settingsAppliedRef.current) {
+            if ((message.type === 'settings_applied' || (message as any).type === 'SettingsApplied') && !settingsAppliedRef.current) {
               settingsAppliedRef.current = true;
               (window as any).voiceAgentReady = true;
               if (settingsSendTimeoutRef.current) {
@@ -401,6 +405,20 @@ export const useWebSocket = (options: UseWebSocketOptions = {}, authenticated: b
               setLastMessage({ ...message, type: 'settings_applied' } as any);
               onMessage?.({ ...message, type: 'settings_applied' } as any);
               return;
+            }
+
+            // If backend complains we sent audio before settings, immediately resend settings for this connection
+            if (message.type === 'error' && typeof (message as any).message === 'string' && /before\s+Settings/i.test((message as any).message)) {
+              console.warn('⚠️ Server reported audio before Settings; re-sending Settings now');
+              try {
+                const settings = buildSettingsPayload();
+                settingsAppliedRef.current = false;
+                settingsSentRef.current = false;
+                newSocket.send(JSON.stringify(settings));
+                settingsSentRef.current = true;
+              } catch (e) {
+                console.error('Failed to re-send Settings after error:', e);
+              }
             }
 
             // Barge-in: user started speaking -> stop TTS playback immediately
